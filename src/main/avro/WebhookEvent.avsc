@@ -1,0 +1,39 @@
+{
+    "type": "record",
+    "name": "WebhookEvent",
+    "namespace": "gregor.avro",
+    "fields": [
+        {
+            "name": "eventId",
+            "type": "string"
+        },
+        {
+            "name": "eventType",
+            "type": "string"
+        },
+        {
+            "name": "tenantId",
+            "type": "string"
+        },
+        {
+            "name": "endpointId",
+            "type": "string"
+        },
+        {
+            "name": "createdAt",
+            "type": {
+                "type": "long",
+                "logicalType": "timestamp-millis"
+            }
+        },
+        {
+            "name": "payload",
+            "type": "bytes"
+        },
+        {
+            "name": "retryCount",
+            "type": "int",
+            "default": 0
+        }
+    ]
+}

@@ -1,0 +1,53 @@
+logging:
+    pattern:
+        console: "[%p] %m%n%wEx"
+    level:
+        root: WARN
+        org.apache.kafka.common.config: WARN
+        org.apache.camel: WARN
+        org.hibernate: WARN
+
+gregor:
+    kafka:
+        listener-concurrency: 1
+        topics:
+            default-partitions: 12
+            replication-factor: 1
+    webhook:
+        tenant-id: 00000000-0000-0000-0000-000000000001
+        endpoint-id: 00000000-0000-0000-0000-000000000002
+        receiver-url: http://localhost:1/unreachable
+        signing-secret: whsec_Z3JlZ29yLWxvY2FsLWRldmVsb3BtZW50LXNlY3JldA==
+        connection-timeout: 2s
+        response-timeout: 5s
+        receiver-timestamp-tolerance: 5m
+        maximum-attempts: ${WEBHOOK_MAXIMUM_ATTEMPTS:3}
+
+camel:
+    springboot:
+        auto-startup: false
+    component:
+        kafka:
+            brokers: localhost:1
+            key-serializer: org.apache.kafka.common.serialization.StringSerializer
+            value-serializer: io.apicurio.registry.serde.avro.AvroKafkaSerializer
+            key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+            value-deserializer: io.apicurio.registry.serde.avro.AvroKafkaDeserializer
+            additional-properties:
+                "[apicurio.registry.url]": ${APICURIO_REGISTRY_URL:http://localhost:${SCHEMA_REGISTRY_PORT:8081}/apis/registry/v3}
+                "[apicurio.registry.use-specific-avro-reader]": true
+                "[apicurio.registry.auto-register]": true
+
+spring:
+    application:
+        name: gregor
+    datasource:
+        url: jdbc:h2:mem:gregor;DB_CLOSE_DELAY=-1
+        username: sa
+        password:
+    jpa:
+        hibernate:
+            ddl-auto: create-drop
+    kafka:
+        admin:
+            auto-create: false

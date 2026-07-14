@@ -1,0 +1,63 @@
+logging:
+    pattern:
+        console: "[%p] %m%n%wEx"
+    level:
+        root: INFO
+        org.apache.kafka: WARN
+        org.apache.camel: WARN
+        org.hibernate: WARN
+
+gregor:
+    kafka:
+        listener-concurrency: ${KAFKA_LISTENER_CONCURRENCY:12}
+        topics:
+            default-partitions: 12
+            replication-factor: 1
+    webhook:
+        tenant-id: ${WEBHOOK_TENANT_ID:00000000-0000-0000-0000-000000000001}
+        endpoint-id: ${WEBHOOK_ENDPOINT_ID:00000000-0000-0000-0000-000000000002}
+        receiver-url: ${WEBHOOK_RECEIVER_URL:http://localhost:8080/api/mocked-webhook-receiver}
+        signing-secret: ${WEBHOOK_SIGNING_SECRET:whsec_Z3JlZ29yLWxvY2FsLWRldmVsb3BtZW50LXNlY3JldA==}
+        connection-timeout: ${WEBHOOK_CONNECTION_TIMEOUT:2s}
+        response-timeout: ${WEBHOOK_RESPONSE_TIMEOUT:5s}
+        receiver-timestamp-tolerance: ${WEBHOOK_RECEIVER_TIMESTAMP_TOLERANCE:5m}
+        maximum-attempts: ${WEBHOOK_MAXIMUM_ATTEMPTS:3}
+
+camel:
+    component:
+        kafka:
+            brokers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:${KAFKA_PORT:9092}}
+            consumers-count: ${gregor.kafka.listener-concurrency}
+            auto-commit-enable: false
+            allow-manual-commit: true
+            break-on-first-error: true
+            max-poll-records: 1
+            auto-offset-reset: earliest
+            key-serializer: org.apache.kafka.common.serialization.StringSerializer
+            value-serializer: io.apicurio.registry.serde.avro.AvroKafkaSerializer
+            key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+            value-deserializer: io.apicurio.registry.serde.avro.AvroKafkaDeserializer
+            request-required-acks: all
+            additional-properties:
+                "[apicurio.registry.url]": ${APICURIO_REGISTRY_URL:http://localhost:${SCHEMA_REGISTRY_PORT:8081}/apis/registry/v3}
+                "[apicurio.registry.use-specific-avro-reader]": true
+                "[apicurio.registry.auto-register]": true
+
+spring:
+    application:
+        name: gregor
+    datasource:
+        url: jdbc:postgresql://${POSTGRES_HOST:localhost}:${POSTGRES_PORT:5432}/${POSTGRES_DB:gregor}
+        username: ${POSTGRES_USER:gregor}
+        password: ${POSTGRES_PASSWORD:gregor}
+    threads:
+        virtual:
+            enabled: true
+    jpa:
+        open-in-view: false
+        hibernate:
+            ddl-auto: update
+    kafka:
+        bootstrap-servers: "${KAFKA_BOOTSTRAP_SERVERS:localhost:${KAFKA_PORT:9092}}"
+        admin:
+            auto-create: true

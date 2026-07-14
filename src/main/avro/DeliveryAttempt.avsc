@@ -1,0 +1,66 @@
+{
+    "type": "record",
+    "name": "DeliveryAttempt",
+    "namespace": "gregor.avro",
+    "fields": [
+        {
+            "name": "attemptId",
+            "type": "string"
+        },
+        {
+            "name": "eventId",
+            "type": "string"
+        },
+        {
+            "name": "tenantId",
+            "type": "string"
+        },
+        {
+            "name": "endpointId",
+            "type": "string"
+        },
+        {
+            "name": "eventType",
+            "type": "string"
+        },
+        {
+            "name": "attemptNumber",
+            "type": "int"
+        },
+        {
+            "name": "outcome",
+            "type": {
+                "type": "enum",
+                "name": "DeliveryOutcome",
+                "symbols": [
+                    "SUCCEEDED",
+                    "RETRYABLE_FAILURE",
+                    "PERMANENT_FAILURE"
+                ]
+            }
+        },
+        {
+            "name": "httpStatus",
+            "type": [
+                "null",
+                "int"
+            ],
+            "default": null
+        },
+        {
+            "name": "latencyMs",
+            "type": "long"
+        },
+        {
+            "name": "attemptedAt",
+            "type": {
+                "type": "long",
+                "logicalType": "timestamp-millis"
+            }
+        },
+        {
+            "name": "details",
+            "type": "bytes"
+        }
+    ]
+}

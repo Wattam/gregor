@@ -1,0 +1,100 @@
+name: gregor
+
+services:
+    postgres:
+        image: postgres:18.4-alpine3.24
+        command: [ "postgres", "-c", "log_min_messages=warning" ]
+        environment:
+            POSTGRES_DB: gregor
+            POSTGRES_USER: gregor
+            POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-gregor}
+        ports:
+            - "${POSTGRES_PORT:-5432}:5432"
+        volumes:
+            - postgres-data:/var/lib/postgresql
+        healthcheck:
+            test: [ "CMD-SHELL", "pg_isready -U gregor -d gregor" ]
+            interval: 5s
+            timeout: 5s
+            retries: 10
+            start_period: 5s
+        restart: unless-stopped
+
+    postgres-init:
+        image: postgres:18.4-alpine3.24
+        environment:
+            PGPASSWORD: ${POSTGRES_PASSWORD:-gregor}
+        command:
+            - sh
+            - -c
+            - >-
+                psql --host postgres --username gregor --dbname gregor --set ON_ERROR_STOP=1
+                --command 'CREATE SCHEMA IF NOT EXISTS apicurio_registry AUTHORIZATION gregor'
+        depends_on:
+            postgres:
+                condition: service_healthy
+        restart: "no"
+
+    kafka:
+        image: apache/kafka:4.3.1
+        ports:
+            - "${KAFKA_PORT:-9092}:${KAFKA_PORT:-9092}"
+        environment:
+            CLUSTER_ID: 4L6g3nShT-eMCtK--X86sw
+            KAFKA_NODE_ID: 1
+            KAFKA_PROCESS_ROLES: broker,controller
+            KAFKA_LISTENERS: CONTROLLER://:29093,PLAINTEXT_HOST://:${KAFKA_PORT:-9092},PLAINTEXT://:19092
+            KAFKA_ADVERTISED_LISTENERS: PLAINTEXT_HOST://localhost:${KAFKA_PORT:-9092},PLAINTEXT://kafka:19092
+            KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,PLAINTEXT:PLAINTEXT
+            KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+            KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+            KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+            KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+            KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+            KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+            KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+            KAFKA_SHARE_COORDINATOR_STATE_TOPIC_MIN_ISR: 1
+            KAFKA_SHARE_COORDINATOR_STATE_TOPIC_REPLICATION_FACTOR: 1
+            KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+            KAFKA_NUM_PARTITIONS: 12
+            KAFKA_LOG_DIRS: /var/lib/kafka/data
+            KAFKA_LOG4J_ROOT_LOGLEVEL: WARN
+        volumes:
+            - kafka-data:/var/lib/kafka/data
+        healthcheck:
+            test:
+                - CMD-SHELL
+                - /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:${KAFKA_PORT:-9092} --list >/dev/null
+            interval: 5s
+            timeout: 10s
+            retries: 12
+            start_period: 15s
+        restart: unless-stopped
+
+    apicurio-registry:
+        image: apicurio/apicurio-registry:3.2.6
+        environment:
+            APICURIO_STORAGE_KIND: sql
+            APICURIO_STORAGE_SQL_KIND: postgresql
+            QUARKUS_LOG_LEVEL: WARN
+            APICURIO_LOG_LEVEL: WARN
+            APICURIO_DATASOURCE_URL: jdbc:postgresql://postgres:5432/gregor?currentSchema=apicurio_registry
+            APICURIO_DATASOURCE_USERNAME: gregor
+            APICURIO_SQL_DB_SCHEMA: apicurio_registry
+            APICURIO_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:-gregor}
+        ports:
+            - "${SCHEMA_REGISTRY_PORT:-8081}:8080"
+        depends_on:
+            postgres-init:
+                condition: service_completed_successfully
+        healthcheck:
+            test: [ "CMD-SHELL", "curl --fail --silent http://localhost:9000/health/ready >/dev/null" ]
+            interval: 5s
+            timeout: 5s
+            retries: 12
+            start_period: 15s
+        restart: unless-stopped
+
+volumes:
+    kafka-data:
+    postgres-data:

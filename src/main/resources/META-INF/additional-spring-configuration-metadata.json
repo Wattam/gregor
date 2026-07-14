@@ -1,0 +1,88 @@
+{
+    "properties": [
+        {
+            "name": "camel.springboot.auto-startup",
+            "type": "java.lang.Boolean",
+            "sourceType": "org.apache.camel.spring.boot.CamelConfigurationProperties",
+            "description": "Whether routes should automatically start when Camel starts."
+        },
+        {
+            "name": "camel.component.kafka.brokers",
+            "type": "java.lang.String",
+            "sourceType": "org.apache.camel.component.kafka.springboot.KafkaComponentConfiguration",
+            "description": "URL of the Kafka brokers to use."
+        },
+        {
+            "name": "camel.component.kafka.consumers-count",
+            "type": "java.lang.Integer",
+            "sourceType": "org.apache.camel.component.kafka.springboot.KafkaComponentConfiguration",
+            "description": "The number of consumers that connect to Kafka server."
+        },
+        {
+            "name": "camel.component.kafka.auto-commit-enable",
+            "type": "java.lang.Boolean",
+            "sourceType": "org.apache.camel.component.kafka.springboot.KafkaComponentConfiguration",
+            "description": "If true, periodically commit to ZooKeeper the offset of messages already fetched by the consumer."
+        },
+        {
+            "name": "camel.component.kafka.allow-manual-commit",
+            "type": "java.lang.Boolean",
+            "sourceType": "org.apache.camel.component.kafka.springboot.KafkaComponentConfiguration",
+            "description": "Whether to allow doing manual commits via KafkaManualCommit."
+        },
+        {
+            "name": "camel.component.kafka.break-on-first-error",
+            "type": "java.lang.Boolean",
+            "sourceType": "org.apache.camel.component.kafka.springboot.KafkaComponentConfiguration",
+            "description": "This options controls what happens when a consumer is processing an exchange and it fails."
+        },
+        {
+            "name": "camel.component.kafka.max-poll-records",
+            "type": "java.lang.Integer",
+            "sourceType": "org.apache.camel.component.kafka.springboot.KafkaComponentConfiguration",
+            "description": "The maximum number of records returned in a single call to poll()."
+        },
+        {
+            "name": "camel.component.kafka.auto-offset-reset",
+            "type": "java.lang.String",
+            "sourceType": "org.apache.camel.component.kafka.springboot.KafkaComponentConfiguration",
+            "description": "What to do when there is no initial offset in ZooKeeper or if an offset is out of range."
+        },
+        {
+            "name": "camel.component.kafka.key-serializer",
+            "type": "java.lang.String",
+            "sourceType": "org.apache.camel.component.kafka.springboot.KafkaComponentConfiguration",
+            "description": "The serializer class for keys (defaults to the same as for messages if nothing is given)."
+        },
+        {
+            "name": "camel.component.kafka.value-serializer",
+            "type": "java.lang.String",
+            "sourceType": "org.apache.camel.component.kafka.springboot.KafkaComponentConfiguration",
+            "description": "The serializer class for messages."
+        },
+        {
+            "name": "camel.component.kafka.key-deserializer",
+            "type": "java.lang.String",
+            "sourceType": "org.apache.camel.component.kafka.springboot.KafkaComponentConfiguration",
+            "description": "Deserializer class for keys if nothing is given for keys."
+        },
+        {
+            "name": "camel.component.kafka.value-deserializer",
+            "type": "java.lang.String",
+            "sourceType": "org.apache.camel.component.kafka.springboot.KafkaComponentConfiguration",
+            "description": "Deserializer class for values if nothing is given for messages."
+        },
+        {
+            "name": "camel.component.kafka.request-required-acks",
+            "type": "java.lang.String",
+            "sourceType": "org.apache.camel.component.kafka.springboot.KafkaComponentConfiguration",
+            "description": "The number of acknowledgments the producer requires the leader to have received before considering a request complete."
+        },
+        {
+            "name": "camel.component.kafka.additional-properties",
+            "type": "java.util.Map<java.lang.String,java.lang.Object>",
+            "sourceType": "org.apache.camel.component.kafka.springboot.KafkaComponentConfiguration",
+            "description": "Sets additional properties for either kafka consumer or kafka producer in case they can't be set directly on the camel configurations."
+        }
+    ]
+}
