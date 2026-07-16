@@ -121,7 +121,10 @@ class DeliveryAttemptRedeliveryIntegrationTests {
                 204,
                 1L,
                 Instant.now(),
-                ByteBuffer.wrap("{}".getBytes(StandardCharsets.UTF_8))
+                ByteBuffer.wrap("{}".getBytes(StandardCharsets.UTF_8)),
+                0,
+                0,
+                false
         );
         Mockito.doThrow(new IllegalStateException("database unavailable"))
                 .doNothing()
@@ -137,7 +140,10 @@ class DeliveryAttemptRedeliveryIntegrationTests {
         long expectedOffset = this.endOffset(partition);
 
         Mockito.verify(this.webhookService, Mockito.timeout(15_000).atLeast(2)).persistDeliveryAttempt(
-                Mockito.argThat(redelivered -> eventId.equals(redelivered.getEventId()))
+                Mockito.argThat(redelivered -> eventId.equals(redelivered.getEventId())
+                        && redelivered.getRetryCount() == 0
+                        && redelivered.getReplayCount() == 0
+                        && !redelivered.getDeadLettered())
         );
         this.awaitCommittedOffset(partition, expectedOffset);
     }

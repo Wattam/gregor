@@ -106,6 +106,9 @@ class WebhookServiceTests {
         Assertions.assertThat(deliveryAttempt.getHttpStatus()).isEqualTo(503);
         Assertions.assertThat(deliveryAttempt.getLatencyMs()).isEqualTo(37L);
         Assertions.assertThat(deliveryAttempt.getAttemptedAt()).isEqualTo(Instant.parse("2026-07-10T12:00:00Z"));
+        Assertions.assertThat(deliveryAttempt.getRetryCount()).isZero();
+        Assertions.assertThat(deliveryAttempt.getReplayCount()).isZero();
+        Assertions.assertThat(deliveryAttempt.getDeadLettered()).isFalse();
         byte[] detailsBytes = bytes(deliveryAttempt.getDetails());
         JsonNode details = objectMapper.readTree(detailsBytes);
         Assertions.assertThat(details.get("type").asString()).isEqualTo("HTTP_FAILURE");
@@ -162,7 +165,7 @@ class WebhookServiceTests {
 
     @Test
     void retriesOnlyRetryableFailuresBeforeTheConfiguredMaximumAttempt() {
-        WebhookProperties webhookProperties = WebhookPropertiesFixtures.create(5);
+        WebhookProperties webhookProperties = WebhookPropertiesFixtures.create(4);
         WebhookService webhookService = service(new ObjectMapper(), webhookProperties);
 
         for (int attemptNumber = 1; attemptNumber <= webhookProperties.maximumAttempts(); attemptNumber++) {
@@ -219,6 +222,10 @@ class WebhookServiceTests {
         Assertions.assertThat(webhookEventEnvelope.getEndpointId()).isEqualTo("00000000-0000-0000-0000-000000000002");
         Assertions.assertThat(webhookEventEnvelope.getCreatedAt()).isEqualTo(Instant.parse("2026-07-10T12:00:00Z"));
         Assertions.assertThat(webhookEventEnvelope.getRetryCount()).isZero();
+        Assertions.assertThat(webhookEventEnvelope.getNextEligibleAt()).isNull();
+        Assertions.assertThat(webhookEventEnvelope.getDeliveryAttemptCount()).isZero();
+        Assertions.assertThat(webhookEventEnvelope.getReplayCount()).isZero();
+        Assertions.assertThat(WebhookEvent.getClassSchema().getField("schemaVersion")).isNull();
         ByteBuffer payloadBuffer = webhookEventEnvelope.getPayload().duplicate();
         byte[] publishedPayload = new byte[payloadBuffer.remaining()];
         payloadBuffer.get(publishedPayload);
@@ -331,6 +338,9 @@ class WebhookServiceTests {
                 ByteBuffer.wrap(
                         "{\"secret\":\"payload-marker\",\"key\":\"signing-secret\"}".getBytes(StandardCharsets.UTF_8)
                 ),
+                0,
+                null,
+                0,
                 0
         );
     }

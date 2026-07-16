@@ -87,6 +87,17 @@ class DeliveryAttemptPersistenceMappingTests {
         Assertions.assertThat(details.getAnnotation(JdbcTypeCode.class).value()).isEqualTo(SqlTypes.JSON);
         Assertions.assertThat(details.getAnnotation(Column.class).nullable()).isFalse();
         Assertions.assertThat(details.getAnnotation(Column.class).columnDefinition()).isEqualToIgnoringCase("JSONB");
+        Field retryCount = DeliveryAttempt.class.getDeclaredField("retryCount");
+        Assertions.assertThat(retryCount.getType()).isEqualTo(int.class);
+        assertColumnNotNullable(retryCount);
+        Field replayCount = DeliveryAttempt.class.getDeclaredField("replayCount");
+        Assertions.assertThat(replayCount.getType()).isEqualTo(int.class);
+        assertColumnNotNullable(replayCount);
+        Field deadLettered = DeliveryAttempt.class.getDeclaredField("deadLettered");
+        Assertions.assertThat(deadLettered.getType()).isEqualTo(boolean.class);
+        assertColumnNotNullable(deadLettered);
+        Assertions.assertThat(Arrays.stream(DeliveryAttempt.class.getDeclaredFields()).map(Field::getName))
+                .doesNotContain("payload", "signingSecret");
     }
 
     @Test
@@ -108,8 +119,10 @@ class DeliveryAttemptPersistenceMappingTests {
         Assertions.assertThat(query.nativeQuery()).isTrue();
         Assertions.assertThat(normalizedSql)
                 .contains("INSERT INTO DELIVERY_ATTEMPT")
-                .contains("CAST(:DETAILS AS JSONB)")
-                .contains("ON CONFLICT (EVENT_ID, ATTEMPT_NUMBER) DO NOTHING");
+                .contains("ATTEMPTED_AT, DETAILS, RETRY_COUNT, REPLAY_COUNT, DEAD_LETTERED")
+                .contains("CAST(:DETAILS AS JSONB), :RETRYCOUNT, :REPLAYCOUNT, :DEADLETTERED")
+                .contains("ON CONFLICT (EVENT_ID, ATTEMPT_NUMBER) DO NOTHING")
+                .doesNotContain("PAYLOAD", "SIGNING_SECRET");
         Set<String> parameterNames = Arrays.stream(insert.getParameters())
                 .map(Parameter::getAnnotations)
                 .flatMap(Arrays::stream)
@@ -129,7 +142,10 @@ class DeliveryAttemptPersistenceMappingTests {
                 Integer.class,
                 long.class,
                 Instant.class,
-                String.class
+                String.class,
+                int.class,
+                int.class,
+                boolean.class
         );
         Assertions.assertThat(parameterNames).containsExactlyInAnyOrder(
                 "attemptId",
@@ -142,7 +158,10 @@ class DeliveryAttemptPersistenceMappingTests {
                 "httpStatus",
                 "latencyMs",
                 "attemptedAt",
-                "details"
+                "details",
+                "retryCount",
+                "replayCount",
+                "deadLettered"
         );
     }
 

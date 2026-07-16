@@ -66,14 +66,17 @@ class WebhookPersistenceTests {
                 503,
                 42L,
                 Instant.parse("2026-07-10T12:00:00Z"),
-                ByteBuffer.wrap("{\"type\":\"HTTP_FAILURE\"}".getBytes(StandardCharsets.UTF_8))
+                ByteBuffer.wrap("{\"type\":\"HTTP_FAILURE\"}".getBytes(StandardCharsets.UTF_8)),
+                4,
+                2,
+                true
         );
 
         webhookService.persistDeliveryAttempt(deliveryAttempt);
 
         Assertions.assertThat(insertInvocation.get()).isNotNull();
         Object[] arguments = insertInvocation.get().getArguments();
-        Assertions.assertThat(arguments).hasSize(11);
+        Assertions.assertThat(arguments).hasSize(14);
         Assertions.assertThat(arguments[0]).isEqualTo(UUID.fromString("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"));
         Assertions.assertThat(arguments[1]).isEqualTo(UUID.fromString("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"));
         Assertions.assertThat(arguments[2]).isEqualTo(UUID.fromString("cccccccc-cccc-cccc-cccc-cccccccccccc"));
@@ -86,6 +89,9 @@ class WebhookPersistenceTests {
         Assertions.assertThat(arguments[9]).isEqualTo(Instant.parse("2026-07-10T12:00:00Z"));
         JsonNode details = objectMapper.readTree((String) arguments[10]);
         Assertions.assertThat(details.get("type").asString()).isEqualTo("HTTP_FAILURE");
+        Assertions.assertThat(arguments[11]).isEqualTo(4);
+        Assertions.assertThat(arguments[12]).isEqualTo(2);
+        Assertions.assertThat(arguments[13]).isEqualTo(true);
     }
 
     @Test
@@ -120,7 +126,10 @@ class WebhookPersistenceTests {
                 null,
                 12L,
                 Instant.EPOCH,
-                ByteBuffer.wrap("{}".getBytes(StandardCharsets.UTF_8))
+                ByteBuffer.wrap("{}".getBytes(StandardCharsets.UTF_8)),
+                0,
+                0,
+                false
         );
 
         Assertions.assertThatCode(() -> webhookService.persistDeliveryAttempt(deliveryAttempt))
@@ -128,5 +137,6 @@ class WebhookPersistenceTests {
 
         Assertions.assertThat(insertInvocation.get()).isNotNull();
         Assertions.assertThat(insertInvocation.get().getArguments()[7]).isNull();
+        Assertions.assertThat(insertInvocation.get().getArguments()).endsWith(0, 0, false);
     }
 }

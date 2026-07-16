@@ -15,6 +15,10 @@ public class WebhookRoute extends BaseRoute {
     public static final String WEBHOOK_EVENT_TOPIC = "webhook-events";
     public static final String WEBHOOK_DELIVERY_ATTEMPT_DIRECT = "direct:webhook-delivery-attempt";
     public static final String PERSIST_DELIVERY_ATTEMPT_TOPIC = "persist-delivery-attempt";
+    public static final String WEBHOOK_EVENT_RETRY_1M_TOPIC = "webhook-events-retry-1m";
+    public static final String WEBHOOK_EVENT_RETRY_10M_TOPIC = "webhook-events-retry-10m";
+    public static final String WEBHOOK_EVENT_RETRY_1H_TOPIC = "webhook-events-retry-1h";
+    public static final String WEBHOOK_EVENT_DEAD_LETTER_TOPIC = "webhook-events-dead-letter";
 
     private final WebhookService webhookService;
 

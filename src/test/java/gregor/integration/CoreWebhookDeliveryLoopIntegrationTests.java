@@ -9,6 +9,7 @@ import gregor.component.SignatureComponent;
 import gregor.config.properties.WebhookProperties;
 import gregor.route.WebhookRoute;
 import gregor.service.WebhookService;
+import org.apache.camel.CamelContext;
 import org.apache.camel.ProducerTemplate;
 import org.apache.camel.component.kafka.KafkaConstants;
 import org.apache.kafka.clients.admin.AdminClient;
@@ -31,8 +32,11 @@ import org.assertj.core.api.Assertions;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.ExtendWith;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.system.CapturedOutput;
+import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.annotation.DirtiesContext;
@@ -68,6 +72,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
+@ExtendWith(OutputCaptureExtension.class)
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 class CoreWebhookDeliveryLoopIntegrationTests {
@@ -78,9 +83,17 @@ class CoreWebhookDeliveryLoopIntegrationTests {
             "01234567890123456789012345678901".getBytes(StandardCharsets.UTF_8)
     );
     private static final TestReceiver RECEIVER = TestReceiver.start();
+    private static final List<String> INFRASTRUCTURE_ONLY_TOPICS = List.of(
+            "webhook-events-retry-1m",
+            "webhook-events-retry-10m",
+            "webhook-events-retry-1h",
+            "webhook-events-dead-letter"
+    );
 
     @LocalServerPort
     private int serverPort;
+    @Autowired
+    private CamelContext camelContext;
     @Autowired
     private ProducerTemplate producerTemplate;
     @Autowired
@@ -197,6 +210,9 @@ class CoreWebhookDeliveryLoopIntegrationTests {
             Assertions.assertThat(event.getEndpointId()).isEqualTo(ENDPOINT_ID);
             Assertions.assertThat(event.getCreatedAt()).isBeforeOrEqualTo(Instant.now());
             Assertions.assertThat(event.getRetryCount()).isZero();
+            Assertions.assertThat(event.getNextEligibleAt()).isNull();
+            Assertions.assertThat(event.getDeliveryAttemptCount()).isZero();
+            Assertions.assertThat(event.getReplayCount()).isZero();
             Assertions.assertThat(bytes(event.getPayload()))
                     .isEqualTo("{\"orderId\":\"123\",\"name\":\"é\"}".getBytes(StandardCharsets.UTF_8));
             Assertions.assertThat(WebhookEvent.getClassSchema().getField("signingSecret")).isNull();
@@ -223,6 +239,9 @@ class CoreWebhookDeliveryLoopIntegrationTests {
             Assertions.assertThat(attempt.getHttpStatus()).isEqualTo(204);
             Assertions.assertThat(attempt.getLatencyMs()).isNotNegative();
             Assertions.assertThat(attempt.getAttemptedAt()).isBeforeOrEqualTo(Instant.now());
+            Assertions.assertThat(attempt.getRetryCount()).isZero();
+            Assertions.assertThat(attempt.getReplayCount()).isZero();
+            Assertions.assertThat(attempt.getDeadLettered()).isFalse();
             Assertions.assertThat(DeliveryAttempt.getClassSchema().getField("payload")).isNull();
             Assertions.assertThat(DeliveryAttempt.getClassSchema().getField("signingSecret")).isNull();
 
@@ -230,7 +249,8 @@ class CoreWebhookDeliveryLoopIntegrationTests {
             Map<String, Object> row = this.jdbcTemplate.queryForMap(
                     """
                     SELECT tenant_id, endpoint_id, event_type, attempt_number, outcome, http_status,
-                           latency_ms, attempted_at, details::text AS details
+                           latency_ms, attempted_at, retry_count, replay_count, dead_lettered,
+                           details::text AS details
                     FROM delivery_attempt
                     WHERE event_id = ?::uuid
                     """,
@@ -244,6 +264,7 @@ class CoreWebhookDeliveryLoopIntegrationTests {
                     .containsEntry("outcome", "SUCCEEDED")
                     .containsEntry("http_status", 204);
             Assertions.assertThat((Long) row.get("latency_ms")).isNotNegative();
+            assertPhaseOneAuditFields(row);
             Assertions.assertThat(row.get("details").toString()).isEqualTo("{}");
         }
     }
@@ -254,16 +275,13 @@ class CoreWebhookDeliveryLoopIntegrationTests {
         List<String> eventIds = new ArrayList<>();
 
         for (String payload : payloads) {
-            HttpResponse<String> response = this.postEvent(
-                    "{\"eventType\":\"payload.test\",\"payload\":" + payload + "}"
-            );
+            HttpResponse<String> response =
+                    this.postEvent("{\"eventType\":\"payload.test\",\"payload\":" + payload + "}");
             Assertions.assertThat(response.statusCode()).isEqualTo(202);
             eventIds.add(this.objectMapper.readTree(response.body()).get("eventId").asString());
         }
 
-        HttpResponse<String> repeated = this.postEvent(
-                "{\"eventType\":\"payload.test\",\"payload\":true}"
-        );
+        HttpResponse<String> repeated = this.postEvent("{\"eventType\":\"payload.test\",\"payload\":true}");
         Assertions.assertThat(repeated.statusCode()).isEqualTo(202);
         eventIds.add(this.objectMapper.readTree(repeated.body()).get("eventId").asString());
         Assertions.assertThat(eventIds).doesNotHaveDuplicates();
@@ -298,8 +316,9 @@ class CoreWebhookDeliveryLoopIntegrationTests {
     }
 
     @Test
-    void retriesRetryableResponsesUntilTheConfiguredMaximumAndStopsPermanentResponsesAfterOneAttempt() throws Exception {
+    void keepsHttpOutcomeClassificationAndImmediateRetryLimitUnchanged() throws Exception {
         int maximumAttempts = this.webhookProperties.maximumAttempts();
+        Assertions.assertThat(maximumAttempts).isEqualTo(4);
         List<Integer> expectedAttemptNumbers = IntStream.rangeClosed(1, maximumAttempts).boxed().toList();
         for (int status : List.of(408, 429, 503)) {
             RECEIVER.respondWith(status);
@@ -312,7 +331,8 @@ class CoreWebhookDeliveryLoopIntegrationTests {
             this.awaitAttemptRows(eventId, maximumAttempts);
             List<Map<String, Object>> rows = this.jdbcTemplate.queryForList(
                     """
-                    SELECT attempt_number, outcome, http_status, details::text AS details
+                    SELECT attempt_number, outcome, http_status, retry_count, replay_count, dead_lettered,
+                           details::text AS details
                     FROM delivery_attempt
                     WHERE event_id = ?::uuid
                     ORDER BY attempt_number
@@ -325,6 +345,7 @@ class CoreWebhookDeliveryLoopIntegrationTests {
             Assertions.assertThat(rows).allSatisfy(row -> {
                 Assertions.assertThat(row.get("outcome")).isEqualTo("RETRYABLE_FAILURE");
                 Assertions.assertThat(row.get("http_status")).isEqualTo(status);
+                assertPhaseOneAuditFields(row);
                 Assertions.assertThat(row.get("details").toString()).contains("HTTP_FAILURE");
             });
             Thread.sleep(200L);
@@ -343,7 +364,7 @@ class CoreWebhookDeliveryLoopIntegrationTests {
             this.awaitAttemptRows(eventId, 1);
             Map<String, Object> row = this.jdbcTemplate.queryForMap(
                     """
-                    SELECT attempt_number, outcome, http_status
+                    SELECT attempt_number, outcome, http_status, retry_count, replay_count, dead_lettered
                     FROM delivery_attempt
                     WHERE event_id = ?::uuid
                     """,
@@ -353,6 +374,7 @@ class CoreWebhookDeliveryLoopIntegrationTests {
                     .containsEntry("attempt_number", 1)
                     .containsEntry("outcome", "PERMANENT_FAILURE")
                     .containsEntry("http_status", status);
+            assertPhaseOneAuditFields(row);
             Thread.sleep(200L);
             Assertions.assertThat(RECEIVER.count(eventId)).isEqualTo(1);
             RECEIVER.reset();
@@ -368,12 +390,18 @@ class CoreWebhookDeliveryLoopIntegrationTests {
 
         RECEIVER.awaitRequest(eventId, maximumAttempts);
         this.awaitAttemptRows(eventId, maximumAttempts);
-        List<String> detailsValues = this.jdbcTemplate.queryForList(
-                "SELECT details::text FROM delivery_attempt WHERE event_id = ?::uuid ORDER BY attempt_number",
-                String.class,
+        List<Map<String, Object>> rows = this.jdbcTemplate.queryForList(
+                """
+                SELECT retry_count, replay_count, dead_lettered, details::text AS details
+                FROM delivery_attempt
+                WHERE event_id = ?::uuid
+                ORDER BY attempt_number
+                """,
                 eventId
         );
-        Assertions.assertThat(detailsValues).hasSize(maximumAttempts).allSatisfy(detailsJson -> {
+        Assertions.assertThat(rows).hasSize(maximumAttempts).allSatisfy(row -> {
+            assertPhaseOneAuditFields(row);
+            String detailsJson = row.get("details").toString();
             JsonNode details = this.objectMapper.readTree(detailsJson);
             Assertions.assertThat(details.get("type").asString()).isIn("CONNECTION_FAILURE", "INVALID_RESPONSE");
             Assertions.assertThat(details.has("exceptionClass")).isTrue();
@@ -394,12 +422,18 @@ class CoreWebhookDeliveryLoopIntegrationTests {
 
         RECEIVER.awaitRequest(eventId, maximumAttempts);
         this.awaitAttemptRows(eventId, maximumAttempts);
-        List<String> detailsValues = this.jdbcTemplate.queryForList(
-                "SELECT details::text FROM delivery_attempt WHERE event_id = ?::uuid ORDER BY attempt_number",
-                String.class,
+        List<Map<String, Object>> rows = this.jdbcTemplate.queryForList(
+                """
+                SELECT retry_count, replay_count, dead_lettered, details::text AS details
+                FROM delivery_attempt
+                WHERE event_id = ?::uuid
+                ORDER BY attempt_number
+                """,
                 eventId
         );
-        Assertions.assertThat(detailsValues).hasSize(maximumAttempts).allSatisfy(detailsJson -> {
+        Assertions.assertThat(rows).hasSize(maximumAttempts).allSatisfy(row -> {
+            assertPhaseOneAuditFields(row);
+            String detailsJson = row.get("details").toString();
             JsonNode details = this.objectMapper.readTree(detailsJson);
             String snippet = details.get("responseBody").asString();
             Assertions.assertThat(details.get("type").asString()).isEqualTo("HTTP_FAILURE");
@@ -411,7 +445,7 @@ class CoreWebhookDeliveryLoopIntegrationTests {
     }
 
     @Test
-    void omitsHttpFailureDetailsThatContainTheRequestPayloadOrSigningSecret() throws Exception {
+    void omitsHttpFailureDetailsThatContainTheRequestPayloadOrSigningSecret(CapturedOutput output) throws Exception {
         String payload = "{\"private\":\"request-payload-marker\"}";
         RECEIVER.respondWith(400, "echo=" + payload + ";secret=" + SIGNING_SECRET);
 
@@ -422,14 +456,20 @@ class CoreWebhookDeliveryLoopIntegrationTests {
         RECEIVER.awaitRequest(eventId, 1);
         this.awaitAttemptRows(eventId, 1);
 
-        String detailsJson = this.jdbcTemplate.queryForObject(
-                "SELECT details::text FROM delivery_attempt WHERE event_id = ?::uuid",
-                String.class,
+        Map<String, Object> row = this.jdbcTemplate.queryForMap(
+                """
+                SELECT retry_count, replay_count, dead_lettered, details::text AS details
+                FROM delivery_attempt
+                WHERE event_id = ?::uuid
+                """,
                 eventId
         );
+        assertPhaseOneAuditFields(row);
+        String detailsJson = row.get("details").toString();
         Assertions.assertThat(this.objectMapper.readTree(detailsJson))
                 .isEqualTo(this.objectMapper.readTree("{\"type\":\"HTTP_FAILURE\"}"));
         Assertions.assertThat(detailsJson).doesNotContain(payload, SIGNING_SECRET);
+        Assertions.assertThat(output.getAll()).doesNotContain(payload, SIGNING_SECRET);
     }
 
     @Test
@@ -443,7 +483,8 @@ class CoreWebhookDeliveryLoopIntegrationTests {
         this.awaitAttemptRows(eventId, maximumAttempts);
         List<Map<String, Object>> rows = this.jdbcTemplate.queryForList(
                 """
-                SELECT attempt_number, outcome, http_status, details::text AS details
+                SELECT attempt_number, outcome, http_status, retry_count, replay_count, dead_lettered,
+                       details::text AS details
                 FROM delivery_attempt
                 WHERE event_id = ?::uuid
                 ORDER BY attempt_number
@@ -453,6 +494,7 @@ class CoreWebhookDeliveryLoopIntegrationTests {
         Assertions.assertThat(rows).hasSize(maximumAttempts).allSatisfy(row -> {
             Assertions.assertThat(row.get("outcome")).isEqualTo("RETRYABLE_FAILURE");
             Assertions.assertThat(row.get("http_status")).isNull();
+            assertPhaseOneAuditFields(row);
             Assertions.assertThat(row.get("details").toString()).contains("TIMEOUT");
         });
     }
@@ -519,6 +561,9 @@ class CoreWebhookDeliveryLoopIntegrationTests {
                 ENDPOINT_ID,
                 Instant.now(),
                 ByteBuffer.wrap("{\"duplicate\":true}".getBytes(StandardCharsets.UTF_8)),
+                0,
+                null,
+                0,
                 0
         );
 
@@ -555,12 +600,31 @@ class CoreWebhookDeliveryLoopIntegrationTests {
                 null,
                 42L,
                 Instant.parse("2026-07-10T12:00:00Z"),
-                ByteBuffer.wrap("{\"type\":\"TIMEOUT\"}".getBytes(StandardCharsets.UTF_8))
+                ByteBuffer.wrap("{\"type\":\"TIMEOUT\"}".getBytes(StandardCharsets.UTF_8)),
+                2,
+                1,
+                true
+        );
+        DeliveryAttempt duplicateAttemptNumber = new DeliveryAttempt(
+                UUID.randomUUID().toString(),
+                eventId,
+                TENANT_ID,
+                ENDPOINT_ID,
+                "duplicate.test",
+                3,
+                DeliveryOutcome.SUCCEEDED,
+                204,
+                1L,
+                Instant.parse("2026-07-10T12:01:00Z"),
+                ByteBuffer.wrap("{}".getBytes(StandardCharsets.UTF_8)),
+                0,
+                0,
+                false
         );
 
         Assertions.assertThatCode(() -> {
             this.webhookService.persistDeliveryAttempt(attempt);
-            this.webhookService.persistDeliveryAttempt(attempt);
+            this.webhookService.persistDeliveryAttempt(duplicateAttemptNumber);
         }).doesNotThrowAnyException();
 
         Assertions.assertThat(this.attemptRowCount(eventId)).isEqualTo(1);
@@ -576,7 +640,7 @@ class CoreWebhookDeliveryLoopIntegrationTests {
         Map<String, Object> row = this.jdbcTemplate.queryForMap(
                 """
                 SELECT attempt_id, event_id, attempt_number, outcome, http_status, latency_ms,
-                       attempted_at, details::text AS details
+                       attempted_at, retry_count, replay_count, dead_lettered, details::text AS details
                 FROM delivery_attempt
                 WHERE event_id = ?::uuid
                 """,
@@ -589,24 +653,64 @@ class CoreWebhookDeliveryLoopIntegrationTests {
                 .containsEntry("outcome", "RETRYABLE_FAILURE")
                 .containsEntry("latency_ms", 42L);
         Assertions.assertThat(row.get("http_status")).isNull();
+        Assertions.assertThat(row)
+                .containsEntry("retry_count", 2)
+                .containsEntry("replay_count", 1)
+                .containsEntry("dead_lettered", true);
         Assertions.assertThat(row.get("details").toString()).contains("\"type\": \"TIMEOUT\"");
+
+        List<Map<String, Object>> auditColumns = this.jdbcTemplate.queryForList(
+                """
+                SELECT column_name, data_type, is_nullable
+                FROM information_schema.columns
+                WHERE table_name = 'delivery_attempt'
+                  AND column_name IN ('retry_count', 'replay_count', 'dead_lettered')
+                ORDER BY column_name
+                """
+        );
+        Assertions.assertThat(auditColumns)
+                .extracting(column -> List.of(
+                        column.get("column_name"),
+                        column.get("data_type"),
+                        column.get("is_nullable")
+                ))
+                .containsExactly(
+                        List.of("dead_lettered", "boolean", "NO"),
+                        List.of("replay_count", "integer", "NO"),
+                        List.of("retry_count", "integer", "NO")
+                );
+        List<String> columnNames = this.jdbcTemplate.queryForList(
+                """
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_name = 'delivery_attempt'
+                """,
+                String.class
+        );
+        Assertions.assertThat(columnNames).doesNotContain("payload", "signing_secret");
     }
 
     @Test
-    void createsOnlyTheTwoPhaseOneTopicsWithConfiguredPartitionAndRetentionSettings() throws Exception {
+    void declaresPhaseTwoInfrastructureTopicsWithoutActivatingTheirDeliveryPaths() throws Exception {
+        List<String> expectedTopics = Stream.concat(
+                Stream.of("webhook-events", "persist-delivery-attempt"),
+                INFRASTRUCTURE_ONLY_TOPICS.stream()
+        ).toList();
         try (
                 AdminClient adminClient = AdminClient.create(Map.of(
                         AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG,
                         kafkaBootstrapServers()
-                ))
+                ));
+                KafkaConsumer<String, Object> infrastructureConsumer =
+                        this.newConsumer("integration-infrastructure-only-" + UUID.randomUUID())
         ) {
             Assertions.assertThat(adminClient.listTopics().names().get(10, TimeUnit.SECONDS))
-                    .containsExactlyInAnyOrder("webhook-events", "persist-delivery-attempt");
+                    .containsExactlyInAnyOrderElementsOf(expectedTopics);
             Map<String, TopicDescription> descriptions = adminClient
-                    .describeTopics(List.of("webhook-events", "persist-delivery-attempt"))
+                    .describeTopics(expectedTopics)
                     .allTopicNames()
                     .get(10, TimeUnit.SECONDS);
-            Assertions.assertThat(descriptions).containsOnlyKeys("webhook-events", "persist-delivery-attempt");
+            Assertions.assertThat(descriptions.keySet()).containsExactlyInAnyOrderElementsOf(expectedTopics);
             Assertions.assertThat(descriptions.values()).allSatisfy(description -> {
                 Assertions.assertThat(description.partitions()).hasSize(12);
                 Assertions.assertThat(description.partitions()).allSatisfy(partition ->
@@ -614,20 +718,45 @@ class CoreWebhookDeliveryLoopIntegrationTests {
                 );
             });
 
-            ConfigResource webhookEvents = new ConfigResource(ConfigResource.Type.TOPIC, "webhook-events");
-            ConfigResource deliveryAttempts = new ConfigResource(ConfigResource.Type.TOPIC, "persist-delivery-attempt");
+            Map<String, String> expectedRetentions = Map.of(
+                    "webhook-events", "604800000",
+                    "persist-delivery-attempt", "2592000000",
+                    "webhook-events-retry-1m", "604800000",
+                    "webhook-events-retry-10m", "604800000",
+                    "webhook-events-retry-1h", "604800000",
+                    "webhook-events-dead-letter", "2592000000"
+            );
+            List<ConfigResource> resources = expectedTopics.stream()
+                    .map(topic -> new ConfigResource(ConfigResource.Type.TOPIC, topic))
+                    .toList();
             Map<ConfigResource, Config> configs = adminClient
-                    .describeConfigs(List.of(webhookEvents, deliveryAttempts))
+                    .describeConfigs(resources)
                     .all()
                     .get(10, TimeUnit.SECONDS);
-            Assertions.assertThat(configValue(configs.get(webhookEvents), TopicConfig.CLEANUP_POLICY_CONFIG))
-                    .isEqualTo(TopicConfig.CLEANUP_POLICY_DELETE);
-            Assertions.assertThat(configValue(configs.get(webhookEvents), TopicConfig.RETENTION_MS_CONFIG))
-                    .isEqualTo("604800000");
-            Assertions.assertThat(configValue(configs.get(deliveryAttempts), TopicConfig.CLEANUP_POLICY_CONFIG))
-                    .isEqualTo(TopicConfig.CLEANUP_POLICY_DELETE);
-            Assertions.assertThat(configValue(configs.get(deliveryAttempts), TopicConfig.RETENTION_MS_CONFIG))
-                    .isEqualTo("2592000000");
+            for (ConfigResource resource : resources) {
+                Assertions.assertThat(configValue(configs.get(resource), TopicConfig.CLEANUP_POLICY_CONFIG))
+                        .isEqualTo(TopicConfig.CLEANUP_POLICY_DELETE);
+                Assertions.assertThat(configValue(configs.get(resource), TopicConfig.RETENTION_MS_CONFIG))
+                        .isEqualTo(expectedRetentions.get(resource.name()));
+            }
+
+            List<String> consumerUris = this.camelContext.getRoutes().stream()
+                    .map(route -> route.getEndpoint().getEndpointUri())
+                    .toList();
+            Assertions.assertThat(consumerUris).noneMatch(uri ->
+                    INFRASTRUCTURE_ONLY_TOPICS.stream().anyMatch(uri::contains)
+            );
+
+            this.seekToEnd(infrastructureConsumer, INFRASTRUCTURE_ONLY_TOPICS.toArray(String[]::new));
+            RECEIVER.respondWith(503);
+            HttpResponse<String> response = this.postEvent(
+                    "{\"eventType\":\"infrastructure-only.test\",\"payload\":{}}"
+            );
+            Assertions.assertThat(response.statusCode()).isEqualTo(202);
+            String eventId = this.objectMapper.readTree(response.body()).get("eventId").asString();
+            RECEIVER.awaitRequest(eventId, 4);
+            this.awaitAttemptRows(eventId, 4);
+            Assertions.assertThat(infrastructureConsumer.poll(Duration.ofSeconds(1)).isEmpty()).isTrue();
         }
     }
 
@@ -713,10 +842,11 @@ class CoreWebhookDeliveryLoopIntegrationTests {
         return new KafkaConsumer<>(properties);
     }
 
-    private void seekToEnd(KafkaConsumer<String, Object> consumer, String topic) {
-        List<TopicPartition> partitions = consumer.partitionsFor(topic, Duration.ofSeconds(10)).stream()
-                .map(PartitionInfo::partition)
-                .map(partition -> new TopicPartition(topic, partition))
+    private void seekToEnd(KafkaConsumer<String, Object> consumer, String... topics) {
+        List<TopicPartition> partitions = Stream.of(topics)
+                .flatMap(topic -> consumer.partitionsFor(topic, Duration.ofSeconds(10)).stream()
+                        .map(PartitionInfo::partition)
+                        .map(partition -> new TopicPartition(topic, partition)))
                 .toList();
         consumer.assign(partitions);
         consumer.seekToEnd(partitions);
@@ -809,6 +939,13 @@ class CoreWebhookDeliveryLoopIntegrationTests {
         return count == null ? 0 : count;
     }
 
+    private static void assertPhaseOneAuditFields(Map<String, Object> row) {
+        Assertions.assertThat(row)
+                .containsEntry("retry_count", 0)
+                .containsEntry("replay_count", 0)
+                .containsEntry("dead_lettered", false);
+    }
+
     private static byte[] bytes(ByteBuffer buffer) {
         ByteBuffer copy = buffer.duplicate();
         byte[] bytes = new byte[copy.remaining()];
@@ -834,6 +971,9 @@ class CoreWebhookDeliveryLoopIntegrationTests {
                 UUID.nameUUIDFromBytes(endpointId.getBytes(StandardCharsets.UTF_8)).toString(),
                 Instant.now(),
                 ByteBuffer.wrap(("{\"eventType\":\"" + eventType + "\"}").getBytes(StandardCharsets.UTF_8)),
+                0,
+                null,
+                0,
                 0
         );
     }

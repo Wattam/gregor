@@ -13,6 +13,8 @@ gregor:
         topics:
             default-partitions: 12
             replication-factor: 1
+            retry-retention: ${KAFKA_RETRY_TOPIC_RETENTION:7d}
+            dead-letter-retention: ${KAFKA_DEAD_LETTER_TOPIC_RETENTION:30d}
     webhook:
         tenant-id: ${WEBHOOK_TENANT_ID:00000000-0000-0000-0000-000000000001}
         endpoint-id: ${WEBHOOK_ENDPOINT_ID:00000000-0000-0000-0000-000000000002}
@@ -21,7 +23,7 @@ gregor:
         connection-timeout: ${WEBHOOK_CONNECTION_TIMEOUT:2s}
         response-timeout: ${WEBHOOK_RESPONSE_TIMEOUT:5s}
         receiver-timestamp-tolerance: ${WEBHOOK_RECEIVER_TIMESTAMP_TOLERANCE:5m}
-        maximum-attempts: ${WEBHOOK_MAXIMUM_ATTEMPTS:3}
+        maximum-attempts: ${WEBHOOK_MAXIMUM_ATTEMPTS:4}
 
 camel:
     component:

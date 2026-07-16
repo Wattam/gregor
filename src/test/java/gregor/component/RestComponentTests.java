@@ -55,6 +55,9 @@ class RestComponentTests {
                 "endpoint-123",
                 Instant.EPOCH,
                 payload,
+                0,
+                null,
+                0,
                 0
         );
         byte[] expectedBody = "{\"x\":1}".getBytes(StandardCharsets.UTF_8);
@@ -123,6 +126,9 @@ class RestComponentTests {
                     "endpoint-123",
                     Instant.EPOCH,
                     ByteBuffer.wrap("{}".getBytes(StandardCharsets.UTF_8)),
+                    0,
+                    null,
+                    0,
                     0
             );
             mockRestServiceServer
@@ -174,6 +180,9 @@ class RestComponentTests {
                     "endpoint-123",
                     Instant.EPOCH,
                     ByteBuffer.wrap("{}".getBytes(StandardCharsets.UTF_8)),
+                    0,
+                    null,
+                    0,
                     0
             );
             mockRestServiceServer
@@ -221,6 +230,9 @@ class RestComponentTests {
                 "endpoint-123",
                 Instant.EPOCH,
                 ByteBuffer.wrap("{}".getBytes(StandardCharsets.UTF_8)),
+                0,
+                null,
+                0,
                 0
         );
         String responseBody = "a" + "🙂".repeat(1_100);
@@ -258,6 +270,9 @@ class RestComponentTests {
                     "endpoint-123",
                     Instant.EPOCH,
                     ByteBuffer.wrap(payload),
+                    0,
+                    null,
+                    0,
                     0
             );
             mockRestServiceServer

@@ -5,9 +5,10 @@ and store delivery attempts in PostgreSQL.
 
 ## Run locally
 
-Start PostgreSQL, Kafka, and Apicurio Registry:
+After this schema change, recreate the local PostgreSQL and Kafka volumes before running Gregor. This reset is required:
 
 ```bash
+docker compose down --volumes
 docker compose up -d
 ```
 
@@ -28,7 +29,12 @@ The runtime supports these environment overrides:
 | `WEBHOOK_CONNECTION_TIMEOUT`           | `2s`                                                |
 | `WEBHOOK_RESPONSE_TIMEOUT`             | `5s`                                                |
 | `WEBHOOK_RECEIVER_TIMESTAMP_TOLERANCE` | `5m`                                                |
+| `WEBHOOK_MAXIMUM_ATTEMPTS`             | `4`                                                 |
 | `KAFKA_LISTENER_CONCURRENCY`           | `12`                                                |
+| `KAFKA_RETRY_TOPIC_RETENTION`          | `7d`                                                |
+| `KAFKA_DEAD_LETTER_TOPIC_RETENTION`    | `30d`                                               |
+
+`WEBHOOK_MAXIMUM_ATTEMPTS` must be from `1` through `4`. `KAFKA_RETRY_TOPIC_RETENTION` must exceed `1h`, and `KAFKA_DEAD_LETTER_TOPIC_RETENTION` must be positive.
 
 ## Ingest an event
 
@@ -55,10 +61,23 @@ Receivers must handle duplicate deliveries idempotently. Attempt persistence ign
 
 ```bash
 docker compose exec -T postgres psql -U gregor -d gregor -c \
-    'SELECT event_id, attempt_number, outcome, http_status, latency_ms, attempted_at, details FROM delivery_attempt ORDER BY attempted_at DESC;'
+    'SELECT event_id, attempt_number, outcome, http_status, latency_ms, attempted_at, retry_count, replay_count, dead_lettered, details FROM delivery_attempt ORDER BY attempted_at DESC;'
 ```
 
 The `details` column is PostgreSQL JSONB. Attempt rows do not contain the webhook payload or signing secret.
+
+Kafka declares this topic topology:
+
+| Topic                        | Retention                                           |
+|------------------------------|-----------------------------------------------------|
+| `webhook-events`             | 7 days                                              |
+| `persist-delivery-attempt`   | 30 days                                             |
+| `webhook-events-retry-1m`    | Configured retry retention (`7d` by default)        |
+| `webhook-events-retry-10m`   | Configured retry retention (`7d` by default)        |
+| `webhook-events-retry-1h`    | Configured retry retention (`7d` by default)        |
+| `webhook-events-dead-letter` | Configured dead-letter retention (`30d` by default) |
+
+All topics use 12 default partitions and replication factor 1. The four new retry and dead-letter topics have no producers or consumers. Retryable failures still run immediately up to the configured maximum attempt count.
 
 ## Local receiver and signatures
 

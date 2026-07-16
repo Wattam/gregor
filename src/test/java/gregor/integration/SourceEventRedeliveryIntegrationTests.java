@@ -142,10 +142,13 @@ class SourceEventRedeliveryIntegrationTests {
                 "00000000-0000-0000-0000-000000000002",
                 Instant.now(),
                 ByteBuffer.wrap(payload),
+                0,
+                null,
+                0,
                 0
         );
         AtomicInteger publicationCount = new AtomicInteger();
-        ConcurrentLinkedQueue<Integer> attemptNumbers = new ConcurrentLinkedQueue<>();
+        ConcurrentLinkedQueue<DeliveryAttempt> attempts = new ConcurrentLinkedQueue<>();
         AdviceWith.adviceWith(
                 this.camelContext,
                 WebhookRoute.WEBHOOK_DELIVERY_ATTEMPT_DIRECT,
@@ -154,7 +157,7 @@ class SourceEventRedeliveryIntegrationTests {
                         .process(exchange -> {
                             DeliveryAttempt attempt = exchange.getMessage().getBody(DeliveryAttempt.class);
                             if (eventId.equals(attempt.getEventId())) {
-                                attemptNumbers.add(attempt.getAttemptNumber());
+                                attempts.add(attempt);
                                 if (publicationCount.incrementAndGet() == 1) {
                                     throw new IllegalStateException("delivery-attempt publication unavailable");
                                 }
@@ -198,7 +201,12 @@ class SourceEventRedeliveryIntegrationTests {
                             request.body()
                     ));
                 });
-        Assertions.assertThat(attemptNumbers).containsExactly(1, 1);
+        Assertions.assertThat(attempts).hasSize(2).allSatisfy(attempt -> {
+            Assertions.assertThat(attempt.getAttemptNumber()).isEqualTo(1);
+            Assertions.assertThat(attempt.getRetryCount()).isZero();
+            Assertions.assertThat(attempt.getReplayCount()).isZero();
+            Assertions.assertThat(attempt.getDeadLettered()).isFalse();
+        });
     }
 
     private void awaitPublicationCount(AtomicInteger publicationCount, int expectedCount) throws InterruptedException {

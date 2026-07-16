@@ -61,6 +61,21 @@
         {
             "name": "details",
             "type": "bytes"
+        },
+        {
+            "name": "retryCount",
+            "type": "int",
+            "default": 0
+        },
+        {
+            "name": "replayCount",
+            "type": "int",
+            "default": 0
+        },
+        {
+            "name": "deadLettered",
+            "type": "boolean",
+            "default": false
         }
     ]
 }

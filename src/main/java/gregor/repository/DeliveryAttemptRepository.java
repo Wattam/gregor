@@ -18,11 +18,12 @@ public interface DeliveryAttemptRepository extends JpaRepository<DeliveryAttempt
             value = """
                     INSERT INTO delivery_attempt (
                         attempt_id, event_id, tenant_id, endpoint_id, event_type,
-                        attempt_number, outcome, http_status, latency_ms, attempted_at, details
+                        attempt_number, outcome, http_status, latency_ms, attempted_at, details,
+                        retry_count, replay_count, dead_lettered
                     ) VALUES (
                         :attemptId, :eventId, :tenantId, :endpointId, :eventType,
                         :attemptNumber, :outcome, :httpStatus, :latencyMs, :attemptedAt,
-                        CAST(:details AS jsonb)
+                        CAST(:details AS jsonb), :retryCount, :replayCount, :deadLettered
                     )
                     ON CONFLICT (event_id, attempt_number) DO NOTHING
                     """,
@@ -39,6 +40,9 @@ public interface DeliveryAttemptRepository extends JpaRepository<DeliveryAttempt
             @Param("httpStatus") Integer httpStatus,
             @Param("latencyMs") long latencyMs,
             @Param("attemptedAt") Instant attemptedAt,
-            @Param("details") String details
+            @Param("details") String details,
+            @Param("retryCount") int retryCount,
+            @Param("replayCount") int replayCount,
+            @Param("deadLettered") boolean deadLettered
     );
 }

@@ -61,4 +61,13 @@ public class DeliveryAttempt {
     @JdbcTypeCode(SqlTypes.JSON)
     @Column(nullable = false, columnDefinition = "JSONB")
     private Map<String, String> details;
+
+    @Column(nullable = false)
+    private int retryCount;
+
+    @Column(nullable = false)
+    private int replayCount;
+
+    @Column(nullable = false)
+    private boolean deadLettered;
 }

@@ -34,6 +34,27 @@
             "name": "retryCount",
             "type": "int",
             "default": 0
+        },
+        {
+            "name": "nextEligibleAt",
+            "type": [
+                "null",
+                {
+                    "type": "long",
+                    "logicalType": "timestamp-millis"
+                }
+            ],
+            "default": null
+        },
+        {
+            "name": "deliveryAttemptCount",
+            "type": "int",
+            "default": 0
+        },
+        {
+            "name": "replayCount",
+            "type": "int",
+            "default": 0
         }
     ]
 }

@@ -47,6 +47,9 @@ public class WebhookService {
                     this.webhookProperties.endpointId(),
                     Instant.now(this.clock),
                     ByteBuffer.wrap(payload),
+                    0,
+                    null,
+                    0,
                     0
             );
             this.producerTemplate.sendBodyAndHeader(
@@ -87,7 +90,10 @@ public class WebhookService {
                 result.httpStatus(),
                 result.latencyMs(),
                 result.attemptedAt(),
-                ByteBuffer.wrap(details)
+                ByteBuffer.wrap(details),
+                0,
+                0,
+                false
         );
     }
 
@@ -116,7 +122,10 @@ public class WebhookService {
                 deliveryAttempt.getHttpStatus(),
                 deliveryAttempt.getLatencyMs(),
                 deliveryAttempt.getAttemptedAt(),
-                details
+                details,
+                deliveryAttempt.getRetryCount(),
+                deliveryAttempt.getReplayCount(),
+                deliveryAttempt.getDeadLettered()
         );
         if (inserted != 0 && inserted != 1) {
             throw new IllegalStateException("Unexpected delivery attempt insert count: " + inserted);

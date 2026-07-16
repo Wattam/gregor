@@ -8,6 +8,7 @@ import gregor.dto.DeliveryOutcome;
 import gregor.dto.WebhookRouteMessage;
 import gregor.service.WebhookService;
 import org.apache.camel.CamelContext;
+import org.apache.camel.Endpoint;
 import org.apache.camel.ProducerTemplate;
 import org.apache.camel.builder.AdviceWith;
 import org.apache.camel.component.kafka.KafkaConstants;
@@ -33,7 +34,10 @@ import java.util.List;
 import java.util.Map;
 
 @UseAdviceWith
-@SpringBootTest
+@SpringBootTest(properties = {
+        "gregor.kafka.topics.retry-retention=7d",
+        "gregor.kafka.topics.dead-letter-retention=30d"
+})
 @CamelSpringBootTest
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_EACH_TEST_METHOD)
 class WebhookRouteTests {
@@ -65,6 +69,16 @@ class WebhookRouteTests {
                 .isEqualTo(WebhookRoute.WEBHOOK_DELIVERY_ATTEMPT_DIRECT);
         Assertions.assertThat(sourceUri(modelCamelContext, DELIVERY_ATTEMPT_PERSISTENCE_URI))
                 .isEqualTo(DELIVERY_ATTEMPT_PERSISTENCE_URI);
+        Assertions.assertThat(modelCamelContext.getRouteDefinitions()).hasSize(3);
+        List<String> inactiveTopics = List.of(
+                WebhookRoute.WEBHOOK_EVENT_RETRY_1M_TOPIC,
+                WebhookRoute.WEBHOOK_EVENT_RETRY_10M_TOPIC,
+                WebhookRoute.WEBHOOK_EVENT_RETRY_1H_TOPIC,
+                WebhookRoute.WEBHOOK_EVENT_DEAD_LETTER_TOPIC
+        );
+        Assertions.assertThat(this.camelContext.getEndpoints())
+                .extracting(Endpoint::getEndpointUri)
+                .noneMatch(endpointUri -> inactiveTopics.stream().anyMatch(endpointUri::contains));
     }
 
     @Test
@@ -291,7 +305,10 @@ class WebhookRouteTests {
                 "endpoint-1",
                 Instant.EPOCH,
                 ByteBuffer.wrap("{}".getBytes(StandardCharsets.UTF_8)),
-                retryCount
+                retryCount,
+                null,
+                0,
+                0
         );
     }
 
@@ -311,7 +328,10 @@ class WebhookRouteTests {
                 204,
                 1L,
                 Instant.EPOCH,
-                ByteBuffer.wrap("{}".getBytes(StandardCharsets.UTF_8))
+                ByteBuffer.wrap("{}".getBytes(StandardCharsets.UTF_8)),
+                0,
+                0,
+                false
         );
     }
 }
