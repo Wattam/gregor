@@ -67,9 +67,11 @@ class WebhookRouteTests {
         Assertions.assertThat(sourceUri(modelCamelContext, WEBHOOK_DELIVERY_URI)).isEqualTo(WEBHOOK_DELIVERY_URI);
         Assertions.assertThat(sourceUri(modelCamelContext, WebhookRoute.WEBHOOK_DELIVERY_ATTEMPT_DIRECT))
                 .isEqualTo(WebhookRoute.WEBHOOK_DELIVERY_ATTEMPT_DIRECT);
+        Assertions.assertThat(sourceUri(modelCamelContext, WebhookRoute.WEBHOOK_DELIVERY_RESULT_DIRECT))
+                .isEqualTo(WebhookRoute.WEBHOOK_DELIVERY_RESULT_DIRECT);
         Assertions.assertThat(sourceUri(modelCamelContext, DELIVERY_ATTEMPT_PERSISTENCE_URI))
                 .isEqualTo(DELIVERY_ATTEMPT_PERSISTENCE_URI);
-        Assertions.assertThat(modelCamelContext.getRouteDefinitions()).hasSize(3);
+        Assertions.assertThat(modelCamelContext.getRouteDefinitions()).hasSize(4);
         List<String> inactiveTopics = List.of(
                 WebhookRoute.WEBHOOK_EVENT_RETRY_1M_TOPIC,
                 WebhookRoute.WEBHOOK_EVENT_RETRY_10M_TOPIC,
@@ -84,7 +86,11 @@ class WebhookRouteTests {
     @Test
     void terminalResultsPublishOneAttemptAndCommitWithoutRepublishingTheEvent() throws Exception {
         this.adviseDeliveryAndAttemptPublication();
-        this.startRoutes(WebhookRoute.WEBHOOK_DELIVERY_ATTEMPT_DIRECT, WEBHOOK_DELIVERY_URI);
+        this.startRoutes(
+                WebhookRoute.WEBHOOK_DELIVERY_RESULT_DIRECT,
+                WebhookRoute.WEBHOOK_DELIVERY_ATTEMPT_DIRECT,
+                WEBHOOK_DELIVERY_URI
+        );
         MockEndpoint attempts = this.camelContext.getEndpoint(DELIVERY_ATTEMPT_OUTPUT, MockEndpoint.class);
         attempts.expectedMessageCount(2);
 
@@ -92,8 +98,11 @@ class WebhookRouteTests {
             WebhookEvent webhookEvent = event("event-" + outcome.name());
             DeliveryAttemptResult deliveryAttemptResult = result(outcome);
             DeliveryAttempt attempt = attempt(webhookEvent.getEventId(), 1, outcome);
-            WebhookRouteMessage initial = new WebhookRouteMessage(webhookEvent, null, 0);
-            WebhookRouteMessage sent = new WebhookRouteMessage(webhookEvent, deliveryAttemptResult, 1);
+            WebhookRouteMessage initial = new WebhookRouteMessage(webhookEvent, null);
+            WebhookRouteMessage sent = new WebhookRouteMessage(
+                    event("event-" + outcome.name(), 0, 1),
+                    deliveryAttemptResult
+            );
             Mockito.when(this.webhookService.createWebhookRouteMessage(webhookEvent)).thenReturn(initial);
             Mockito.when(this.webhookService.sendWebhookEvent(initial)).thenReturn(sent);
             Mockito.when(this.webhookService.createAttempt(sent)).thenReturn(attempt);
@@ -106,9 +115,11 @@ class WebhookRouteTests {
                     Map.of(KafkaConstants.MANUAL_COMMIT, kafkaManualCommit, "source-metadata", "must-not-propagate")
             );
 
+            Mockito.verify(this.webhookService).hasImpossibleDeliveryState(initial);
             Mockito.verify(this.webhookService).sendWebhookEvent(initial);
             Mockito.verify(this.webhookService).createAttempt(sent);
             Mockito.verify(this.webhookService).shouldRetry(sent);
+            Mockito.verify(this.webhookService, Mockito.never()).logDiscardedEnvelope(Mockito.any());
             Mockito.verify(kafkaManualCommit).commit();
         }
         MockEndpoint.assertIsSatisfied(this.camelContext);
@@ -132,14 +143,17 @@ class WebhookRouteTests {
         ));
         WebhookEvent webhookEvent = event("event-retry", 7);
         DeliveryAttemptResult deliveryAttemptResult = result(DeliveryOutcome.RETRYABLE_FAILURE);
-        WebhookRouteMessage initialMessage = new WebhookRouteMessage(webhookEvent, null, 0);
+        WebhookRouteMessage initialMessage = new WebhookRouteMessage(webhookEvent, null);
         List<WebhookRouteMessage> sentMessages = new ArrayList<>();
         WebhookRouteMessage inputMessage = initialMessage;
         for (int attemptNumber = 1; attemptNumber <= maximumAttempts; attemptNumber++) {
-            WebhookRouteMessage sent = new WebhookRouteMessage(webhookEvent, deliveryAttemptResult, attemptNumber);
+            WebhookRouteMessage sent = new WebhookRouteMessage(
+                    event("event-retry", 7, attemptNumber),
+                    deliveryAttemptResult
+            );
             sentMessages.add(sent);
             Mockito.when(this.webhookService.sendWebhookEvent(inputMessage)).thenAnswer(_ -> {
-                operations.add("send-" + sent.attemptNumber());
+                operations.add("send-" + sent.webhookEvent().getDeliveryAttemptCount());
                 return sent;
             });
             Mockito.when(this.webhookService.createAttempt(sent)).thenReturn(attempt(
@@ -156,7 +170,11 @@ class WebhookRouteTests {
             operations.add("commit");
             return null;
         }).when(kafkaManualCommit).commit();
-        this.startRoutes(WebhookRoute.WEBHOOK_DELIVERY_ATTEMPT_DIRECT, WEBHOOK_DELIVERY_URI);
+        this.startRoutes(
+                WebhookRoute.WEBHOOK_DELIVERY_RESULT_DIRECT,
+                WebhookRoute.WEBHOOK_DELIVERY_ATTEMPT_DIRECT,
+                WEBHOOK_DELIVERY_URI
+        );
 
         this.producerTemplate.sendBodyAndHeader(
                 WEBHOOK_DELIVERY_INPUT,
@@ -177,8 +195,11 @@ class WebhookRouteTests {
         for (WebhookRouteMessage sentMessage : sentMessages.subList(0, maximumAttempts - 1)) {
             Mockito.verify(this.webhookService).sendWebhookEvent(sentMessage);
         }
+        Mockito.verify(this.webhookService, Mockito.times(maximumAttempts))
+                .hasImpossibleDeliveryState(Mockito.any());
         Mockito.verify(kafkaManualCommit).commit();
         Assertions.assertThat(webhookEvent.getRetryCount()).isEqualTo(7);
+        Assertions.assertThat(webhookEvent.getDeliveryAttemptCount()).isZero();
     }
 
     @Test
@@ -191,13 +212,20 @@ class WebhookRouteTests {
         WebhookEvent webhookEvent = event("event-failure");
         DeliveryAttemptResult deliveryAttemptResult = result(DeliveryOutcome.RETRYABLE_FAILURE);
         DeliveryAttempt deliveryAttempt = attempt(webhookEvent.getEventId(), 1, deliveryAttemptResult.outcome());
-        WebhookRouteMessage initialMessage = new WebhookRouteMessage(webhookEvent, null, 0);
-        WebhookRouteMessage sentMessage = new WebhookRouteMessage(webhookEvent, deliveryAttemptResult, 1);
+        WebhookRouteMessage initialMessage = new WebhookRouteMessage(webhookEvent, null);
+        WebhookRouteMessage sentMessage = new WebhookRouteMessage(
+                event("event-failure", 0, 1),
+                deliveryAttemptResult
+        );
         Mockito.when(this.webhookService.createWebhookRouteMessage(webhookEvent)).thenReturn(initialMessage);
         Mockito.when(this.webhookService.sendWebhookEvent(initialMessage)).thenReturn(sentMessage);
         Mockito.when(this.webhookService.createAttempt(sentMessage)).thenReturn(deliveryAttempt);
         KafkaManualCommit kafkaManualCommit = Mockito.mock(KafkaManualCommit.class);
-        this.startRoutes(WebhookRoute.WEBHOOK_DELIVERY_ATTEMPT_DIRECT, WEBHOOK_DELIVERY_URI);
+        this.startRoutes(
+                WebhookRoute.WEBHOOK_DELIVERY_RESULT_DIRECT,
+                WebhookRoute.WEBHOOK_DELIVERY_ATTEMPT_DIRECT,
+                WEBHOOK_DELIVERY_URI
+        );
 
         Assertions.assertThatThrownBy(() -> this.producerTemplate.sendBodyAndHeader(
                 WEBHOOK_DELIVERY_INPUT,
@@ -210,6 +238,80 @@ class WebhookRouteTests {
         Mockito.verify(this.webhookService).createAttempt(sentMessage);
         Mockito.verify(this.webhookService, Mockito.never()).shouldRetry(Mockito.any());
         Mockito.verify(kafkaManualCommit, Mockito.never()).commit();
+    }
+
+    @Test
+    void impossibleDeliveryStateDiscardsTheEnvelopeWithoutDeliveringOrPublishing() throws Exception {
+        this.adviseDeliveryAndAttemptPublication();
+        MockEndpoint attempts = this.camelContext.getEndpoint(DELIVERY_ATTEMPT_OUTPUT, MockEndpoint.class);
+        attempts.expectedMessageCount(0);
+        WebhookEvent webhookEvent = event("event-impossible", 0, this.webhookProperties.maximumAttempts());
+        WebhookRouteMessage initialMessage = new WebhookRouteMessage(webhookEvent, null);
+        Mockito.when(this.webhookService.createWebhookRouteMessage(webhookEvent)).thenReturn(initialMessage);
+        Mockito.when(this.webhookService.hasImpossibleDeliveryState(initialMessage)).thenReturn(true);
+        KafkaManualCommit kafkaManualCommit = Mockito.mock(KafkaManualCommit.class);
+        this.startRoutes(
+                WebhookRoute.WEBHOOK_DELIVERY_RESULT_DIRECT,
+                WebhookRoute.WEBHOOK_DELIVERY_ATTEMPT_DIRECT,
+                WEBHOOK_DELIVERY_URI
+        );
+
+        Assertions.assertThatCode(() -> this.producerTemplate.sendBodyAndHeader(
+                WEBHOOK_DELIVERY_INPUT,
+                webhookEvent,
+                KafkaConstants.MANUAL_COMMIT,
+                kafkaManualCommit
+        )).doesNotThrowAnyException();
+
+        MockEndpoint.assertIsSatisfied(this.camelContext);
+        Mockito.verify(this.webhookService).logDiscardedEnvelope(initialMessage);
+        Mockito.verify(this.webhookService, Mockito.never()).sendWebhookEvent(Mockito.any());
+        Mockito.verify(this.webhookService, Mockito.never()).createAttempt(Mockito.any());
+        Mockito.verify(this.webhookService, Mockito.never()).shouldRetry(Mockito.any());
+        Mockito.verify(kafkaManualCommit).commit();
+    }
+
+    @Test
+    void checksTheGuardBeforeEachImmediateRetryRequest() throws Exception {
+        this.adviseDeliveryAndAttemptPublication();
+        MockEndpoint attempts = this.camelContext.getEndpoint(DELIVERY_ATTEMPT_OUTPUT, MockEndpoint.class);
+        attempts.expectedMessageCount(1);
+        WebhookEvent webhookEvent = event("event-reentry");
+        DeliveryAttemptResult deliveryAttemptResult = result(DeliveryOutcome.RETRYABLE_FAILURE);
+        WebhookRouteMessage initialMessage = new WebhookRouteMessage(webhookEvent, null);
+        WebhookRouteMessage sentMessage = new WebhookRouteMessage(
+                event("event-reentry", 0, 1),
+                deliveryAttemptResult
+        );
+        Mockito.when(this.webhookService.createWebhookRouteMessage(webhookEvent)).thenReturn(initialMessage);
+        Mockito.when(this.webhookService.hasImpossibleDeliveryState(initialMessage)).thenReturn(false);
+        Mockito.when(this.webhookService.hasImpossibleDeliveryState(sentMessage)).thenReturn(true);
+        Mockito.when(this.webhookService.sendWebhookEvent(initialMessage)).thenReturn(sentMessage);
+        Mockito.when(this.webhookService.createAttempt(sentMessage))
+                .thenReturn(attempt("event-reentry", 1, DeliveryOutcome.RETRYABLE_FAILURE));
+        Mockito.when(this.webhookService.shouldRetry(sentMessage)).thenReturn(true);
+        KafkaManualCommit kafkaManualCommit = Mockito.mock(KafkaManualCommit.class);
+        this.startRoutes(
+                WebhookRoute.WEBHOOK_DELIVERY_RESULT_DIRECT,
+                WebhookRoute.WEBHOOK_DELIVERY_ATTEMPT_DIRECT,
+                WEBHOOK_DELIVERY_URI
+        );
+
+        this.producerTemplate.sendBodyAndHeader(
+                WEBHOOK_DELIVERY_INPUT,
+                webhookEvent,
+                KafkaConstants.MANUAL_COMMIT,
+                kafkaManualCommit
+        );
+
+        MockEndpoint.assertIsSatisfied(this.camelContext);
+        Mockito.verify(this.webhookService).sendWebhookEvent(initialMessage);
+        Mockito.verify(this.webhookService, Mockito.never()).sendWebhookEvent(sentMessage);
+        Mockito.verify(this.webhookService).createAttempt(sentMessage);
+        Mockito.verify(this.webhookService).shouldRetry(sentMessage);
+        Mockito.verify(this.webhookService).logDiscardedEnvelope(sentMessage);
+        Mockito.verify(this.webhookService, Mockito.times(2)).hasImpossibleDeliveryState(Mockito.any());
+        Mockito.verify(kafkaManualCommit).commit();
     }
 
     @Test
@@ -275,7 +377,7 @@ class WebhookRouteTests {
         );
         AdviceWith.adviceWith(
                 this.camelContext,
-                WebhookRoute.WEBHOOK_DELIVERY_ATTEMPT_DIRECT,
+                WebhookRoute.WEBHOOK_DELIVERY_RESULT_DIRECT,
                 advice -> advice.weaveByToUri("kafka:persist-delivery-attempt").replace().to(DELIVERY_ATTEMPT_OUTPUT)
         );
     }
@@ -298,6 +400,10 @@ class WebhookRouteTests {
     }
 
     private static WebhookEvent event(String eventId, int retryCount) {
+        return event(eventId, retryCount, 0);
+    }
+
+    private static WebhookEvent event(String eventId, int retryCount, int deliveryAttemptCount) {
         return new WebhookEvent(
                 eventId,
                 "order.created",
@@ -307,13 +413,13 @@ class WebhookRouteTests {
                 ByteBuffer.wrap("{}".getBytes(StandardCharsets.UTF_8)),
                 retryCount,
                 null,
-                0,
+                deliveryAttemptCount,
                 0
         );
     }
 
     private static DeliveryAttemptResult result(DeliveryOutcome outcome) {
-        return new DeliveryAttemptResult(outcome, 204, 1L, Instant.EPOCH, Map.of());
+        return new DeliveryAttemptResult(outcome, 204, 1L, Instant.EPOCH, Instant.EPOCH.plusSeconds(2), Map.of());
     }
 
     private static DeliveryAttempt attempt(String eventId, int attemptNumber, DeliveryOutcome outcome) {

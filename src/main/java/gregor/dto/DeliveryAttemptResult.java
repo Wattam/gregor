@@ -8,5 +8,6 @@ public record DeliveryAttemptResult(
         Integer httpStatus,
         long latencyMs,
         Instant attemptedAt,
+        Instant completedAt,
         Map<String, String> details
 ) {}

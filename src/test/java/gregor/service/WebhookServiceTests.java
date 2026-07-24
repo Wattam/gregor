@@ -26,6 +26,8 @@ import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -48,11 +50,11 @@ class WebhookServiceTests {
 
         WebhookRouteMessage initialMessage = webhookService.createWebhookRouteMessage(webhookEvent);
 
-        Assertions.assertThat(initialMessage).isEqualTo(new WebhookRouteMessage(webhookEvent, null, 0));
+        Assertions.assertThat(initialMessage).isEqualTo(new WebhookRouteMessage(webhookEvent, null));
     }
 
     @Test
-    void sendsTheWebhookAndAdvancesTheRouteMessage() {
+    void sendsTheWebhookAndAdvancesTheEnvelopeDeliveryAttemptCount() {
         RestComponent restComponent = Mockito.mock(RestComponent.class);
         WebhookService webhookService = new WebhookService(
                 restComponent,
@@ -62,20 +64,26 @@ class WebhookServiceTests {
                 Mockito.mock(ProducerTemplate.class),
                 Clock.systemUTC()
         );
-        WebhookEvent webhookEvent = event();
+        WebhookEvent webhookEvent = event(2, 1, 3);
         DeliveryAttemptResult result = new DeliveryAttemptResult(
                 DeliveryOutcome.SUCCEEDED,
                 204,
                 1L,
                 Instant.EPOCH,
+                Instant.EPOCH.plusSeconds(2),
                 Map.of()
         );
-        WebhookRouteMessage input = new WebhookRouteMessage(webhookEvent, null, 2);
+        WebhookRouteMessage input = new WebhookRouteMessage(webhookEvent, null);
         Mockito.when(restComponent.sendWebhook(webhookEvent)).thenReturn(result);
 
         WebhookRouteMessage output = webhookService.sendWebhookEvent(input);
 
-        Assertions.assertThat(output).isEqualTo(new WebhookRouteMessage(webhookEvent, result, 3));
+        Assertions.assertThat(output).isEqualTo(new WebhookRouteMessage(event(3, 1, 3), result));
+        Assertions.assertThat(output.webhookEvent().getDeliveryAttemptCount()).isEqualTo(3);
+        Assertions.assertThat(output.webhookEvent().getRetryCount()).isEqualTo(1);
+        Assertions.assertThat(output.webhookEvent().getReplayCount()).isEqualTo(3);
+        Assertions.assertThat(output.webhookEvent().getNextEligibleAt()).isNull();
+        Assertions.assertThat(webhookEvent.getDeliveryAttemptCount()).isEqualTo(2);
         Mockito.verify(restComponent).sendWebhook(webhookEvent);
     }
 
@@ -83,16 +91,17 @@ class WebhookServiceTests {
     void createsACompleteAttemptWithoutSensitiveEventData() {
         ObjectMapper objectMapper = new ObjectMapper();
         WebhookService webhookService = service(objectMapper);
-        WebhookEvent webhookEvent = event();
+        WebhookEvent webhookEvent = event(2, 5, 3);
         DeliveryAttemptResult deliveryAttemptResult = new DeliveryAttemptResult(
                 DeliveryOutcome.RETRYABLE_FAILURE,
                 503,
                 37L,
                 Instant.parse("2026-07-10T12:00:00Z"),
+                Instant.parse("2026-07-10T12:00:02Z"),
                 Map.of("type", "HTTP_FAILURE", "responseBody", "unavailable")
         );
 
-        WebhookRouteMessage inputMessage = new WebhookRouteMessage(webhookEvent, deliveryAttemptResult, 2);
+        WebhookRouteMessage inputMessage = new WebhookRouteMessage(webhookEvent, deliveryAttemptResult);
 
         DeliveryAttempt deliveryAttempt = webhookService.createAttempt(inputMessage);
 
@@ -106,8 +115,8 @@ class WebhookServiceTests {
         Assertions.assertThat(deliveryAttempt.getHttpStatus()).isEqualTo(503);
         Assertions.assertThat(deliveryAttempt.getLatencyMs()).isEqualTo(37L);
         Assertions.assertThat(deliveryAttempt.getAttemptedAt()).isEqualTo(Instant.parse("2026-07-10T12:00:00Z"));
-        Assertions.assertThat(deliveryAttempt.getRetryCount()).isZero();
-        Assertions.assertThat(deliveryAttempt.getReplayCount()).isZero();
+        Assertions.assertThat(deliveryAttempt.getRetryCount()).isEqualTo(5);
+        Assertions.assertThat(deliveryAttempt.getReplayCount()).isEqualTo(3);
         Assertions.assertThat(deliveryAttempt.getDeadLettered()).isFalse();
         byte[] detailsBytes = bytes(deliveryAttempt.getDetails());
         JsonNode details = objectMapper.readTree(detailsBytes);
@@ -117,6 +126,8 @@ class WebhookServiceTests {
                 .doesNotContain("payload-marker", "signing-secret");
         Assertions.assertThat(DeliveryAttempt.getClassSchema().getField("payload")).isNull();
         Assertions.assertThat(DeliveryAttempt.getClassSchema().getField("signingSecret")).isNull();
+        Assertions.assertThat(DeliveryAttempt.getClassSchema().getField("completedAt")).isNull();
+        Assertions.assertThat(WebhookEvent.getClassSchema().getField("completedAt")).isNull();
     }
 
     @Test
@@ -132,8 +143,14 @@ class WebhookServiceTests {
         List<DeliveryAttempt> deliveryAttempts = outcomes.keySet().stream()
                 .map(deliveryOutcome -> webhookService.createAttempt(new WebhookRouteMessage(
                         webhookEvent,
-                        new DeliveryAttemptResult(deliveryOutcome, null, 1L, Instant.EPOCH, Map.of()),
-                        1
+                        new DeliveryAttemptResult(
+                                deliveryOutcome,
+                                null,
+                                1L,
+                                Instant.EPOCH,
+                                Instant.EPOCH.plusSeconds(2),
+                                Map.of()
+                        )
                 )))
                 .toList();
 
@@ -153,42 +170,125 @@ class WebhookServiceTests {
                 204,
                 1L,
                 Instant.EPOCH,
+                Instant.EPOCH.plusSeconds(2),
                 Map.of()
         );
         IllegalStateException failure = new IllegalStateException("serialization failed");
         Mockito.when(objectMapper.writeValueAsBytes(deliveryAttemptResult.details())).thenThrow(failure);
 
-        WebhookRouteMessage webhookRouteMessage = new WebhookRouteMessage(event(), deliveryAttemptResult, 1);
+        WebhookRouteMessage webhookRouteMessage = new WebhookRouteMessage(event(1), deliveryAttemptResult);
 
         Assertions.assertThatThrownBy(() -> webhookService.createAttempt(webhookRouteMessage)).isSameAs(failure);
     }
 
     @Test
-    void retriesOnlyRetryableFailuresBeforeTheConfiguredMaximumAttempt() {
+    void retriesOnlyRetryableFailuresBelowTheConfiguredMaximumAttempts() {
         WebhookProperties webhookProperties = WebhookPropertiesFixtures.create(4);
         WebhookService webhookService = service(new ObjectMapper(), webhookProperties);
+        int maximumAttempts = webhookProperties.maximumAttempts();
 
-        for (int attemptNumber = 1; attemptNumber <= webhookProperties.maximumAttempts(); attemptNumber++) {
+        for (int deliveryAttemptCount = 1; deliveryAttemptCount <= maximumAttempts; deliveryAttemptCount++) {
             for (DeliveryOutcome deliveryOutcome : DeliveryOutcome.values()) {
                 DeliveryAttemptResult deliveryAttemptResult = new DeliveryAttemptResult(
                         deliveryOutcome,
                         null,
                         1L,
                         Instant.EPOCH,
+                        Instant.EPOCH.plusSeconds(2),
                         Map.of()
                 );
 
                 WebhookRouteMessage webhookRouteMessage = new WebhookRouteMessage(
-                        event(),
-                        deliveryAttemptResult,
-                        attemptNumber
+                        event(deliveryAttemptCount),
+                        deliveryAttemptResult
                 );
 
                 Assertions.assertThat(webhookService.shouldRetry(webhookRouteMessage)).isEqualTo(
                         deliveryOutcome == DeliveryOutcome.RETRYABLE_FAILURE
-                                && attemptNumber < webhookProperties.maximumAttempts()
+                                && deliveryAttemptCount < maximumAttempts
                 );
             }
+        }
+    }
+
+    @Test
+    void detectsOnlyImpossibleDeliveryStates() {
+        WebhookProperties webhookProperties = WebhookPropertiesFixtures.create(4);
+        WebhookService webhookService = service(new ObjectMapper(), webhookProperties);
+        Map<WebhookEvent, Boolean> cases = new LinkedHashMap<>();
+        cases.put(event(0), false);
+        cases.put(event(3), false);
+        cases.put(event(4), true);
+        cases.put(event(5), true);
+        cases.put(event(-1), true);
+        cases.put(event(0, -1, 0), true);
+        cases.put(event(0, 0, -1), true);
+        cases.put(event(1, 3, 0), false);
+        cases.put(event(0, 0, 0, Instant.parse("2026-07-10T12:00:00Z")), false);
+
+        for (Map.Entry<WebhookEvent, Boolean> testCase : cases.entrySet()) {
+            WebhookRouteMessage webhookRouteMessage = new WebhookRouteMessage(testCase.getKey(), null);
+
+            Assertions.assertThat(webhookService.hasImpossibleDeliveryState(webhookRouteMessage))
+                    .isEqualTo(testCase.getValue());
+        }
+    }
+
+    @Test
+    void discardsAnImpossibleEnvelopeWithoutThrowing() {
+        WebhookService webhookService = service(new ObjectMapper(), WebhookPropertiesFixtures.create(4));
+        WebhookRouteMessage webhookRouteMessage = new WebhookRouteMessage(event(4), null);
+
+        Assertions.assertThatCode(() -> webhookService.logDiscardedEnvelope(webhookRouteMessage))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    void numbersEveryHttpRequestFromTheEnvelopeDeliveryAttemptCount() {
+        WebhookProperties webhookProperties = WebhookPropertiesFixtures.create(4);
+        Map<Integer, List<Integer>> cases = new LinkedHashMap<>();
+        cases.put(0, List.of(1, 2, 3, 4));
+        cases.put(2, List.of(3, 4));
+
+        for (Map.Entry<Integer, List<Integer>> testCase : cases.entrySet()) {
+            RestComponent restComponent = Mockito.mock(RestComponent.class);
+            WebhookService webhookService = new WebhookService(
+                    restComponent,
+                    Mockito.mock(DeliveryAttemptRepository.class),
+                    new ObjectMapper(),
+                    webhookProperties,
+                    Mockito.mock(ProducerTemplate.class),
+                    Clock.systemUTC()
+            );
+            Mockito.when(restComponent.sendWebhook(Mockito.any())).thenReturn(new DeliveryAttemptResult(
+                    DeliveryOutcome.RETRYABLE_FAILURE,
+                    503,
+                    1L,
+                    Instant.EPOCH,
+                    Instant.EPOCH.plusSeconds(2),
+                    Map.of()
+            ));
+            WebhookRouteMessage webhookRouteMessage =
+                    webhookService.createWebhookRouteMessage(event(testCase.getKey()));
+            List<Integer> attemptNumbers = new ArrayList<>();
+
+            while (!webhookService.hasImpossibleDeliveryState(webhookRouteMessage)) {
+                webhookRouteMessage = webhookService.sendWebhookEvent(webhookRouteMessage);
+                attemptNumbers.add(webhookService.createAttempt(webhookRouteMessage).getAttemptNumber());
+                if (!webhookService.shouldRetry(webhookRouteMessage)) {
+                    break;
+                }
+            }
+
+            ArgumentCaptor<WebhookEvent> requestedEvents = ArgumentCaptor.forClass(WebhookEvent.class);
+            Mockito.verify(restComponent, Mockito.times(testCase.getValue().size()))
+                    .sendWebhook(requestedEvents.capture());
+            Assertions.assertThat(requestedEvents.getAllValues())
+                    .extracting(requestedEvent -> requestedEvent.getDeliveryAttemptCount() + 1)
+                    .containsExactlyElementsOf(testCase.getValue());
+            Assertions.assertThat(attemptNumbers).containsExactlyElementsOf(testCase.getValue());
+            Assertions.assertThat(webhookRouteMessage.webhookEvent().getDeliveryAttemptCount())
+                    .isEqualTo(webhookProperties.maximumAttempts());
         }
     }
 
@@ -329,6 +429,23 @@ class WebhookServiceTests {
     }
 
     private static WebhookEvent event() {
+        return event(0, 0, 0, null);
+    }
+
+    private static WebhookEvent event(int deliveryAttemptCount) {
+        return event(deliveryAttemptCount, 0, 0, null);
+    }
+
+    private static WebhookEvent event(int deliveryAttemptCount, int retryCount, int replayCount) {
+        return event(deliveryAttemptCount, retryCount, replayCount, null);
+    }
+
+    private static WebhookEvent event(
+            int deliveryAttemptCount,
+            int retryCount,
+            int replayCount,
+            Instant nextEligibleAt
+    ) {
         return new WebhookEvent(
                 "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
                 "order.created",
@@ -338,10 +455,10 @@ class WebhookServiceTests {
                 ByteBuffer.wrap(
                         "{\"secret\":\"payload-marker\",\"key\":\"signing-secret\"}".getBytes(StandardCharsets.UTF_8)
                 ),
-                0,
-                null,
-                0,
-                0
+                retryCount,
+                nextEligibleAt,
+                deliveryAttemptCount,
+                replayCount
         );
     }
 

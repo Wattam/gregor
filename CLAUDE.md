@@ -3,6 +3,11 @@ Gregor is a local-development Spring Boot service that uses Apache Camel, Kafka,
 When creating or implementing anything, or selecting a tech stack, use the most established standards for Java/Spring Boot services.
 However, when a recent JDK release provides a new feature that simplifies the implementation, prefer that feature over established standards. Use only finalized JDK features; never use preview or incubator features.
 
+## Scope & documentation
+
+- `IMPLEMENTATION-PHASES.md` defines what belongs to the increment being implemented. Read it before starting work, and update the phase status when an increment lands.
+- `README.md` documents only the actual current state of the project. Never reference `IMPLEMENTATION-PHASES.md`, planned phases, or future work from it.
+
 ## Source layout & style
 
 - Maximum line length is 120. When a call does not fit, either break after `=` and indent the whole call onto the next line, or split it one argument per line with the closing `)` on its own new line.
@@ -15,10 +20,21 @@ However, when a recent JDK release provides a new feature that simplifies the im
   Keep calls forming one EIP on the same line, such as `.multicast().stopOnException()` and `.choice().when().method(...)`.
 - Apply these Java style rules to production and test code.
 - Never edit generated Avro Java. Edit the source `.avsc` schemas and regenerate it through Gradle.
+- Generated Avro records have no setters (`createSetters = false`). Derive a changed record with `WebhookEvent.newBuilder(existing).setDeliveryAttemptCount(...).build()`.
+- Jackson is version 3. Take `ObjectMapper`, `JsonMapper`, `JsonNode`, and node factories from `tools.jackson.databind`, and databind annotations (`@JsonSerialize`, `@JsonDeserialize`, `@JsonNaming`) from `tools.jackson.databind.annotation`.
+  Jackson 3 ships no annotation package of its own, so the core annotations (`@JsonProperty`, `@JsonInclude`, `@JsonCreator`) still come from `com.fasterxml.jackson.annotation`.
+  Never import `com.fasterxml.jackson.databind`: Jackson 2 is on the compile classpath transitively, so the wrong mapper compiles and fails only at runtime.
+- Production code injects the `@Primary JsonMapper` bean declared by `JacksonConfiguration` instead of constructing a mapper.
+
+## Configuration & persistence
+
+- The Camel starter publishes no configuration metadata. Every `camel.*` property used in `application.yaml` needs a matching entry in `src/main/resources/META-INF/additional-spring-configuration-metadata.json`.
+- There are no database migrations: `ddl-auto: update` derives the schema from the JPA entities. After changing a persisted column, recreate the volumes with `docker compose down --volumes` and `docker compose up -d` before running tests.
 
 ## Tests
 
 - All assertions go through `org.assertj.core.api.Assertions` as qualified calls — `Assertions.assertThat(...)`, `Assertions.catchThrowableOfType(...)` — never JUnit's assertions.
+- Never test logs. Do not assert on log output, and do not use `CapturedOutput` or `OutputCaptureExtension`.
 - After every change to Java, tests, Avro schemas, Gradle files, or application configuration, run `docker compose up -d` and then `./gradlew test`. Leave the services running afterward.
 
 ## Apache Camel documentation

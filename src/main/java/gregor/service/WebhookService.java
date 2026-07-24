@@ -12,6 +12,7 @@ import gregor.exception.EventPublicationException;
 import gregor.repository.DeliveryAttemptRepository;
 import gregor.route.WebhookRoute;
 import lombok.AllArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.camel.Body;
 import org.apache.camel.ProducerTemplate;
 import org.apache.camel.component.kafka.KafkaConstants;
@@ -25,6 +26,7 @@ import java.time.Clock;
 import java.time.Instant;
 import java.util.UUID;
 
+@Slf4j
 @Service
 @AllArgsConstructor
 public class WebhookService {
@@ -66,13 +68,39 @@ public class WebhookService {
     }
 
     public WebhookRouteMessage createWebhookRouteMessage(@Body WebhookEvent webhookEvent) {
-        return new WebhookRouteMessage(webhookEvent, null, 0);
+        return new WebhookRouteMessage(webhookEvent, null);
+    }
+
+    public boolean hasImpossibleDeliveryState(@Body WebhookRouteMessage webhookRouteMessage) {
+        WebhookEvent webhookEvent = webhookRouteMessage.webhookEvent();
+        return webhookEvent.getDeliveryAttemptCount() < 0
+                || webhookEvent.getRetryCount() < 0
+                || webhookEvent.getReplayCount() < 0
+                || webhookEvent.getDeliveryAttemptCount() >= this.webhookProperties.maximumAttempts();
+    }
+
+    public void logDiscardedEnvelope(@Body WebhookRouteMessage webhookRouteMessage) {
+        WebhookEvent webhookEvent = webhookRouteMessage.webhookEvent();
+        log.error(
+                "Discarding webhook event with impossible delivery state [eventId={}] [tenantId={}] [endpointId={}]"
+                        + " [deliveryAttemptCount={}] [retryCount={}] [replayCount={}] [maximumAttempts={}]",
+                webhookEvent.getEventId(),
+                webhookEvent.getTenantId(),
+                webhookEvent.getEndpointId(),
+                webhookEvent.getDeliveryAttemptCount(),
+                webhookEvent.getRetryCount(),
+                webhookEvent.getReplayCount(),
+                this.webhookProperties.maximumAttempts()
+        );
     }
 
     public WebhookRouteMessage sendWebhookEvent(@Body WebhookRouteMessage webhookRouteMessage) {
         WebhookEvent webhookEvent = webhookRouteMessage.webhookEvent();
         DeliveryAttemptResult deliveryAttemptResult = this.restComponent.sendWebhook(webhookEvent);
-        return new WebhookRouteMessage(webhookEvent, deliveryAttemptResult, webhookRouteMessage.attemptNumber() + 1);
+        WebhookEvent advancedWebhookEvent = WebhookEvent.newBuilder(webhookEvent)
+                .setDeliveryAttemptCount(webhookEvent.getDeliveryAttemptCount() + 1)
+                .build();
+        return new WebhookRouteMessage(advancedWebhookEvent, deliveryAttemptResult);
     }
 
     public DeliveryAttempt createAttempt(@Body WebhookRouteMessage webhookRouteMessage) {
@@ -85,21 +113,22 @@ public class WebhookService {
                 event.getTenantId(),
                 event.getEndpointId(),
                 event.getEventType(),
-                webhookRouteMessage.attemptNumber(),
+                event.getDeliveryAttemptCount(),
                 mapOutcome(result.outcome()),
                 result.httpStatus(),
                 result.latencyMs(),
                 result.attemptedAt(),
                 ByteBuffer.wrap(details),
-                0,
-                0,
+                event.getRetryCount(),
+                event.getReplayCount(),
                 false
         );
     }
 
     public boolean shouldRetry(@Body WebhookRouteMessage webhookRouteMessage) {
+        int deliveryAttemptCount = webhookRouteMessage.webhookEvent().getDeliveryAttemptCount();
         return webhookRouteMessage.deliveryAttemptResult().outcome() == DeliveryOutcome.RETRYABLE_FAILURE
-                && webhookRouteMessage.attemptNumber() < this.webhookProperties.maximumAttempts();
+                && deliveryAttemptCount < this.webhookProperties.maximumAttempts();
     }
 
     @Transactional

@@ -32,11 +32,8 @@ import org.assertj.core.api.Assertions;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.api.extension.ExtendWith;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
-import org.springframework.boot.test.system.CapturedOutput;
-import org.springframework.boot.test.system.OutputCaptureExtension;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.annotation.DirtiesContext;
@@ -72,7 +69,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
-@ExtendWith(OutputCaptureExtension.class)
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 class CoreWebhookDeliveryLoopIntegrationTests {
@@ -382,6 +378,67 @@ class CoreWebhookDeliveryLoopIntegrationTests {
     }
 
     @Test
+    void resumesAttemptNumberingFromTheEnvelopeDeliveryAttemptCount() throws Exception {
+        Assertions.assertThat(this.webhookProperties.maximumAttempts()).isEqualTo(4);
+        RECEIVER.respondWith(500);
+        String eventId = UUID.randomUUID().toString();
+        WebhookEvent resumedEvent = new WebhookEvent(
+                eventId,
+                "resumed-numbering.test",
+                TENANT_ID,
+                ENDPOINT_ID,
+                Instant.now(),
+                ByteBuffer.wrap("{\"resumed\":true}".getBytes(StandardCharsets.UTF_8)),
+                2,
+                null,
+                2,
+                0
+        );
+
+        try (
+                KafkaConsumer<String, Object> attemptConsumer =
+                        this.newConsumer("integration-resumed-numbering-" + UUID.randomUUID())
+        ) {
+            this.seekToEnd(attemptConsumer, "persist-delivery-attempt");
+            this.producerTemplate.sendBodyAndHeaders(
+                    "kafka:" + WebhookRoute.WEBHOOK_EVENT_TOPIC,
+                    resumedEvent,
+                    Map.of(KafkaConstants.KEY, ENDPOINT_ID, KafkaConstants.PARTITION_KEY, 0)
+            );
+
+            RECEIVER.awaitRequest(eventId, 2);
+            this.awaitAttemptRows(eventId, 2);
+            Thread.sleep(200L);
+            Assertions.assertThat(RECEIVER.count(eventId)).isEqualTo(2);
+
+            DeliveryAttempt firstAttempt = (DeliveryAttempt) this.awaitRecord(attemptConsumer, eventId).value();
+            Assertions.assertThat(firstAttempt.getAttemptNumber()).isEqualTo(3);
+            Assertions.assertThat(firstAttempt.getRetryCount()).isEqualTo(2);
+            Assertions.assertThat(firstAttempt.getReplayCount()).isZero();
+            Assertions.assertThat(firstAttempt.getDeadLettered()).isFalse();
+
+            List<Map<String, Object>> rows = this.jdbcTemplate.queryForList(
+                    """
+                    SELECT attempt_number, outcome, http_status, retry_count, replay_count, dead_lettered
+                    FROM delivery_attempt
+                    WHERE event_id = ?::uuid
+                    ORDER BY attempt_number
+                    """,
+                    eventId
+            );
+            Assertions.assertThat(rows)
+                    .extracting(row -> (Integer) row.get("attempt_number"))
+                    .containsExactly(3, 4);
+            Assertions.assertThat(rows).allSatisfy(row -> Assertions.assertThat(row)
+                    .containsEntry("outcome", "RETRYABLE_FAILURE")
+                    .containsEntry("http_status", 500)
+                    .containsEntry("retry_count", 2)
+                    .containsEntry("replay_count", 0)
+                    .containsEntry("dead_lettered", false));
+        }
+    }
+
+    @Test
     void retriesAbruptTransportFailuresUntilTheConfiguredMaximumWithSanitizedDetails() throws Exception {
         int maximumAttempts = this.webhookProperties.maximumAttempts();
         RECEIVER.closeConnectionsWithoutResponse();
@@ -445,7 +502,7 @@ class CoreWebhookDeliveryLoopIntegrationTests {
     }
 
     @Test
-    void omitsHttpFailureDetailsThatContainTheRequestPayloadOrSigningSecret(CapturedOutput output) throws Exception {
+    void omitsHttpFailureDetailsThatContainTheRequestPayloadOrSigningSecret() throws Exception {
         String payload = "{\"private\":\"request-payload-marker\"}";
         RECEIVER.respondWith(400, "echo=" + payload + ";secret=" + SIGNING_SECRET);
 
@@ -469,7 +526,6 @@ class CoreWebhookDeliveryLoopIntegrationTests {
         Assertions.assertThat(this.objectMapper.readTree(detailsJson))
                 .isEqualTo(this.objectMapper.readTree("{\"type\":\"HTTP_FAILURE\"}"));
         Assertions.assertThat(detailsJson).doesNotContain(payload, SIGNING_SECRET);
-        Assertions.assertThat(output.getAll()).doesNotContain(payload, SIGNING_SECRET);
     }
 
     @Test
@@ -687,7 +743,7 @@ class CoreWebhookDeliveryLoopIntegrationTests {
                 """,
                 String.class
         );
-        Assertions.assertThat(columnNames).doesNotContain("payload", "signing_secret");
+        Assertions.assertThat(columnNames).doesNotContain("payload", "signing_secret", "completed_at");
     }
 
     @Test

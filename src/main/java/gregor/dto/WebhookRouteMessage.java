@@ -5,6 +5,5 @@ import jakarta.validation.constraints.NotNull;
 
 public record WebhookRouteMessage(
         @NotNull WebhookEvent webhookEvent,
-        DeliveryAttemptResult deliveryAttemptResult,
-        @NotNull int attemptNumber
+        DeliveryAttemptResult deliveryAttemptResult
 ) {}

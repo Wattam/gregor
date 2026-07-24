@@ -67,6 +67,7 @@ public class RestComponent {
                             clientResponse.getStatusCode().value(),
                             responseSnippet(clientResponse.getBody().readNBytes(MAXIMUM_RESPONSE_BODY_BYTES))
                     ));
+            Instant completedAt = Instant.now(this.clock);
             DeliveryOutcome deliveryOutcome = classifyStatus(httpAttemptResponse.status());
             Map<String, String> details = deliveryOutcome == DeliveryOutcome.SUCCEEDED
                     ? Map.of()
@@ -77,15 +78,18 @@ public class RestComponent {
                     httpAttemptResponse.status(),
                     elapsedMilliseconds(startNanos),
                     attemptedAt,
+                    completedAt,
                     details
             );
         } catch (RestClientException exception) {
+            Instant completedAt = Instant.now(this.clock);
             TransportFailure transportFailure = classifyTransportFailure(exception);
             return new DeliveryAttemptResult(
                     DeliveryOutcome.RETRYABLE_FAILURE,
                     null,
                     elapsedMilliseconds(startNanos),
                     attemptedAt,
+                    completedAt,
                     transportFailureDetails(transportFailure)
             );
         }

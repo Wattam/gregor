@@ -57,6 +57,23 @@ Kafka acknowledgement occurs before the API returns a `202 Accepted` response:
 Each accepted request creates a new event ID. Delivery is at least once: failures before Kafka offset commit can deliver the same event again with the same `webhook-id`.
 Receivers must handle duplicate deliveries idempotently. Attempt persistence ignores a duplicate `(event_id, attempt_number)` row.
 
+## Delivery state and attempt numbering
+
+Delivery state lives on the durable `WebhookEvent` envelope rather than in worker memory. The logical attempt number of an HTTP request is the envelope's `deliveryAttemptCount` at the time of that request plus `1`, and the envelope carried
+onward reports the count of the request just performed. Each published attempt takes its `attempt_number`, `retry_count`, and `replay_count` from that envelope, and `dead_lettered` is always `false` in this phase.
+
+Nothing republishes an updated envelope yet, so a source record redelivered by Kafka arrives with `deliveryAttemptCount=0` and restarts numbering at logical attempt `1`.
+
+Before every HTTP request, including each immediate retry re-entry, the delivery path rejects an envelope whose delivery state is impossible:
+
+- `deliveryAttemptCount < 0`
+- `retryCount < 0`
+- `replayCount < 0`
+- `deliveryAttemptCount >= WEBHOOK_MAXIMUM_ATTEMPTS`
+
+A rejected record is discarded loudly. One ERROR log line records the event, tenant, endpoint, all three counters, and the configured maximum, then the source offset commits so the partition keeps making progress. No HTTP request, attempt
+record, or attempt row is produced. A non-null `nextEligibleAt` is not a rejection reason and does not delay or skip delivery: delayed retries remain inactive.
+
 ## Inspect attempts
 
 ```bash
@@ -77,7 +94,8 @@ Kafka declares this topic topology:
 | `webhook-events-retry-1h`    | Configured retry retention (`7d` by default)        |
 | `webhook-events-dead-letter` | Configured dead-letter retention (`30d` by default) |
 
-All topics use 12 default partitions and replication factor 1. The four new retry and dead-letter topics have no producers or consumers. Retryable failures still run immediately up to the configured maximum attempt count.
+All topics use 12 default partitions and replication factor 1. The four retry and dead-letter topics have no producers or consumers. Delayed retries and dead-lettering remain inactive, and retryable failures still run immediately up to the
+configured maximum attempt count.
 
 ## Local receiver and signatures
 

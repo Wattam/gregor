@@ -14,6 +14,7 @@ public class WebhookRoute extends BaseRoute {
 
     public static final String WEBHOOK_EVENT_TOPIC = "webhook-events";
     public static final String WEBHOOK_DELIVERY_ATTEMPT_DIRECT = "direct:webhook-delivery-attempt";
+    public static final String WEBHOOK_DELIVERY_RESULT_DIRECT = "direct:webhook-delivery-result";
     public static final String PERSIST_DELIVERY_ATTEMPT_TOPIC = "persist-delivery-attempt";
     public static final String WEBHOOK_EVENT_RETRY_1M_TOPIC = "webhook-events-retry-1m";
     public static final String WEBHOOK_EVENT_RETRY_10M_TOPIC = "webhook-events-retry-10m";
@@ -33,7 +34,14 @@ public class WebhookRoute extends BaseRoute {
             .process(super::commitOffset);
 
         super.routeDefinition(WEBHOOK_DELIVERY_ATTEMPT_DIRECT, WebhookRouteMessage.class)
-            .bean(this.webhookService, "sendWebhookEvent")
+            .choice().when().method(this.webhookService, "hasImpossibleDeliveryState")
+                .bean(this.webhookService, "logDiscardedEnvelope")
+            .otherwise()
+                .bean(this.webhookService, "sendWebhookEvent")
+                .to(WEBHOOK_DELIVERY_RESULT_DIRECT)
+            .end();
+
+        super.routeDefinition(WEBHOOK_DELIVERY_RESULT_DIRECT, WebhookRouteMessage.class)
             .multicast().stopOnException()
                 .pipeline()
                     .bean(this.webhookService, "createAttempt")

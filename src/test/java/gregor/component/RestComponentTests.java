@@ -37,7 +37,9 @@ class RestComponentTests {
         RestClient.Builder builder = RestClient.builder();
         MockRestServiceServer mockRestServiceServer = MockRestServiceServer.bindTo(builder).build();
         SignatureComponent signatureComponent = Mockito.mock(SignatureComponent.class);
-        Clock clock = Clock.fixed(Instant.ofEpochSecond(1_700_000_000L), ZoneOffset.UTC);
+        Clock clock = Mockito.mock(Clock.class);
+        Mockito.when(clock.instant())
+                .thenReturn(Instant.ofEpochSecond(1_700_000_000L), Instant.ofEpochSecond(1_700_000_002L));
         RestComponent restComponent = new RestComponent(
                 builder.build(),
                 signatureComponent,
@@ -82,8 +84,11 @@ class RestComponentTests {
         DeliveryAttemptResult deliveryAttemptResult = restComponent.sendWebhook(webhookEvent);
         Assertions.assertThat(deliveryAttemptResult.outcome()).isEqualTo(DeliveryOutcome.SUCCEEDED);
         Assertions.assertThat(deliveryAttemptResult.httpStatus()).isEqualTo(204);
-        Assertions.assertThat(deliveryAttemptResult.latencyMs()).isNotNegative();
+        Assertions.assertThat(deliveryAttemptResult.latencyMs()).isNotNegative().isLessThan(2_000L);
         Assertions.assertThat(deliveryAttemptResult.attemptedAt()).isEqualTo(Instant.ofEpochSecond(1_700_000_000L));
+        Assertions.assertThat(deliveryAttemptResult.completedAt()).isEqualTo(Instant.ofEpochSecond(1_700_000_002L));
+        Assertions.assertThat(deliveryAttemptResult.completedAt())
+                .isAfterOrEqualTo(deliveryAttemptResult.attemptedAt());
         Assertions.assertThat(deliveryAttemptResult.details()).isEmpty();
         Assertions.assertThat(payload.position()).isEqualTo(1);
         Assertions.assertThat(payload.limit()).isEqualTo(8);
@@ -92,6 +97,7 @@ class RestComponentTests {
                 Mockito.eq(1_700_000_000L),
                 AdditionalMatchers.aryEq(expectedBody)
         );
+        Mockito.verify(clock, Mockito.times(2)).instant();
     }
 
     @Test
@@ -141,6 +147,9 @@ class RestComponentTests {
 
             Assertions.assertThat(deliveryAttemptResult.outcome()).isEqualTo(testCase.getValue());
             Assertions.assertThat(deliveryAttemptResult.httpStatus()).isEqualTo(testCase.getKey());
+            Assertions.assertThat(deliveryAttemptResult.completedAt()).isEqualTo(Instant.EPOCH);
+            Assertions.assertThat(deliveryAttemptResult.completedAt())
+                    .isAfterOrEqualTo(deliveryAttemptResult.attemptedAt());
             if (testCase.getValue() == DeliveryOutcome.SUCCEEDED) {
                 Assertions.assertThat(deliveryAttemptResult.details()).isEmpty();
             } else {
@@ -193,6 +202,9 @@ class RestComponentTests {
 
             Assertions.assertThat(deliveryAttemptResult.outcome()).isEqualTo(DeliveryOutcome.RETRYABLE_FAILURE);
             Assertions.assertThat(deliveryAttemptResult.httpStatus()).isNull();
+            Assertions.assertThat(deliveryAttemptResult.completedAt()).isEqualTo(Instant.EPOCH);
+            Assertions.assertThat(deliveryAttemptResult.completedAt())
+                    .isAfterOrEqualTo(deliveryAttemptResult.attemptedAt());
             Assertions.assertThat(deliveryAttemptResult.details()).containsEntry("type", testCase.getValue());
             Assertions.assertThat(deliveryAttemptResult.details())
                     .containsEntry("exceptionClass", testCase.getKey().getClass().getSimpleName());
@@ -208,6 +220,50 @@ class RestComponentTests {
                     "\tat "
             );
         }
+    }
+
+    @Test
+    void capturesTheCompletionInstantForTransportFailures() {
+        RestClient.Builder builder = RestClient.builder();
+        MockRestServiceServer mockRestServiceServer = MockRestServiceServer.bindTo(builder).build();
+        SignatureComponent signatureComponent = Mockito.mock(SignatureComponent.class);
+        Mockito.when(signatureComponent.sign(Mockito.anyString(), Mockito.anyLong(), Mockito.any()))
+                .thenReturn("v1,digest");
+        Clock clock = Mockito.mock(Clock.class);
+        Mockito.when(clock.instant())
+                .thenReturn(Instant.ofEpochSecond(1_700_000_000L), Instant.ofEpochSecond(1_700_000_002L));
+        RestComponent restComponent = new RestComponent(
+                builder.build(),
+                signatureComponent,
+                clock,
+                WebhookPropertiesFixtures.create()
+        );
+        WebhookEvent webhookEvent = new WebhookEvent(
+                "event-123",
+                "order.created",
+                "tenant-123",
+                "endpoint-123",
+                Instant.EPOCH,
+                ByteBuffer.wrap("{}".getBytes(StandardCharsets.UTF_8)),
+                0,
+                null,
+                0,
+                0
+        );
+        mockRestServiceServer
+                .expect(request -> Assertions.assertThat(request.getMethod()).isEqualTo(HttpMethod.POST))
+                .andRespond(MockRestResponseCreators.withException(new HttpTimeoutException("timed out")));
+
+        DeliveryAttemptResult deliveryAttemptResult = restComponent.sendWebhook(webhookEvent);
+
+        Assertions.assertThat(deliveryAttemptResult.outcome()).isEqualTo(DeliveryOutcome.RETRYABLE_FAILURE);
+        Assertions.assertThat(deliveryAttemptResult.httpStatus()).isNull();
+        Assertions.assertThat(deliveryAttemptResult.attemptedAt()).isEqualTo(Instant.ofEpochSecond(1_700_000_000L));
+        Assertions.assertThat(deliveryAttemptResult.completedAt()).isEqualTo(Instant.ofEpochSecond(1_700_000_002L));
+        Assertions.assertThat(deliveryAttemptResult.completedAt())
+                .isAfterOrEqualTo(deliveryAttemptResult.attemptedAt());
+        Assertions.assertThat(deliveryAttemptResult.latencyMs()).isNotNegative().isLessThan(2_000L);
+        Mockito.verify(clock, Mockito.times(2)).instant();
     }
 
     @Test

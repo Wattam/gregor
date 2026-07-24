@@ -151,7 +151,7 @@ class SourceEventRedeliveryIntegrationTests {
         ConcurrentLinkedQueue<DeliveryAttempt> attempts = new ConcurrentLinkedQueue<>();
         AdviceWith.adviceWith(
                 this.camelContext,
-                WebhookRoute.WEBHOOK_DELIVERY_ATTEMPT_DIRECT,
+                WebhookRoute.WEBHOOK_DELIVERY_RESULT_DIRECT,
                 advice -> advice.weaveByToUri("kafka:" + WebhookRoute.PERSIST_DELIVERY_ATTEMPT_TOPIC + "*")
                         .before()
                         .process(exchange -> {
@@ -165,6 +165,7 @@ class SourceEventRedeliveryIntegrationTests {
                         })
         );
         this.camelContext.start();
+        this.camelContext.getRouteController().startRoute(WebhookRoute.WEBHOOK_DELIVERY_RESULT_DIRECT);
         this.camelContext.getRouteController().startRoute(WebhookRoute.WEBHOOK_DELIVERY_ATTEMPT_DIRECT);
         this.camelContext.getRouteController().startRoute(WEBHOOK_DELIVERY_URI);
         RECEIVER.blockResponses();
