@@ -39,9 +39,9 @@ However, when a recent JDK release provides a new feature that simplifies the im
 
 ## Apache Camel documentation
 
-- https://camel.apache.org/manual/java-dsl.html — RouteBuilder and Java DSL fundamentals, endpoint URIs, fluent EIP construction, text blocks, and lambda routes.
-- https://camel.apache.org/manual/camel-4x-upgrade-guide-4_21.html — Camel 4.21 migration and breaking-change notes; check before changing Camel versions or version-sensitive behavior.
-- https://camel.apache.org/components/next/eips/choice-eip.html — Conditional routing with `choice`, `when`, and `otherwise`, including when nested EIPs require `endChoice()`.
-- https://camel.apache.org/components/next/eips/bean-eip.html — Bean method invocation, method selection, bean scopes, registry lookup, and parameter binding.
-- https://camel.apache.org/components/next/direct-component.html — Synchronous, same-CamelContext route linking and behavior when no consumer is active.
-- https://camel.apache.org/components/next/kafka-component.html — Kafka endpoint and component options, serializers, keys, acknowledgements, consumer groups, error handling, and manual offset commits.
+- `docs/apache-camel/java-dsl.md` — RouteBuilder and Java DSL fundamentals, endpoint URIs, fluent EIP construction, text blocks, and lambda routes.
+- `docs/apache-camel/camel-4.21-upgrade-guide.md` — Camel 4.21 migration and breaking-change notes. Check it before a Camel version change or a version-sensitive behavior change.
+- `docs/apache-camel/choice-eip.md` — Conditional routing with `choice`, `when`, and `otherwise`. It includes the use of `endChoice()` with nested EIPs.
+- `docs/apache-camel/bean-eip.md` — Bean method invocation, method selection, bean scopes, registry lookup, and parameter binding.
+- `docs/apache-camel/direct-component.md` — Synchronous route links in one CamelContext and behavior when no consumer is active.
+- `docs/apache-camel/kafka-component.md` — Kafka endpoints, serializers, keys, acknowledgements, consumer groups, error handling, and manual offset commits.
