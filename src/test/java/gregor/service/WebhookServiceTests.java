@@ -4,11 +4,13 @@ import gregor.avro.DeliveryAttempt;
 import gregor.avro.WebhookEvent;
 import gregor.component.RestComponent;
 import gregor.config.WebhookPropertiesFixtures;
+import gregor.config.properties.KafkaConsumerProperties;
 import gregor.config.properties.WebhookProperties;
 import gregor.dto.DeliveryAttemptResult;
 import gregor.dto.DeliveryOutcome;
 import gregor.dto.EventIngestRequest;
 import gregor.dto.WebhookRouteMessage;
+import gregor.exception.EligibilityWaitInterruptedException;
 import gregor.exception.EventPublicationException;
 import gregor.repository.DeliveryAttemptRepository;
 import gregor.route.WebhookRoute;
@@ -24,6 +26,7 @@ import tools.jackson.databind.ObjectMapper;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
@@ -33,6 +36,9 @@ import java.util.Map;
 import java.util.UUID;
 
 class WebhookServiceTests {
+
+    private static final KafkaConsumerProperties KAFKA_CONSUMER_PROPERTIES =
+            new KafkaConsumerProperties(4_500_000);
 
     @Test
     void deliveryOutcomeDefinesOnlyTheThreePhaseOneResults() {
@@ -61,6 +67,7 @@ class WebhookServiceTests {
                 Mockito.mock(DeliveryAttemptRepository.class),
                 new ObjectMapper(),
                 WebhookPropertiesFixtures.create(),
+                KAFKA_CONSUMER_PROPERTIES,
                 Mockito.mock(ProducerTemplate.class),
                 Clock.systemUTC()
         );
@@ -235,12 +242,89 @@ class WebhookServiceTests {
     }
 
     @Test
-    void discardsAnImpossibleEnvelopeWithoutThrowing() {
-        WebhookService webhookService = service(new ObjectMapper(), WebhookPropertiesFixtures.create(4));
-        WebhookRouteMessage webhookRouteMessage = new WebhookRouteMessage(event(4), null);
+    void detectsMalformedRetryEnvelopesAtTheMaximumPermittedWaitBoundary() {
+        Instant now = Instant.parse("2026-07-10T12:00:00Z");
+        WebhookService webhookService = service(
+                new ObjectMapper(),
+                WebhookPropertiesFixtures.create(4),
+                Mockito.mock(ProducerTemplate.class),
+                Clock.fixed(now, ZoneOffset.UTC)
+        );
+        Duration maximumPermittedWait = KAFKA_CONSUMER_PROPERTIES.maximumPermittedWait();
+        Map<WebhookEvent, Boolean> cases = new LinkedHashMap<>();
+        cases.put(event(0, 0, 0, null), true);
+        cases.put(event(4, 0, 0, now), true);
+        cases.put(event(-1, 0, 0, now), true);
+        cases.put(event(0, -1, 0, now), true);
+        cases.put(event(0, 0, -1, now), true);
+        cases.put(event(0, 0, 0, now.plus(maximumPermittedWait).plusNanos(1)), true);
+        cases.put(event(0, 0, 0, now.plus(maximumPermittedWait)), false);
+        cases.put(event(0, 3, 0, now), false);
 
-        Assertions.assertThatCode(() -> webhookService.logDiscardedEnvelope(webhookRouteMessage))
-                .doesNotThrowAnyException();
+        for (Map.Entry<WebhookEvent, Boolean> testCase : cases.entrySet()) {
+            WebhookRouteMessage webhookRouteMessage = new WebhookRouteMessage(testCase.getKey(), null);
+
+            Assertions.assertThat(webhookService.hasMalformedRetryEnvelope(webhookRouteMessage))
+                    .isEqualTo(testCase.getValue());
+        }
+    }
+
+    @Test
+    void calculatesEligibilityWaitBeforeAtAndAfterTheEligibleInstant() {
+        Instant now = Instant.parse("2026-07-10T12:00:00Z");
+        WebhookService webhookService = service(
+                new ObjectMapper(),
+                WebhookPropertiesFixtures.create(),
+                Mockito.mock(ProducerTemplate.class),
+                Clock.fixed(now, ZoneOffset.UTC)
+        );
+
+        Assertions.assertThat(webhookService.eligibilityWait(new WebhookRouteMessage(
+                event(0, 0, 0, now.plusSeconds(30)),
+                null
+        ))).isEqualTo(Duration.ofSeconds(30));
+        Assertions.assertThat(webhookService.eligibilityWait(new WebhookRouteMessage(
+                event(0, 0, 0, now),
+                null
+        ))).isEqualTo(Duration.ZERO);
+        Assertions.assertThat(webhookService.eligibilityWait(new WebhookRouteMessage(
+                event(0, 0, 0, now.minusNanos(1)),
+                null
+        ))).isEqualTo(Duration.ZERO);
+        Assertions.assertThat(webhookService.eligibilityWait(new WebhookRouteMessage(
+                event(0, 0, 0, null),
+                null
+        ))).isEqualTo(Duration.ZERO);
+    }
+
+    @Test
+    void restoresInterruptionAndThrowsWhenEligibilityWaitingIsInterrupted() {
+        Instant now = Instant.parse("2026-07-10T12:00:00Z");
+        WebhookService webhookService = service(
+                new ObjectMapper(),
+                WebhookPropertiesFixtures.create(),
+                Mockito.mock(ProducerTemplate.class),
+                Clock.fixed(now, ZoneOffset.UTC)
+        );
+        WebhookRouteMessage webhookRouteMessage = new WebhookRouteMessage(
+                event(0, 0, 0, now.plusSeconds(30)),
+                null
+        );
+
+        Thread.currentThread().interrupt();
+        try {
+            EligibilityWaitInterruptedException exception = Assertions.catchThrowableOfType(
+                    EligibilityWaitInterruptedException.class,
+                    () -> webhookService.awaitEligibility(webhookRouteMessage)
+            );
+
+            Assertions.assertThat(exception)
+                    .hasMessage("Eligibility wait was interrupted")
+                    .hasCauseInstanceOf(InterruptedException.class);
+            Assertions.assertThat(Thread.currentThread().isInterrupted()).isTrue();
+        } finally {
+            Thread.interrupted();
+        }
     }
 
     @Test
@@ -257,6 +341,7 @@ class WebhookServiceTests {
                     Mockito.mock(DeliveryAttemptRepository.class),
                     new ObjectMapper(),
                     webhookProperties,
+                    KAFKA_CONSUMER_PROPERTIES,
                     Mockito.mock(ProducerTemplate.class),
                     Clock.systemUTC()
             );
@@ -423,6 +508,7 @@ class WebhookServiceTests {
                 Mockito.mock(DeliveryAttemptRepository.class),
                 objectMapper,
                 webhookProperties,
+                KAFKA_CONSUMER_PROPERTIES,
                 producerTemplate,
                 clock
         );

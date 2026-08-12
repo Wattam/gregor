@@ -3,17 +3,20 @@ package gregor.service;
 import gregor.avro.DeliveryAttempt;
 import gregor.avro.WebhookEvent;
 import gregor.component.RestComponent;
+import gregor.config.properties.KafkaConsumerProperties;
 import gregor.config.properties.WebhookProperties;
 import gregor.dto.DeliveryAttemptResult;
 import gregor.dto.DeliveryOutcome;
 import gregor.dto.EventIngestRequest;
 import gregor.dto.WebhookRouteMessage;
+import gregor.exception.EligibilityWaitInterruptedException;
 import gregor.exception.EventPublicationException;
 import gregor.repository.DeliveryAttemptRepository;
 import gregor.route.WebhookRoute;
 import lombok.AllArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.camel.Body;
+import org.apache.camel.Header;
 import org.apache.camel.ProducerTemplate;
 import org.apache.camel.component.kafka.KafkaConstants;
 import org.springframework.stereotype.Service;
@@ -23,7 +26,9 @@ import tools.jackson.databind.ObjectMapper;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
+import java.util.Objects;
 import java.util.UUID;
 
 @Slf4j
@@ -35,6 +40,7 @@ public class WebhookService {
     private final DeliveryAttemptRepository deliveryAttemptRepository;
     private final ObjectMapper objectMapper;
     private final WebhookProperties webhookProperties;
+    private final KafkaConsumerProperties kafkaConsumerProperties;
     private final ProducerTemplate producerTemplate;
     private final Clock clock;
 
@@ -77,6 +83,60 @@ public class WebhookService {
                 || webhookEvent.getRetryCount() < 0
                 || webhookEvent.getReplayCount() < 0
                 || webhookEvent.getDeliveryAttemptCount() >= this.webhookProperties.maximumAttempts();
+    }
+
+    public boolean hasMalformedRetryEnvelope(@Body WebhookRouteMessage webhookRouteMessage) {
+        Instant nextEligibleAt = webhookRouteMessage.webhookEvent().getNextEligibleAt();
+        if (this.hasImpossibleDeliveryState(webhookRouteMessage) || Objects.isNull(nextEligibleAt)) {
+            return true;
+        }
+        Instant latestPermittedEligibility =
+                Instant.now(this.clock).plus(this.kafkaConsumerProperties.maximumPermittedWait());
+        return nextEligibleAt.isAfter(latestPermittedEligibility);
+    }
+
+    public void logDiscardedRetryEnvelope(
+            @Body WebhookRouteMessage webhookRouteMessage,
+            @Header(KafkaConstants.TOPIC) String topic
+    ) {
+        WebhookEvent webhookEvent = webhookRouteMessage.webhookEvent();
+        log.error(
+                "Discarding malformed retry envelope [topic={}] [eventId={}] [tenantId={}] [endpointId={}]"
+                        + " [deliveryAttemptCount={}] [retryCount={}] [replayCount={}] [nextEligibleAt={}]"
+                        + " [maximumAttempts={}] [maximumPermittedWait={}]",
+                topic,
+                webhookEvent.getEventId(),
+                webhookEvent.getTenantId(),
+                webhookEvent.getEndpointId(),
+                webhookEvent.getDeliveryAttemptCount(),
+                webhookEvent.getRetryCount(),
+                webhookEvent.getReplayCount(),
+                webhookEvent.getNextEligibleAt(),
+                this.webhookProperties.maximumAttempts(),
+                this.kafkaConsumerProperties.maximumPermittedWait()
+        );
+    }
+
+    public Duration eligibilityWait(@Body WebhookRouteMessage webhookRouteMessage) {
+        Instant nextEligibleAt = webhookRouteMessage.webhookEvent().getNextEligibleAt();
+        if (Objects.isNull(nextEligibleAt)) {
+            return Duration.ZERO;
+        }
+        Duration wait = Duration.between(Instant.now(this.clock), nextEligibleAt);
+        return wait.isNegative() ? Duration.ZERO : wait;
+    }
+
+    public void awaitEligibility(@Body WebhookRouteMessage webhookRouteMessage) {
+        Duration wait = this.eligibilityWait(webhookRouteMessage);
+        if (wait.isZero()) {
+            return;
+        }
+        try {
+            Thread.sleep(wait);
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            throw new EligibilityWaitInterruptedException(exception);
+        }
     }
 
     public void logDiscardedEnvelope(@Body WebhookRouteMessage webhookRouteMessage) {

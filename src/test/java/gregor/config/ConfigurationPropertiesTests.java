@@ -1,5 +1,6 @@
 package gregor.config;
 
+import gregor.config.properties.KafkaConsumerProperties;
 import gregor.config.properties.KafkaTopicProperties;
 import gregor.config.properties.WebhookProperties;
 import org.assertj.core.api.Assertions;
@@ -12,8 +13,14 @@ import org.springframework.boot.test.context.ConfigDataApplicationContextInitial
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.boot.validation.autoconfigure.ValidationAutoConfiguration;
 import org.springframework.context.annotation.Configuration;
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.ObjectMapper;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 
 class ConfigurationPropertiesTests {
@@ -32,6 +39,9 @@ class ConfigurationPropertiesTests {
         this.contextRunner.run(context -> {
             Assertions.assertThat(context.getStartupFailure()).isNull();
             Assertions.assertThat(context.getBean(WebhookProperties.class).maximumAttempts()).isEqualTo(4);
+            KafkaConsumerProperties kafkaConsumer = context.getBean(KafkaConsumerProperties.class);
+            Assertions.assertThat(kafkaConsumer.maxPollIntervalMs()).isEqualTo(4_500_000);
+            Assertions.assertThat(kafkaConsumer.maximumPermittedWait()).isEqualTo(Duration.ofMinutes(70));
             KafkaTopicProperties kafkaTopics = context.getBean(KafkaTopicProperties.class);
             Assertions.assertThat(kafkaTopics.retryRetention()).isEqualTo(Duration.ofDays(7));
             Assertions.assertThat(kafkaTopics.deadLetterRetention()).isEqualTo(Duration.ofDays(30));
@@ -42,14 +52,60 @@ class ConfigurationPropertiesTests {
     void bindsEnvironmentOverrides() {
         this.contextRunner.withSystemProperties(
                 "WEBHOOK_MAXIMUM_ATTEMPTS=1",
+                "KAFKA_MAX_POLL_INTERVAL_MS=4200000",
                 "KAFKA_RETRY_TOPIC_RETENTION=2h",
                 "KAFKA_DEAD_LETTER_TOPIC_RETENTION=3d"
         ).run(context -> {
             Assertions.assertThat(context.getStartupFailure()).isNull();
             Assertions.assertThat(context.getBean(WebhookProperties.class).maximumAttempts()).isEqualTo(1);
+            KafkaConsumerProperties kafkaConsumer = context.getBean(KafkaConsumerProperties.class);
+            Assertions.assertThat(kafkaConsumer.maxPollIntervalMs()).isEqualTo(4_200_000);
+            Assertions.assertThat(kafkaConsumer.maximumPermittedWait()).isEqualTo(Duration.ofMinutes(65));
             KafkaTopicProperties kafkaTopics = context.getBean(KafkaTopicProperties.class);
             Assertions.assertThat(kafkaTopics.retryRetention()).isEqualTo(Duration.ofHours(2));
             Assertions.assertThat(kafkaTopics.deadLetterRetention()).isEqualTo(Duration.ofDays(3));
+        });
+    }
+
+    @Test
+    void acceptsTheMinimumKafkaMaxPollInterval() {
+        this.contextRunner
+                .withPropertyValues("camel.component.kafka.max-poll-interval-ms=3900001")
+                .run(context -> {
+                    Assertions.assertThat(context.getStartupFailure()).isNull();
+                    KafkaConsumerProperties kafkaConsumer = context.getBean(KafkaConsumerProperties.class);
+                    Assertions.assertThat(kafkaConsumer.maxPollIntervalMs()).isEqualTo(3_900_001);
+                    Assertions.assertThat(kafkaConsumer.maximumPermittedWait())
+                            .isEqualTo(Duration.ofMillis(3_600_001));
+                });
+    }
+
+    @Test
+    void rejectsNullAndValuesBelowTheMinimumKafkaMaxPollInterval() {
+        for (String maxPollInterval : List.of("", "3900000")) {
+            this.contextRunner
+                    .withPropertyValues("camel.component.kafka.max-poll-interval-ms=" + maxPollInterval)
+                    .run(context -> Assertions.assertThat(context.getStartupFailure())
+                            .hasRootCauseInstanceOf(BindValidationException.class));
+        }
+    }
+
+    @Test
+    void declaresKafkaMaxPollIntervalConfigurationMetadata() throws IOException {
+        JsonNode properties = new ObjectMapper().readTree(Files.readString(Path.of(
+                "src/main/resources/META-INF/additional-spring-configuration-metadata.json"
+        ))).get("properties");
+        List<JsonNode> matchingProperties = new ArrayList<>();
+        properties.forEach(property -> {
+            if ("camel.component.kafka.max-poll-interval-ms".equals(property.get("name").asString())) {
+                matchingProperties.add(property);
+            }
+        });
+
+        Assertions.assertThat(matchingProperties).singleElement().satisfies(property -> {
+            Assertions.assertThat(property.get("type").asString()).isEqualTo("java.lang.Integer");
+            Assertions.assertThat(property.get("sourceType").asString())
+                    .isEqualTo("org.apache.camel.component.kafka.springboot.KafkaComponentConfiguration");
         });
     }
 
@@ -111,7 +167,11 @@ class ConfigurationPropertiesTests {
     }
 
     @Configuration(proxyBeanMethods = false)
-    @EnableConfigurationProperties({WebhookProperties.class, KafkaTopicProperties.class})
+    @EnableConfigurationProperties({
+            WebhookProperties.class,
+            KafkaConsumerProperties.class,
+            KafkaTopicProperties.class
+    })
     private static class PropertiesConfiguration {
     }
 }

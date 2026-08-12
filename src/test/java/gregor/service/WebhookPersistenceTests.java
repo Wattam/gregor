@@ -4,6 +4,7 @@ import gregor.avro.DeliveryAttempt;
 import gregor.avro.DeliveryOutcome;
 import gregor.component.RestComponent;
 import gregor.config.WebhookPropertiesFixtures;
+import gregor.config.properties.KafkaConsumerProperties;
 import gregor.repository.DeliveryAttemptRepository;
 import org.apache.camel.ProducerTemplate;
 import org.assertj.core.api.Assertions;
@@ -52,6 +53,7 @@ class WebhookPersistenceTests {
                 deliveryAttemptRepository,
                 objectMapper,
                 WebhookPropertiesFixtures.create(),
+                new KafkaConsumerProperties(4_500_000),
                 Mockito.mock(ProducerTemplate.class),
                 Clock.systemUTC()
         );
@@ -112,6 +114,7 @@ class WebhookPersistenceTests {
                 deliveryAttemptRepository,
                 new ObjectMapper(),
                 WebhookPropertiesFixtures.create(),
+                new KafkaConsumerProperties(4_500_000),
                 Mockito.mock(ProducerTemplate.class),
                 Clock.systemUTC()
         );

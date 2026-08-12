@@ -35,6 +35,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
@@ -56,7 +57,7 @@ class ImpossibleDeliveryStateIntegrationTests {
     private static final String SIGNING_SECRET = "whsec_" + Base64.getEncoder().encodeToString(
             "01234567890123456789012345678901".getBytes(StandardCharsets.UTF_8)
     );
-    private static final List<String> INFRASTRUCTURE_ONLY_TOPICS = List.of(
+    private static final List<String> NON_PRODUCED_TOPICS = List.of(
             WebhookRoute.WEBHOOK_EVENT_RETRY_1M_TOPIC,
             WebhookRoute.WEBHOOK_EVENT_RETRY_10M_TOPIC,
             WebhookRoute.WEBHOOK_EVENT_RETRY_1H_TOPIC,
@@ -161,7 +162,7 @@ class ImpossibleDeliveryStateIntegrationTests {
                         Map.of(KafkaConstants.KEY, ENDPOINT_ID, KafkaConstants.PARTITION_KEY, 0)
                 );
 
-                this.awaitCommittedOffset(partition, this.endOffset(partition));
+                this.awaitCommittedOffset(WebhookRoute.WEBHOOK_EVENT_TOPIC, partition, this.endOffset(partition));
                 Assertions.assertThat(RECEIVER.count(impossibleEvent.getEventId())).isZero();
                 Assertions.assertThat(this.attemptRowCount(impossibleEvent.getEventId())).isZero();
             }
@@ -173,7 +174,84 @@ class ImpossibleDeliveryStateIntegrationTests {
                     .doesNotContainAnyElementsOf(discardedEventIds);
             Assertions.assertThat(downstreamRecords)
                     .extracting(ConsumerRecord::topic)
-                    .doesNotContainAnyElementsOf(INFRASTRUCTURE_ONLY_TOPICS);
+                    .doesNotContainAnyElementsOf(NON_PRODUCED_TOPICS);
+        }
+    }
+
+    @Test
+    void discardsMalformedRetryEnvelopesWithoutDeliveryOrDownstreamPublicationAndCommitsOffsets()
+            throws Exception {
+        Instant now = Instant.now();
+        List<RetryRecord> malformedRecords = List.of(
+                new RetryRecord(
+                        WebhookRoute.WEBHOOK_EVENT_RETRY_1M_TOPIC,
+                        event("retry-exhausted.test", MAXIMUM_ATTEMPTS, 0, 0, now)
+                ),
+                new RetryRecord(
+                        WebhookRoute.WEBHOOK_EVENT_RETRY_10M_TOPIC,
+                        event("retry-negative-attempt.test", -1, 0, 0, now)
+                ),
+                new RetryRecord(
+                        WebhookRoute.WEBHOOK_EVENT_RETRY_1H_TOPIC,
+                        event("retry-negative-retry.test", 0, -1, 0, now)
+                ),
+                new RetryRecord(
+                        WebhookRoute.WEBHOOK_EVENT_RETRY_1M_TOPIC,
+                        event("retry-negative-replay.test", 0, 0, -1, now)
+                ),
+                new RetryRecord(
+                        WebhookRoute.WEBHOOK_EVENT_RETRY_10M_TOPIC,
+                        event("retry-null-eligibility.test", 0, 0, 0, null)
+                ),
+                new RetryRecord(
+                        WebhookRoute.WEBHOOK_EVENT_RETRY_1H_TOPIC,
+                        event("retry-distant-eligibility.test", 0, 0, 0, now.plus(Duration.ofHours(2)))
+                )
+        );
+        List<String> discardedEventIds = malformedRecords.stream()
+                .map(record -> record.event().getEventId())
+                .toList();
+        Map<String, Long> startingRetryOffsets = new HashMap<>();
+        Map<String, Integer> sentRecordsByTopic = new HashMap<>();
+        for (String retryTopic : NON_PRODUCED_TOPICS.subList(0, 3)) {
+            startingRetryOffsets.put(retryTopic, this.endOffset(new TopicPartition(retryTopic, 0)));
+        }
+
+        try (
+                KafkaConsumer<String, Object> downstreamConsumer =
+                        this.newConsumer("integration-malformed-retry-" + UUID.randomUUID())
+        ) {
+            this.seekToEnd(
+                    downstreamConsumer,
+                    WebhookRoute.PERSIST_DELIVERY_ATTEMPT_TOPIC,
+                    WebhookRoute.WEBHOOK_EVENT_DEAD_LETTER_TOPIC
+            );
+
+            for (RetryRecord malformedRecord : malformedRecords) {
+                TopicPartition partition = new TopicPartition(malformedRecord.topic(), 0);
+                this.producerTemplate.sendBodyAndHeaders(
+                        "kafka:" + malformedRecord.topic(),
+                        malformedRecord.event(),
+                        Map.of(KafkaConstants.KEY, ENDPOINT_ID, KafkaConstants.PARTITION_KEY, 0)
+                );
+                sentRecordsByTopic.merge(malformedRecord.topic(), 1, Integer::sum);
+
+                this.awaitCommittedOffset(malformedRecord.topic(), partition, this.endOffset(partition));
+                Assertions.assertThat(RECEIVER.count(malformedRecord.event().getEventId())).isZero();
+                Assertions.assertThat(this.attemptRowCount(malformedRecord.event().getEventId())).isZero();
+            }
+
+            List<ConsumerRecord<String, Object>> downstreamRecords = new ArrayList<>();
+            downstreamConsumer.poll(Duration.ofSeconds(1)).forEach(downstreamRecords::add);
+            Assertions.assertThat(downstreamRecords)
+                    .extracting(record -> eventId(record.value()))
+                    .doesNotContainAnyElementsOf(discardedEventIds);
+        }
+
+        for (Map.Entry<String, Long> startingOffset : startingRetryOffsets.entrySet()) {
+            long expectedOffset = startingOffset.getValue() + sentRecordsByTopic.get(startingOffset.getKey());
+            Assertions.assertThat(this.endOffset(new TopicPartition(startingOffset.getKey(), 0)))
+                    .isEqualTo(expectedOffset);
         }
     }
 
@@ -186,6 +264,7 @@ class ImpossibleDeliveryStateIntegrationTests {
                 0,
                 Instant.now().plus(Duration.ofHours(1))
         );
+        Instant sendStartedAt = Instant.now();
 
         this.producerTemplate.sendBodyAndHeaders(
                 "kafka:" + WebhookRoute.WEBHOOK_EVENT_TOPIC,
@@ -194,6 +273,7 @@ class ImpossibleDeliveryStateIntegrationTests {
         );
 
         RECEIVER.awaitRequest(eligibleLaterEvent.getEventId());
+        Assertions.assertThat(Duration.between(sendStartedAt, Instant.now())).isLessThan(Duration.ofSeconds(5));
         Map<String, Object> row = this.awaitAttemptRow(eligibleLaterEvent.getEventId());
         Assertions.assertThat(row)
                 .containsEntry("attempt_number", 1)
@@ -266,12 +346,16 @@ class ImpossibleDeliveryStateIntegrationTests {
         }
     }
 
-    private void awaitCommittedOffset(TopicPartition partition, long expectedOffset) throws Exception {
+    private void awaitCommittedOffset(
+            String groupId,
+            TopicPartition partition,
+            long expectedOffset
+    ) throws Exception {
         try (AdminClient adminClient = this.adminClient()) {
             Instant deadline = Instant.now().plusSeconds(15);
             while (Instant.now().isBefore(deadline)) {
                 Map<TopicPartition, OffsetAndMetadata> offsets = adminClient
-                        .listConsumerGroupOffsets(WebhookRoute.WEBHOOK_EVENT_TOPIC)
+                        .listConsumerGroupOffsets(groupId)
                         .partitionsToOffsetAndMetadata()
                         .get(5, TimeUnit.SECONDS);
                 OffsetAndMetadata committed = offsets.get(partition);
@@ -281,7 +365,7 @@ class ImpossibleDeliveryStateIntegrationTests {
                 Thread.sleep(50L);
             }
         }
-        Assertions.fail("Source offset was not committed after the record was discarded");
+        Assertions.fail("Offset was not committed after the record was discarded from group " + groupId);
     }
 
     private AdminClient adminClient() {
@@ -318,7 +402,7 @@ class ImpossibleDeliveryStateIntegrationTests {
     private static String[] downstreamTopics() {
         return Stream.concat(
                 Stream.of(WebhookRoute.PERSIST_DELIVERY_ATTEMPT_TOPIC),
-                INFRASTRUCTURE_ONLY_TOPICS.stream()
+                NON_PRODUCED_TOPICS.stream()
         ).toArray(String[]::new);
     }
 
@@ -355,6 +439,9 @@ class ImpossibleDeliveryStateIntegrationTests {
 
     private static String kafkaBootstrapServers() {
         return "localhost:" + System.getenv().getOrDefault("KAFKA_PORT", "9092");
+    }
+
+    private record RetryRecord(String topic, WebhookEvent event) {
     }
 
     private record CapturedRequest(String webhookId) {

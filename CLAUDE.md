@@ -33,8 +33,8 @@ However, when a recent JDK release provides a new feature that simplifies the im
 
 ## Tests
 
-- All assertions go through `org.assertj.core.api.Assertions` as qualified calls — `Assertions.assertThat(...)`, `Assertions.catchThrowableOfType(...)` — never JUnit's assertions.
-- Never test logs. Do not assert on log output, and do not use `CapturedOutput` or `OutputCaptureExtension`.
+- All assertion API calls go through `org.assertj.core.api.Assertions` as qualified calls — `Assertions.assertThat(...)`, `Assertions.catchThrowableOfType(...)` — never JUnit's assertion API. Tests can throw `AssertionError` directly for custom failure paths.
+- Do not test log text or assert on log output. Do not use `CapturedOutput` or `OutputCaptureExtension`. Tests can verify that a method whose effect is logging was called.
 - After every change to Java, tests, Avro schemas, Gradle files, or application configuration, run `docker compose up -d` and then `./gradlew test`. Leave the services running afterward.
 
 ## Apache Camel documentation

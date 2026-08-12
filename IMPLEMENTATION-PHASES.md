@@ -1,6 +1,6 @@
 # Webhook Delivery Service: Build Phases
 
-This document is the complete implementation roadmap for the webhook delivery service. Phase 1, Phase 2A, and Phase 2B are implemented and are kept
+This document is the complete implementation roadmap for the webhook delivery service. Phase 1 and Phases 2A through 2C are implemented and are kept
 whole. Every remaining phase is broken into the smallest dependency-ordered increment that still has a useful, independently testable
 boundary and its own completion gate. Phase 6 stays one release unit because splitting it would advertise an ordering guarantee that does
 not hold yet. Completing groundwork or an isolated test suite does not mark an increment as implemented.
@@ -12,41 +12,14 @@ not hold yet. Completing groundwork or an isolated test suite does not mark an i
 | Phase 1             | Implemented with known limitations | —                                                                   |
 | Phase 2A            | Implemented                        | Phase 1                                                             |
 | Phase 2B            | Implemented                        | Phase 2A                                                            |
-| Phase 2C through 2J | Planned                            | Phase 2B, in listed order                                           |
+| Phase 2C            | Implemented                        | Phase 2B                                                            |
+| Phase 2D through 2J | Planned                            | Phase 2C, in listed order                                           |
 | Phase 3A through 3J | Planned                            | Phase 2; subphases in listed order                                  |
 | Phase 4A through 4F | Planned                            | Stable Phase 2 event contract; can proceed in parallel with Phase 3 |
 | Phase 5A through 5R | Planned                            | Phases 2 through 4; subphases in listed order                       |
 | Phase 6             | Planned as one release unit        | Phases 2, 3, and 5                                                  |
 
 ## Label mapping from the previous roadmap
-
-The subphase letters were reassigned when the planned work was split further. Earlier documents and commit messages use the previous
-labels.
-
-| Previous label | Current labels        |
-|----------------|-----------------------|
-| Phase 1        | Phase 1               |
-| Phase 2A       | Phase 2A              |
-| Phase 2B       | Phases 2B, 2C, 2D, 2E |
-| Phase 2C       | Phases 2F, 2G, 2H     |
-| Phase 2D       | Phases 2I, 2J         |
-| Phase 3A       | Phases 3A, 3B         |
-| Phase 3B       | Phases 3C, 3D, 3E     |
-| Phase 3C       | Phases 3F, 3G, 3H     |
-| Phase 3D       | Phases 3I, 3J         |
-| Phase 4A       | Phases 4A, 4B         |
-| Phase 4B       | Phases 4C, 4D         |
-| Phase 4C       | Phases 4E, 4F         |
-| Phase 5A       | Phases 5A, 5B, 5C     |
-| Phase 5B       | Phases 5D, 5E, 5F, 5G |
-| Phase 5C       | Phases 5H, 5I, 5J     |
-| Phase 5D       | Phases 5K, 5L         |
-| Phase 5E       | Phases 5M, 5N, 5O     |
-| Phase 5F       | Phases 5P, 5Q, 5R     |
-| Phase 6        | Phase 6               |
-
-`specs/add-delivery-state-contracts-kafka-topology` predates this mapping. Its references to Phases 2B through 2D mean the whole retry,
-dead-letter, and replay range that is now Phase 2B through Phase 2J.
 
 ## Completion rules for every planned increment
 
@@ -102,7 +75,7 @@ signed webhook delivery and durable logical-attempt history.
 - There is no retry topic, dead-letter queue, replay, endpoint management, production security, tenant isolation, or strict FIFO mode.
 - Endpoint configuration and tenant identity are single configured values rather than managed or authenticated runtime state.
 
-## Phase 2: Retry Topology, Dead-Letter Queue, and Replay (PHASES 2A AND 2B IMPLEMENTED, REST PLANNED)
+## Phase 2: Retry Topology, Dead-Letter Queue, and Replay (PHASES 2A THROUGH 2C IMPLEMENTED, REST PLANNED)
 
 Phase 2 is split because contracts, retry consumption, retry publication, terminal retention, dead-letter persistence, and replay each have
 a separate testable boundary. The subphases must be implemented in order. Retry attempts for one event remain sequential, but later events
@@ -172,35 +145,47 @@ immediate loop.
 #### Status notes
 
 - An envelope with impossible delivery state is discarded loudly: one ERROR log line carrying the event, tenant, endpoint, all three counters, and the configured maximum, followed by a source-offset commit. Rejection never throws, because
-  `break-on-first-error: true` with manual commit and `disableRedelivery()` would otherwise redeliver the record forever and stall the partition. Phases 2C through 2J replace this discard with dead-letter publication.
+  `break-on-first-error: true` with manual commit and `disableRedelivery()` would otherwise redeliver the record forever and stall the partition. Later Phase 2 increments replace this discard with dead-letter publication.
 - `gregor.webhook.maximum-attempts` now bounds the cumulative `deliveryAttemptCount` carried by the envelope instead of a per-consumption counter.
 - Nothing republishes an updated envelope yet, so a redelivered source record still arrives with `deliveryAttemptCount=0` and restarts at logical attempt `1`. The Phase 1 known limitation about restarted numbering is unchanged.
 - The captured HTTP completion instant is in-memory state for one consumption only. It is not persisted, published, or logged.
 - The recursive immediate retry path remains until Phase 2D, so one consumption still performs up to `gregor.webhook.maximum-attempts` HTTP requests and every Phase 1 duplicate-delivery window is unchanged.
-- The three retry topics and the dead-letter topic still have no producers and no consumers.
+- At Phase 2B completion, the three retry topics and the dead-letter topic had no producers and no consumers.
 
-### Phase 2C: Retry-tier consumers and eligibility gate
+### Phase 2C: Retry-tier consumers and eligibility gate (IMPLEMENTED)
 
 **Goal:** Make the three retry topics consumable and time-gated before anything publishes to them.
 
 #### Tasks
 
-- [ ] Add one consumer route per tier with its own consumer group, using the established hand-built Camel topology rather than Spring Kafka
+- [x] Add one consumer route per tier with its own consumer group, using the established hand-built Camel topology rather than Spring Kafka
   `@RetryableTopic`.
-- [ ] Enforce `nextEligibleAt` before an HTTP request, and document the waiting mechanism together with its effect on consumer liveness and
+- [x] Enforce `nextEligibleAt` before an HTTP request, and document the waiting mechanism together with its effect on consumer liveness and
   poll-interval limits.
-- [ ] Run overdue records immediately after startup, partition assignment, or recovery.
-- [ ] Reject malformed retry envelopes without issuing an HTTP request, and define their operational handling explicitly.
-- [ ] Route eligible retry records through the shared delivery path so classification, attempt publication, and numbering match the source
+- [x] Run overdue records immediately after startup, partition assignment, or recovery.
+- [x] Reject malformed retry envelopes without issuing an HTTP request, and define their operational handling explicitly.
+- [x] Route eligible retry records through the shared delivery path so classification, attempt publication, and numbering match the source
   path.
-- [ ] Require attempt-publication acknowledgement before committing a retry-topic offset.
-- [ ] Test the eligibility boundary before, exactly at, and after the eligible instant, plus overdue records at startup, malformed records,
+- [x] Require attempt-publication acknowledgement before committing a retry-topic offset.
+- [x] Test the eligibility boundary before, exactly at, and after the eligible instant, plus overdue records at startup, malformed records,
   per-tier consumer groups, and offset-commit ordering.
 
 #### Completion gate
 
 Every retry topic has a working, time-gated consumer and per-tier consumer group, while no producer publishes to it yet and automatic
 delivery behavior is unchanged.
+
+#### Status notes
+
+- `webhook-events-retry-1m`, `webhook-events-retry-10m`, and `webhook-events-retry-1h` each have an active consumer group with the same name as its topic.
+- No service route produces a retry or dead-letter record. The dead-letter topic has no consumer.
+- `camel.component.kafka.max-poll-interval-ms` defaults to 75 minutes. The maximum permitted eligibility wait is the configured interval minus five minutes and defaults to 70 minutes.
+- Eligibility waiting is synchronous. A wait blocks all partitions assigned to that consumer. Other consumers in the same group and all other consumer groups continue independently.
+- A malformed retry envelope has impossible delivery state, a null `nextEligibleAt`, or a `nextEligibleAt` after the maximum permitted wait. The route writes one sanitized ERROR log line, discards the envelope without HTTP or downstream publication, and commits the retry offset. A topic and `retryCount` mismatch remains valid.
+- An interrupted wait restores the thread interruption state and fails the exchange. The retry offset stays uncommitted, and Kafka redelivery evaluates eligibility against the current time.
+- The source route remains connected directly to the delivery route. It does not evaluate or wait for `nextEligibleAt`.
+- Recursive immediate retries remain active through the configured cumulative maximum.
+- Retry delivery completes HTTP before attempt-publication acknowledgement and completes all attempt publications before retry-offset commit. A failure in this window can repeat the physical request with the same `webhook-id` and logical attempt number.
 
 ### Phase 2D: Kafka-backed delayed retry cutover
 

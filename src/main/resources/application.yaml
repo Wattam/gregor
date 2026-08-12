@@ -35,6 +35,7 @@ camel:
             break-on-first-error: true
             max-poll-records: 1
             auto-offset-reset: earliest
+            max-poll-interval-ms: ${KAFKA_MAX_POLL_INTERVAL_MS:4500000}
             key-serializer: org.apache.kafka.common.serialization.StringSerializer
             value-serializer: io.apicurio.registry.serde.avro.AvroKafkaSerializer
             key-deserializer: org.apache.kafka.common.serialization.StringDeserializer

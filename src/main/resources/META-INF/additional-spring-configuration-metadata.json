@@ -49,6 +49,12 @@
             "description": "What to do when there is no initial offset in ZooKeeper or if an offset is out of range."
         },
         {
+            "name": "camel.component.kafka.max-poll-interval-ms",
+            "type": "java.lang.Integer",
+            "sourceType": "org.apache.camel.component.kafka.springboot.KafkaComponentConfiguration",
+            "description": "The maximum delay between invocations of poll() when using consumer group management."
+        },
+        {
             "name": "camel.component.kafka.key-serializer",
             "type": "java.lang.String",
             "sourceType": "org.apache.camel.component.kafka.springboot.KafkaComponentConfiguration",

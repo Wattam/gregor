@@ -79,12 +79,15 @@ class CoreWebhookDeliveryLoopIntegrationTests {
             "01234567890123456789012345678901".getBytes(StandardCharsets.UTF_8)
     );
     private static final TestReceiver RECEIVER = TestReceiver.start();
-    private static final List<String> INFRASTRUCTURE_ONLY_TOPICS = List.of(
-            "webhook-events-retry-1m",
-            "webhook-events-retry-10m",
-            "webhook-events-retry-1h",
-            "webhook-events-dead-letter"
+    private static final List<String> RETRY_TOPICS = List.of(
+            WebhookRoute.WEBHOOK_EVENT_RETRY_1M_TOPIC,
+            WebhookRoute.WEBHOOK_EVENT_RETRY_10M_TOPIC,
+            WebhookRoute.WEBHOOK_EVENT_RETRY_1H_TOPIC
     );
+    private static final List<String> NON_PRODUCED_TOPICS = Stream.concat(
+            RETRY_TOPICS.stream(),
+            Stream.of(WebhookRoute.WEBHOOK_EVENT_DEAD_LETTER_TOPIC)
+    ).toList();
 
     @LocalServerPort
     private int serverPort;
@@ -747,18 +750,18 @@ class CoreWebhookDeliveryLoopIntegrationTests {
     }
 
     @Test
-    void declaresPhaseTwoInfrastructureTopicsWithoutActivatingTheirDeliveryPaths() throws Exception {
+    void declaresPhaseTwoTopicsWithRetryConsumersButWithoutRetryOrDeadLetterProducers() throws Exception {
         List<String> expectedTopics = Stream.concat(
                 Stream.of("webhook-events", "persist-delivery-attempt"),
-                INFRASTRUCTURE_ONLY_TOPICS.stream()
+                NON_PRODUCED_TOPICS.stream()
         ).toList();
         try (
                 AdminClient adminClient = AdminClient.create(Map.of(
                         AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG,
                         kafkaBootstrapServers()
                 ));
-                KafkaConsumer<String, Object> infrastructureConsumer =
-                        this.newConsumer("integration-infrastructure-only-" + UUID.randomUUID())
+                KafkaConsumer<String, Object> nonProducedTopicConsumer =
+                        this.newConsumer("integration-non-produced-topics-" + UUID.randomUUID())
         ) {
             Assertions.assertThat(adminClient.listTopics().names().get(10, TimeUnit.SECONDS))
                     .containsExactlyInAnyOrderElementsOf(expectedTopics);
@@ -799,11 +802,16 @@ class CoreWebhookDeliveryLoopIntegrationTests {
             List<String> consumerUris = this.camelContext.getRoutes().stream()
                     .map(route -> route.getEndpoint().getEndpointUri())
                     .toList();
+            for (String retryTopic : RETRY_TOPICS) {
+                Assertions.assertThat(consumerUris).anyMatch(uri ->
+                        uri.contains(retryTopic) && uri.contains("groupId=" + retryTopic)
+                );
+            }
             Assertions.assertThat(consumerUris).noneMatch(uri ->
-                    INFRASTRUCTURE_ONLY_TOPICS.stream().anyMatch(uri::contains)
+                    uri.contains(WebhookRoute.WEBHOOK_EVENT_DEAD_LETTER_TOPIC)
             );
 
-            this.seekToEnd(infrastructureConsumer, INFRASTRUCTURE_ONLY_TOPICS.toArray(String[]::new));
+            this.seekToEnd(nonProducedTopicConsumer, NON_PRODUCED_TOPICS.toArray(String[]::new));
             RECEIVER.respondWith(503);
             HttpResponse<String> response = this.postEvent(
                     "{\"eventType\":\"infrastructure-only.test\",\"payload\":{}}"
@@ -812,7 +820,7 @@ class CoreWebhookDeliveryLoopIntegrationTests {
             String eventId = this.objectMapper.readTree(response.body()).get("eventId").asString();
             RECEIVER.awaitRequest(eventId, 4);
             this.awaitAttemptRows(eventId, 4);
-            Assertions.assertThat(infrastructureConsumer.poll(Duration.ofSeconds(1)).isEmpty()).isTrue();
+            Assertions.assertThat(nonProducedTopicConsumer.poll(Duration.ofSeconds(1)).isEmpty()).isTrue();
         }
     }
 
