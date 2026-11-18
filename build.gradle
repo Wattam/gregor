@@ -23,27 +23,32 @@ repositories {
     mavenCentral()
 }
 
-// Override Spring Boot's managed versions for the Apicurio client dependency chain.
+configurations {
+    mockitoAgent
+}
+
+// The ones directly from Apicurio client have known vulnerabilities. Should be reverted later when normalized.
 ext['netty.version'] = '4.2.21.Final'
 ext['commons-codec.version'] = '1.23.0'
 
+String apicurioVersion = '3.3.4'
+String vertxVersion = '4.5.36'
+String avroVersion = '1.12.1'
+String camelVersion = '4.23.0'
 dependencyManagement {
     imports {
-        mavenBom 'org.apache.camel.springboot:camel-spring-boot-bom:4.21.0'
+        mavenBom "org.apache.camel:camel-bom:${camelVersion}"
+        mavenBom "org.apache.camel.springboot:camel-spring-boot-bom:${camelVersion}"
     }
-}
-
-configurations {
-    mockitoAgent
 }
 
 dependencies {
     implementation 'org.apache.camel.springboot:camel-spring-boot-starter'
     implementation 'org.apache.camel.springboot:camel-kafka-starter'
-    implementation 'io.apicurio:apicurio-registry-avro-serde-kafka:3.3.4'
-    implementation platform('io.vertx:vertx-dependencies:4.5.36')
+    implementation "io.apicurio:apicurio-registry-avro-serde-kafka:${apicurioVersion}"
+    implementation platform("io.vertx:vertx-dependencies:${vertxVersion}")
     implementation 'io.vertx:vertx-core'
-    implementation 'org.apache.avro:avro:1.12.1'
+    implementation "org.apache.avro:avro:${avroVersion}"
     implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
     implementation 'org.springframework.boot:spring-boot-starter-kafka'
     implementation 'org.springframework.boot:spring-boot-starter-restclient'
@@ -56,7 +61,7 @@ dependencies {
 
     runtimeOnly 'org.postgresql:postgresql'
 
-    testImplementation 'org.apache.camel:camel-test-spring-junit5:4.21.0'
+    testImplementation 'org.apache.camel:camel-test-spring-junit5'
     testImplementation 'org.assertj:assertj-core'
     testImplementation 'org.mockito:mockito-core'
     testImplementation 'org.springframework.boot:spring-boot-starter-webmvc-test'
