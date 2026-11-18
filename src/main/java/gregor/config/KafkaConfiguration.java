@@ -7,6 +7,8 @@ import io.vertx.core.Vertx;
 import lombok.AllArgsConstructor;
 import org.apache.camel.Ordered;
 import org.apache.camel.component.kafka.KafkaComponent;
+import org.apache.camel.component.kafka.consumer.DefaultKafkaManualSyncCommit;
+import org.apache.camel.component.kafka.consumer.KafkaManualCommitFactory;
 import org.apache.camel.spi.ComponentCustomizer;
 import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.common.config.TopicConfig;
@@ -38,6 +40,11 @@ public class KafkaConfiguration {
                                 .getAdditionalProperties()
                                 .put(SchemaResolverConfig.VERTX_INSTANCE, registryVertx)
                 );
+    }
+
+    @Bean
+    public KafkaManualCommitFactory kafkaManualCommitFactory() {
+        return DefaultKafkaManualSyncCommit::new;
     }
 
     @Bean
