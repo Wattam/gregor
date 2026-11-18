@@ -9,8 +9,12 @@ import org.apache.avro.io.BinaryEncoder;
 import org.apache.avro.io.DecoderFactory;
 import org.apache.avro.io.EncoderFactory;
 import org.apache.avro.specific.SpecificDatumReader;
+import org.apache.avro.util.ClassSecurityValidator;
 import org.assertj.core.api.Assertions;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.springframework.context.support.GenericApplicationContext;
 
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
@@ -73,6 +77,27 @@ class AvroContractsTests {
             }
             """
     );
+
+    private static ClassSecurityValidator.ClassSecurityPredicate previousValidator;
+
+    @BeforeAll
+    static void configureAvroClassSecurity() {
+        previousValidator = ClassSecurityValidator.getGlobal();
+        try (GenericApplicationContext context = new GenericApplicationContext()) {
+            new AvroClassSecurityInitializer().initialize(context);
+        }
+    }
+
+    @AfterAll
+    static void restoreAvroClassSecurity() {
+        ClassSecurityValidator.setGlobal(previousValidator);
+    }
+
+    @Test
+    void rejectsClassesOutsideTheAllowlist() {
+        Assertions.assertThatThrownBy(() -> ClassSecurityValidator.validate(AvroContractsTests.class))
+                .isInstanceOf(SecurityException.class);
+    }
 
     @Test
     void excludesSensitiveFieldsFromTheWireSchemas() {

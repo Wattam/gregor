@@ -90,7 +90,7 @@ docker compose exec -T postgres psql -U gregor -d gregor -c \
 
 The `details` column is PostgreSQL JSONB. Attempt rows do not contain the webhook payload or signing secret.
 
-Apicurio registry clients share a Spring-managed Vert.x instance that closes on application shutdown.
+Apicurio registry clients share a Spring-managed Vert.x instance that closes on application shutdown. Gregor adds only its generated `WebhookEvent`, `DeliveryAttempt`, and `DeliveryOutcome` classes to Avro’s default trust policy at startup.
 
 Kafka declares this topic topology:
 
