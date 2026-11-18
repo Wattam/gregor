@@ -1,6 +1,11 @@
 package gregor;
 
+import org.apache.camel.CamelContext;
+import org.apache.camel.Route;
+import org.apache.camel.ServiceStatus;
+import org.assertj.core.api.Assertions;
 import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 
 @SpringBootTest(properties = {
@@ -10,7 +15,17 @@ import org.springframework.boot.test.context.SpringBootTest;
 })
 class ApplicationTests {
 
+    @Autowired
+    private CamelContext camelContext;
+
     @Test
-    void contextLoads() {
+    void loadsRoutesWithoutStartingThem() {
+        Assertions.assertThat(this.camelContext.getRoutes())
+                .isNotEmpty()
+                .extracting(Route::getId)
+                .allSatisfy(
+                        routeId -> Assertions.assertThat(this.camelContext.getRouteController().getRouteStatus(routeId))
+                                .isEqualTo(ServiceStatus.Stopped)
+                );
     }
 }

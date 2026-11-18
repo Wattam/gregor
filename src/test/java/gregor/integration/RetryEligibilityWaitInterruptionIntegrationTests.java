@@ -96,7 +96,6 @@ class RetryEligibilityWaitInterruptionIntegrationTests {
         registry.add("camel.component.kafka.auto-offset-reset", () -> "earliest");
         registry.add("camel.component.kafka.max-poll-records", () -> "1");
         registry.add("camel.component.kafka.max-poll-interval-ms", () -> "4500000");
-        registry.add("camel.springboot.auto-startup", () -> "true");
         registry.add("camel.component.kafka.request-required-acks", () -> "all");
         registry.add(
                 "camel.component.kafka.key-serializer",

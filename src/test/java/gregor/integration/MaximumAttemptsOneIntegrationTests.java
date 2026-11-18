@@ -73,7 +73,7 @@ class MaximumAttemptsOneIntegrationTests {
         registry.add("camel.component.kafka.break-on-first-error", () -> "true");
         registry.add("camel.component.kafka.auto-offset-reset", () -> "earliest");
         registry.add("camel.component.kafka.max-poll-records", () -> "1");
-        registry.add("camel.springboot.auto-startup", () -> "true");
+        registry.add("camel.main.auto-startup", () -> "true");
         registry.add("camel.component.kafka.request-required-acks", () -> "all");
         registry.add(
                 "camel.component.kafka.key-serializer",

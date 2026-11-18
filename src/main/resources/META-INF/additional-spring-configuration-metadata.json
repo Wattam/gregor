@@ -1,9 +1,9 @@
 {
     "properties": [
         {
-            "name": "camel.springboot.auto-startup",
+            "name": "camel.main.auto-startup",
             "type": "java.lang.Boolean",
-            "sourceType": "org.apache.camel.spring.boot.CamelConfigurationProperties",
+            "sourceType": "org.apache.camel.spring.boot.CamelConfigurationProperties$Main",
             "description": "Whether routes should automatically start when Camel starts."
         },
         {
@@ -11,6 +11,12 @@
             "type": "java.lang.String",
             "sourceType": "org.apache.camel.component.kafka.springboot.KafkaComponentConfiguration",
             "description": "URL of the Kafka brokers to use."
+        },
+        {
+            "name": "camel.component.kafka.lazy-start-producer",
+            "type": "java.lang.Boolean",
+            "sourceType": "org.apache.camel.component.kafka.springboot.KafkaComponentConfiguration",
+            "description": "Whether to start Kafka producers only when they first receive a message."
         },
         {
             "name": "camel.component.kafka.consumers-count",

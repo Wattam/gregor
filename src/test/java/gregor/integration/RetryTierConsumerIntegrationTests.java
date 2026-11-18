@@ -111,7 +111,7 @@ class RetryTierConsumerIntegrationTests {
         registry.add("camel.component.kafka.max-poll-interval-ms", () -> "4500000");
         registry.add("camel.component.kafka.additional-properties[session.timeout.ms]", () -> "6000");
         registry.add("camel.component.kafka.additional-properties[heartbeat.interval.ms]", () -> "1000");
-        registry.add("camel.springboot.auto-startup", () -> "true");
+        registry.add("camel.main.auto-startup", () -> "true");
         registry.add("camel.component.kafka.request-required-acks", () -> "all");
         registry.add(
                 "camel.component.kafka.key-serializer",

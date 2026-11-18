@@ -26,11 +26,12 @@ gregor:
         maximum-attempts: ${WEBHOOK_MAXIMUM_ATTEMPTS:4}
 
 camel:
-    springboot:
+    main:
         auto-startup: false
     component:
         kafka:
             brokers: localhost:1
+            lazy-start-producer: true
             max-poll-interval-ms: ${KAFKA_MAX_POLL_INTERVAL_MS:4500000}
             key-serializer: org.apache.kafka.common.serialization.StringSerializer
             value-serializer: io.apicurio.registry.serde.avro.AvroKafkaSerializer

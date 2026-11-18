@@ -120,6 +120,7 @@ class DeliveryConfigurationValidationIntegrationTests {
         this.assertStartupFails("--gregor.kafka.topics.dead-letter-retention=-1ms");
     }
 
+    @SuppressWarnings("EmptyTryBlock")
     private void assertStartupFails(String property) {
         Throwable failure = Assertions.catchThrowable(() -> {
             try (ConfigurableApplicationContext ignored = this.start(property)) {
@@ -139,7 +140,7 @@ class DeliveryConfigurationValidationIntegrationTests {
                 "--spring.datasource.password=",
                 "--spring.jpa.hibernate.ddl-auto=create-drop",
                 "--spring.kafka.admin.auto-create=false",
-                "--camel.springboot.auto-startup=false",
+                "--camel.main.auto-startup=false",
                 "--logging.level.root=OFF"
         ));
         arguments.addAll(Arrays.asList(propertyOverrides));
