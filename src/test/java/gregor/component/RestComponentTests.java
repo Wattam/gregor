@@ -6,13 +6,15 @@ import gregor.dto.DeliveryAttemptResult;
 import gregor.dto.DeliveryOutcome;
 import org.assertj.core.api.Assertions;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.mockito.AdditionalMatchers;
 import org.mockito.Mockito;
 import org.springframework.http.HttpMethod;
-import org.springframework.http.HttpStatusCode;
 import org.springframework.http.MediaType;
 import org.springframework.mock.http.client.MockClientHttpRequest;
 import org.springframework.test.web.client.MockRestServiceServer;
+import org.springframework.test.web.client.match.MockRestRequestMatchers;
 import org.springframework.test.web.client.response.MockRestResponseCreators;
 import org.springframework.web.client.RestClient;
 
@@ -25,319 +27,171 @@ import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
-import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
 
 class RestComponentTests {
 
+    private static final URI RECEIVER = URI.create("https://receiver.example.test/hooks");
     private static final String SIGNING_SECRET = "whsec_test-signing-secret";
 
     @Test
-    void sendsTheExactPayloadWithRequiredHeadersAndSignature() {
-        RestClient.Builder builder = RestClient.builder();
-        MockRestServiceServer mockRestServiceServer = MockRestServiceServer.bindTo(builder).build();
-        SignatureComponent signatureComponent = Mockito.mock(SignatureComponent.class);
-        Clock clock = Mockito.mock(Clock.class);
-        Mockito.when(clock.instant())
-                .thenReturn(Instant.ofEpochSecond(1_700_000_000L), Instant.ofEpochSecond(1_700_000_002L));
-        RestComponent restComponent = new RestComponent(
-                builder.build(),
-                signatureComponent,
-                clock,
-                WebhookPropertiesFixtures.create()
-        );
-        byte[] backingPayload = new byte[]{9, '{', '"', 'x', '"', ':', '1', '}', 9};
-        ByteBuffer payload = ByteBuffer.wrap(backingPayload);
-        payload.position(1);
-        payload.limit(8);
-        WebhookEvent webhookEvent = new WebhookEvent(
-                "event-123",
-                "order.created",
-                "tenant-123",
-                "endpoint-123",
-                Instant.EPOCH,
-                payload,
-                0,
-                null,
-                0,
-                0
-        );
-        byte[] expectedBody = "{\"x\":1}".getBytes(StandardCharsets.UTF_8);
-        Mockito.when(signatureComponent.sign(
-                Mockito.eq("event-123"),
-                Mockito.eq(1_700_000_000L),
-                AdditionalMatchers.aryEq(expectedBody)
-        )).thenReturn("v1,digest");
-        mockRestServiceServer.expect(request -> {
-            MockClientHttpRequest mockRequest = (MockClientHttpRequest) request;
-            Assertions.assertThat(request.getURI()).isEqualTo(URI.create("https://receiver.example.test/hooks"));
+    void sendsAndSignsOnlyTheRemainingPayloadBytes() {
+        Instant started = Instant.ofEpochSecond(1_700_000_000L);
+        Instant completed = started.plusSeconds(2);
+        AtomicReference<Instant> now = new AtomicReference<>(started);
+        Fixture fixture = fixture(clock(now));
+        ByteBuffer payload = ByteBuffer.wrap(new byte[]{9, '{', '"', 'x', '"', ':', '1', '}', 9}, 1, 7);
+        byte[] expected = "{\"x\":1}".getBytes(StandardCharsets.UTF_8);
+        Mockito.when(fixture.signer().sign(
+                Mockito.eq("event-123"), Mockito.eq(started.getEpochSecond()), AdditionalMatchers.aryEq(expected)
+        )).thenReturn("v1,exact-body-signature");
+        fixture.server().expect(request -> {
+            Assertions.assertThat(request.getURI()).isEqualTo(RECEIVER);
             Assertions.assertThat(request.getMethod()).isEqualTo(HttpMethod.POST);
-            Assertions.assertThat(mockRequest.getBodyAsBytes()).isEqualTo(expectedBody);
-            Assertions.assertThat(request.getHeaders().getFirst("webhook-event-type")).isEqualTo("order.created");
+            Assertions.assertThat(((MockClientHttpRequest) request).getBodyAsBytes()).isEqualTo(expected);
             Assertions.assertThat(request.getHeaders().getFirst("webhook-id")).isEqualTo("event-123");
+            Assertions.assertThat(request.getHeaders().getFirst("webhook-event-type")).isEqualTo("order.created");
             Assertions.assertThat(request.getHeaders().getFirst("webhook-timestamp")).isEqualTo("1700000000");
-            Assertions.assertThat(request.getHeaders().getFirst("webhook-signature")).isEqualTo("v1,digest");
+            Assertions.assertThat(request.getHeaders().getFirst("webhook-signature"))
+                    .isEqualTo("v1,exact-body-signature");
             Assertions.assertThat(request.getHeaders().getContentType())
                     .isEqualTo(new MediaType(MediaType.APPLICATION_JSON, StandardCharsets.UTF_8));
-        }).andRespond(MockRestResponseCreators.withNoContent());
+        }).andRespond(request -> {
+            now.set(completed);
+            return MockRestResponseCreators.withNoContent().createResponse(request);
+        });
 
-        DeliveryAttemptResult deliveryAttemptResult = restComponent.sendWebhook(webhookEvent);
-        Assertions.assertThat(deliveryAttemptResult.outcome()).isEqualTo(DeliveryOutcome.SUCCEEDED);
-        Assertions.assertThat(deliveryAttemptResult.httpStatus()).isEqualTo(204);
-        Assertions.assertThat(deliveryAttemptResult.latencyMs()).isNotNegative().isLessThan(2_000L);
-        Assertions.assertThat(deliveryAttemptResult.attemptedAt()).isEqualTo(Instant.ofEpochSecond(1_700_000_000L));
-        Assertions.assertThat(deliveryAttemptResult.completedAt()).isEqualTo(Instant.ofEpochSecond(1_700_000_002L));
-        Assertions.assertThat(deliveryAttemptResult.completedAt())
-                .isAfterOrEqualTo(deliveryAttemptResult.attemptedAt());
-        Assertions.assertThat(deliveryAttemptResult.details()).isEmpty();
+        DeliveryAttemptResult result = fixture.component().sendWebhook(event(payload));
+
+        fixture.server().verify();
+        Assertions.assertThat(result.outcome()).isEqualTo(DeliveryOutcome.SUCCEEDED);
+        Assertions.assertThat(result.httpStatus()).isEqualTo(204);
+        Assertions.assertThat(result.details()).isEmpty();
+        Assertions.assertThat(result.attemptedAt()).isEqualTo(started);
+        Assertions.assertThat(result.completedAt()).isEqualTo(completed);
         Assertions.assertThat(payload.position()).isEqualTo(1);
         Assertions.assertThat(payload.limit()).isEqualTo(8);
-        Mockito.verify(signatureComponent).sign(
-                Mockito.eq("event-123"),
-                Mockito.eq(1_700_000_000L),
-                AdditionalMatchers.aryEq(expectedBody)
-        );
-        Mockito.verify(clock, Mockito.times(2)).instant();
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "200, SUCCEEDED",
+            "299, SUCCEEDED",
+            "301, PERMANENT_FAILURE",
+            "400, PERMANENT_FAILURE",
+            "408, RETRYABLE_FAILURE",
+            "429, RETRYABLE_FAILURE",
+            "499, PERMANENT_FAILURE",
+            "500, RETRYABLE_FAILURE",
+            "599, RETRYABLE_FAILURE"
+    })
+    void classifiesHttpStatuses(int status, DeliveryOutcome expected) {
+        Fixture fixture = fixture();
+        fixture.server().expect(MockRestRequestMatchers.requestTo(RECEIVER))
+                .andRespond(MockRestResponseCreators.withRawStatus(status).body("failure"));
+
+        DeliveryAttemptResult result = fixture.component().sendWebhook(event("{}"));
+
+        Assertions.assertThat(result.outcome()).isEqualTo(expected);
+        Assertions.assertThat(result.httpStatus()).isEqualTo(status);
+        Map<String, String> details = expected == DeliveryOutcome.SUCCEEDED
+                ? Map.of()
+                : Map.of("type", "HTTP_FAILURE", "responseBody", "failure");
+        Assertions.assertThat(result.details()).isEqualTo(details);
     }
 
     @Test
-    void classifiesEveryHttpStatusFamilyAndSpecialRetryableStatus() {
-        Map<Integer, DeliveryOutcome> cases = new LinkedHashMap<>();
-        cases.put(200, DeliveryOutcome.SUCCEEDED);
-        cases.put(299, DeliveryOutcome.SUCCEEDED);
-        cases.put(301, DeliveryOutcome.PERMANENT_FAILURE);
-        cases.put(400, DeliveryOutcome.PERMANENT_FAILURE);
-        cases.put(408, DeliveryOutcome.RETRYABLE_FAILURE);
-        cases.put(429, DeliveryOutcome.RETRYABLE_FAILURE);
-        cases.put(499, DeliveryOutcome.PERMANENT_FAILURE);
-        cases.put(500, DeliveryOutcome.RETRYABLE_FAILURE);
-        cases.put(599, DeliveryOutcome.RETRYABLE_FAILURE);
-
-        for (Map.Entry<Integer, DeliveryOutcome> testCase : cases.entrySet()) {
-            RestClient.Builder builder = RestClient.builder();
-            MockRestServiceServer mockRestServiceServer = MockRestServiceServer.bindTo(builder).build();
-            SignatureComponent signatureComponent = Mockito.mock(SignatureComponent.class);
-            Mockito.when(signatureComponent.sign(Mockito.anyString(), Mockito.anyLong(), Mockito.any()))
-                    .thenReturn("v1,digest");
-            RestComponent restComponent = new RestComponent(
-                    builder.build(),
-                    signatureComponent,
-                    Clock.fixed(Instant.EPOCH, ZoneOffset.UTC),
-                    WebhookPropertiesFixtures.create()
-            );
-            WebhookEvent webhookEvent = new WebhookEvent(
-                    "event-123",
-                    "order.created",
-                    "tenant-123",
-                    "endpoint-123",
-                    Instant.EPOCH,
-                    ByteBuffer.wrap("{}".getBytes(StandardCharsets.UTF_8)),
-                    0,
-                    null,
-                    0,
-                    0
-            );
-            mockRestServiceServer
-                    .expect(request -> Assertions.assertThat(request.getURI()).isEqualTo(
-                            URI.create("https://receiver.example.test/hooks")
-                    ))
-                    .andRespond(MockRestResponseCreators.withRawStatus(testCase.getKey()).body("failure"));
-
-            DeliveryAttemptResult deliveryAttemptResult = restComponent.sendWebhook(webhookEvent);
-
-            Assertions.assertThat(deliveryAttemptResult.outcome()).isEqualTo(testCase.getValue());
-            Assertions.assertThat(deliveryAttemptResult.httpStatus()).isEqualTo(testCase.getKey());
-            Assertions.assertThat(deliveryAttemptResult.completedAt()).isEqualTo(Instant.EPOCH);
-            Assertions.assertThat(deliveryAttemptResult.completedAt())
-                    .isAfterOrEqualTo(deliveryAttemptResult.attemptedAt());
-            if (testCase.getValue() == DeliveryOutcome.SUCCEEDED) {
-                Assertions.assertThat(deliveryAttemptResult.details()).isEmpty();
-            } else {
-                Assertions.assertThat(deliveryAttemptResult.details()).containsEntry("type", "HTTP_FAILURE");
-                Assertions.assertThat(deliveryAttemptResult.details()).containsEntry("responseBody", "failure");
-            }
-        }
-    }
-
-    @Test
-    void classifiesTimeoutProtocolAndConnectionFailuresWithSanitizedDetails() {
-        Map<IOException, String> cases = new LinkedHashMap<>();
-        cases.put(new HttpTimeoutException("timed out"), "TIMEOUT");
-        cases.put(new ProtocolException("malformed response"), "INVALID_RESPONSE");
-        cases.put(
+    void classifiesTransportFailuresAndOmitsRawExceptionMessages() {
+        Map<IOException, String> failures = Map.of(
+                new HttpTimeoutException("upstream timed out"), "TIMEOUT",
+                new ProtocolException("malformed response"), "INVALID_RESPONSE",
                 new IOException("Failed https://user:password@example.test/path?token=secret "
                         + "Authorization: Bearer header-secret\n\tat example.Stack.method(Stack.java:1)"),
                 "CONNECTION_FAILURE"
         );
+        Instant completed = Instant.EPOCH.plusSeconds(2);
+        failures.forEach((exception, type) -> {
+            AtomicReference<Instant> now = new AtomicReference<>(Instant.EPOCH);
+            Fixture fixture = fixture(clock(now));
+            fixture.server().expect(MockRestRequestMatchers.requestTo(RECEIVER)).andRespond(_ -> {
+                now.set(completed);
+                throw exception;
+            });
 
-        for (Map.Entry<IOException, String> testCase : cases.entrySet()) {
-            RestClient.Builder builder = RestClient.builder();
-            MockRestServiceServer mockRestServiceServer = MockRestServiceServer.bindTo(builder).build();
-            SignatureComponent signatureComponent = Mockito.mock(SignatureComponent.class);
-            Mockito.when(signatureComponent.sign(Mockito.anyString(), Mockito.anyLong(), Mockito.any()))
-                    .thenReturn("v1,digest");
-            RestComponent restComponent = new RestComponent(
-                    builder.build(),
-                    signatureComponent,
-                    Clock.fixed(Instant.EPOCH, ZoneOffset.UTC),
-                    WebhookPropertiesFixtures.create()
-            );
-            WebhookEvent webhookEvent = new WebhookEvent(
-                    "event-123",
-                    "order.created",
-                    "tenant-123",
-                    "endpoint-123",
-                    Instant.EPOCH,
-                    ByteBuffer.wrap("{}".getBytes(StandardCharsets.UTF_8)),
-                    0,
-                    null,
-                    0,
-                    0
-            );
-            mockRestServiceServer
-                    .expect(request -> Assertions.assertThat(request.getMethod()).isEqualTo(HttpMethod.POST))
-                    .andRespond(MockRestResponseCreators.withException(testCase.getKey()));
+            DeliveryAttemptResult result = fixture.component().sendWebhook(event("{}"));
 
-            DeliveryAttemptResult deliveryAttemptResult = restComponent.sendWebhook(webhookEvent);
-
-            Assertions.assertThat(deliveryAttemptResult.outcome()).isEqualTo(DeliveryOutcome.RETRYABLE_FAILURE);
-            Assertions.assertThat(deliveryAttemptResult.httpStatus()).isNull();
-            Assertions.assertThat(deliveryAttemptResult.completedAt()).isEqualTo(Instant.EPOCH);
-            Assertions.assertThat(deliveryAttemptResult.completedAt())
-                    .isAfterOrEqualTo(deliveryAttemptResult.attemptedAt());
-            Assertions.assertThat(deliveryAttemptResult.details()).containsEntry("type", testCase.getValue());
-            Assertions.assertThat(deliveryAttemptResult.details())
-                    .containsEntry("exceptionClass", testCase.getKey().getClass().getSimpleName());
-            Assertions.assertThat(deliveryAttemptResult.details())
+            Assertions.assertThat(result.outcome())
+                    .as("outcome for %s", type)
+                    .isEqualTo(DeliveryOutcome.RETRYABLE_FAILURE);
+            Assertions.assertThat(result.httpStatus()).isNull();
+            Assertions.assertThat(result.attemptedAt()).isEqualTo(Instant.EPOCH);
+            Assertions.assertThat(result.completedAt()).isEqualTo(completed);
+            Assertions.assertThat(result.details())
+                    .containsEntry("type", type)
+                    .containsEntry("exceptionClass", exception.getClass().getSimpleName())
                     .containsOnlyKeys("type", "exceptionClass", "message");
-            Assertions.assertThat(deliveryAttemptResult.details().get("message")).doesNotContain(
-                    "password",
-                    "token=secret",
-                    "user:password",
-                    "Authorization",
-                    "header-secret",
-                    "Stack.java",
-                    "\tat "
-            );
-        }
+            Assertions.assertThat(result.details().get("message"))
+                    .doesNotContain(exception.getMessage(), "password", "token=secret", "header-secret", "Stack.java");
+        });
     }
 
     @Test
-    void capturesTheCompletionInstantForTransportFailures() {
-        RestClient.Builder builder = RestClient.builder();
-        MockRestServiceServer mockRestServiceServer = MockRestServiceServer.bindTo(builder).build();
-        SignatureComponent signatureComponent = Mockito.mock(SignatureComponent.class);
-        Mockito.when(signatureComponent.sign(Mockito.anyString(), Mockito.anyLong(), Mockito.any()))
-                .thenReturn("v1,digest");
-        Clock clock = Mockito.mock(Clock.class);
-        Mockito.when(clock.instant())
-                .thenReturn(Instant.ofEpochSecond(1_700_000_000L), Instant.ofEpochSecond(1_700_000_002L));
-        RestComponent restComponent = new RestComponent(
-                builder.build(),
-                signatureComponent,
-                clock,
-                WebhookPropertiesFixtures.create()
-        );
-        WebhookEvent webhookEvent = new WebhookEvent(
-                "event-123",
-                "order.created",
-                "tenant-123",
-                "endpoint-123",
-                Instant.EPOCH,
-                ByteBuffer.wrap("{}".getBytes(StandardCharsets.UTF_8)),
-                0,
-                null,
-                0,
-                0
-        );
-        mockRestServiceServer
-                .expect(request -> Assertions.assertThat(request.getMethod()).isEqualTo(HttpMethod.POST))
-                .andRespond(MockRestResponseCreators.withException(new HttpTimeoutException("timed out")));
-
-        DeliveryAttemptResult deliveryAttemptResult = restComponent.sendWebhook(webhookEvent);
-
-        Assertions.assertThat(deliveryAttemptResult.outcome()).isEqualTo(DeliveryOutcome.RETRYABLE_FAILURE);
-        Assertions.assertThat(deliveryAttemptResult.httpStatus()).isNull();
-        Assertions.assertThat(deliveryAttemptResult.attemptedAt()).isEqualTo(Instant.ofEpochSecond(1_700_000_000L));
-        Assertions.assertThat(deliveryAttemptResult.completedAt()).isEqualTo(Instant.ofEpochSecond(1_700_000_002L));
-        Assertions.assertThat(deliveryAttemptResult.completedAt())
-                .isAfterOrEqualTo(deliveryAttemptResult.attemptedAt());
-        Assertions.assertThat(deliveryAttemptResult.latencyMs()).isNotNegative().isLessThan(2_000L);
-        Mockito.verify(clock, Mockito.times(2)).instant();
-    }
-
-    @Test
-    void truncatesResponseDetailsWithoutSplittingUtf8CodePoints() {
-        RestClient.Builder builder = RestClient.builder();
-        MockRestServiceServer mockRestServiceServer = MockRestServiceServer.bindTo(builder).build();
-        SignatureComponent signatureComponent = Mockito.mock(SignatureComponent.class);
-        Mockito.when(signatureComponent.sign(Mockito.anyString(), Mockito.anyLong(), Mockito.any()))
-                .thenReturn("v1,digest");
-        RestComponent restComponent = new RestComponent(
-                builder.build(),
-                signatureComponent,
-                Clock.fixed(Instant.EPOCH, ZoneOffset.UTC),
-                WebhookPropertiesFixtures.create()
-        );
-        WebhookEvent webhookEvent = new WebhookEvent(
-                "event-123",
-                "order.created",
-                "tenant-123",
-                "endpoint-123",
-                Instant.EPOCH,
-                ByteBuffer.wrap("{}".getBytes(StandardCharsets.UTF_8)),
-                0,
-                null,
-                0,
-                0
-        );
+    void truncatesResponseDetailsAtTheLastCompleteUtf8CodePoint() {
+        Fixture fixture = fixture();
         String responseBody = "a" + "🙂".repeat(1_100);
-        mockRestServiceServer
-                .expect(request -> Assertions.assertThat(request.getMethod()).isEqualTo(HttpMethod.POST))
-                .andRespond(MockRestResponseCreators.withStatus(HttpStatusCode.valueOf(503)).body(responseBody));
+        fixture.server().expect(MockRestRequestMatchers.requestTo(RECEIVER))
+                .andRespond(MockRestResponseCreators.withRawStatus(503).body(responseBody));
 
-        DeliveryAttemptResult deliveryAttemptResult = restComponent.sendWebhook(webhookEvent);
+        DeliveryAttemptResult result = fixture.component().sendWebhook(event("{}"));
 
-        String snippet = deliveryAttemptResult.details().get("responseBody");
-        Assertions.assertThat(snippet.getBytes(StandardCharsets.UTF_8).length).isLessThanOrEqualTo(4_096);
-        Assertions.assertThat(snippet).doesNotContain("�");
-        Assertions.assertThat(responseBody).startsWith(snippet);
+        Assertions.assertThat(result.details()).containsEntry("responseBody", "a" + "🙂".repeat(1_023));
     }
 
     @Test
-    void omitsResponseDetailsContainingTheRequestPayloadOrSigningSecret() {
-        byte[] payload = "{\"private\":\"payload-marker\"}".getBytes(StandardCharsets.UTF_8);
-        for (String responseBody : new String[]{new String(payload, StandardCharsets.UTF_8), SIGNING_SECRET}) {
-            RestClient.Builder builder = RestClient.builder();
-            MockRestServiceServer mockRestServiceServer = MockRestServiceServer.bindTo(builder).build();
-            SignatureComponent signatureComponent = Mockito.mock(SignatureComponent.class);
-            Mockito.when(signatureComponent.sign(Mockito.anyString(), Mockito.anyLong(), Mockito.any()))
-                    .thenReturn("v1,digest");
-            RestComponent restComponent = new RestComponent(
-                    builder.build(),
-                    signatureComponent,
-                    Clock.fixed(Instant.EPOCH, ZoneOffset.UTC),
-                    WebhookPropertiesFixtures.create()
-            );
-            WebhookEvent webhookEvent = new WebhookEvent(
-                    "event-123",
-                    "order.created",
-                    "tenant-123",
-                    "endpoint-123",
-                    Instant.EPOCH,
-                    ByteBuffer.wrap(payload),
-                    0,
-                    null,
-                    0,
-                    0
-            );
-            mockRestServiceServer
-                    .expect(request -> Assertions.assertThat(request.getMethod()).isEqualTo(HttpMethod.POST))
-                    .andRespond(MockRestResponseCreators.withStatus(HttpStatusCode.valueOf(503)).body(responseBody));
+    void omitsResponseDetailsContainingEitherTheRequestPayloadOrSigningSecret() {
+        String payload = "{\"private\":\"payload-marker\"}";
+        for (String sensitiveValue : new String[]{payload, SIGNING_SECRET}) {
+            Fixture fixture = fixture();
+            fixture.server().expect(MockRestRequestMatchers.requestTo(RECEIVER))
+                    .andRespond(MockRestResponseCreators.withRawStatus(503).body("Receiver echoed: " + sensitiveValue));
 
-            DeliveryAttemptResult deliveryAttemptResult = restComponent.sendWebhook(webhookEvent);
+            DeliveryAttemptResult result = fixture.component().sendWebhook(event(payload));
 
-            Assertions.assertThat(deliveryAttemptResult.details()).containsExactly(Map.entry("type", "HTTP_FAILURE"));
+            Assertions.assertThat(result.details()).isEqualTo(Map.of("type", "HTTP_FAILURE"));
         }
+    }
+
+    private static Fixture fixture() {
+        return fixture(Clock.fixed(Instant.EPOCH, ZoneOffset.UTC));
+    }
+
+    private static Fixture fixture(Clock clock) {
+        RestClient.Builder builder = RestClient.builder();
+        MockRestServiceServer server = MockRestServiceServer.bindTo(builder).build();
+        SignatureComponent signer = Mockito.mock(SignatureComponent.class);
+        Mockito.when(signer.sign(Mockito.anyString(), Mockito.anyLong(), Mockito.any())).thenReturn("v1,digest");
+        return new Fixture(server, signer, new RestComponent(
+                builder.build(), signer, clock, WebhookPropertiesFixtures.create()
+        ));
+    }
+
+    private static Clock clock(AtomicReference<Instant> now) {
+        Clock clock = Mockito.mock(Clock.class);
+        Mockito.when(clock.instant()).thenAnswer(_ -> now.get());
+        return clock;
+    }
+
+    private static WebhookEvent event(String payload) {
+        return event(ByteBuffer.wrap(payload.getBytes(StandardCharsets.UTF_8)));
+    }
+
+    private static WebhookEvent event(ByteBuffer payload) {
+        return new WebhookEvent(
+                "event-123", "order.created", "tenant-123", "endpoint-123", Instant.EPOCH, payload, 0, null, 0, 0
+        );
+    }
+
+    private record Fixture(MockRestServiceServer server, SignatureComponent signer, RestComponent component) {
     }
 }

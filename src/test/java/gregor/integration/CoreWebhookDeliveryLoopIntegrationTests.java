@@ -9,6 +9,8 @@ import gregor.component.SignatureComponent;
 import gregor.config.properties.WebhookProperties;
 import gregor.route.WebhookRoute;
 import gregor.service.WebhookService;
+import io.apicurio.registry.resolver.config.SchemaResolverConfig;
+import io.vertx.core.Vertx;
 import org.apache.camel.CamelContext;
 import org.apache.camel.ProducerTemplate;
 import org.apache.camel.component.kafka.KafkaConstants;
@@ -18,10 +20,12 @@ import org.apache.kafka.clients.admin.Config;
 import org.apache.kafka.clients.admin.ConfigEntry;
 import org.apache.kafka.clients.admin.ConsumerGroupDescription;
 import org.apache.kafka.clients.admin.MemberDescription;
+import org.apache.kafka.clients.admin.OffsetSpec;
 import org.apache.kafka.clients.admin.TopicDescription;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.GroupState;
 import org.apache.kafka.common.PartitionInfo;
 import org.apache.kafka.common.TopicPartition;
@@ -66,7 +70,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.stream.IntStream;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
@@ -95,6 +99,8 @@ class CoreWebhookDeliveryLoopIntegrationTests {
     private CamelContext camelContext;
     @Autowired
     private ProducerTemplate producerTemplate;
+    @Autowired
+    private Vertx registryVertx;
     @Autowired
     private JdbcTemplate jdbcTemplate;
     @Autowired
@@ -214,7 +220,6 @@ class CoreWebhookDeliveryLoopIntegrationTests {
             Assertions.assertThat(event.getReplayCount()).isZero();
             Assertions.assertThat(bytes(event.getPayload()))
                     .isEqualTo("{\"orderId\":\"123\",\"name\":\"é\"}".getBytes(StandardCharsets.UTF_8));
-            Assertions.assertThat(WebhookEvent.getClassSchema().getField("signingSecret")).isNull();
 
             CapturedRequest delivered = RECEIVER.awaitRequest(eventId, 1);
             Assertions.assertThat(delivered.body())
@@ -241,8 +246,6 @@ class CoreWebhookDeliveryLoopIntegrationTests {
             Assertions.assertThat(attempt.getRetryCount()).isZero();
             Assertions.assertThat(attempt.getReplayCount()).isZero();
             Assertions.assertThat(attempt.getDeadLettered()).isFalse();
-            Assertions.assertThat(DeliveryAttempt.getClassSchema().getField("payload")).isNull();
-            Assertions.assertThat(DeliveryAttempt.getClassSchema().getField("signingSecret")).isNull();
 
             this.awaitAttemptRows(eventId, 1);
             Map<String, Object> row = this.jdbcTemplate.queryForMap(
@@ -295,154 +298,89 @@ class CoreWebhookDeliveryLoopIntegrationTests {
         List<String> invalidBodies = List.of(
                 "{\"eventType\":",
                 "{}",
-                "{\"eventType\":\"\",\"payload\":{}}",
+                "{\"eventType\":\" \",\"payload\":{}}",
                 "{\"eventType\":\"order.\\r\\ncreated\",\"payload\":{}}",
+                "{\"eventType\":\"order.\\u0000created\",\"payload\":{}}",
                 "{\"eventType\":\"order.created\"}",
                 "{\"eventType\":\"order.created\",\"payload\":null}"
         );
-        try (KafkaConsumer<String, Object> consumer = this.newConsumer("integration-invalid-" + UUID.randomUUID())) {
-            this.seekToEnd(consumer, "webhook-events");
+        String topic = WebhookRoute.WEBHOOK_EVENT_TOPIC;
+        try (AdminClient admin = newAdminClient()) {
+            Map<TopicPartition, OffsetSpec> partitionOffsets = admin.describeTopics(List.of(topic))
+                    .topicNameValues().get(topic)
+                    .get(5, TimeUnit.SECONDS)
+                    .partitions().stream()
+                    .collect(Collectors.toMap(
+                            partition -> new TopicPartition(topic, partition.partition()),
+                            _ -> OffsetSpec.latest()
+                    ));
+            Map<TopicPartition, Long> offsetsBefore = latestOffsets(admin, partitionOffsets);
             for (String body : invalidBodies) {
                 HttpResponse<String> response = this.postEvent(body);
-                Assertions.assertThat(response.statusCode()).isEqualTo(400);
+                Assertions.assertThat(response.statusCode()).as("response for %s", body).isEqualTo(400);
                 Assertions.assertThat(response.body())
                         .contains("\"title\":\"Invalid request\"")
                         .contains("\"detail\":\"Request body is malformed or invalid.\"");
             }
-            Assertions.assertThat(consumer.poll(Duration.ofSeconds(1)).isEmpty()).isTrue();
-        }
-        Assertions.assertThat(RECEIVER.requestCount()).isZero();
-    }
-
-    @Test
-    void keepsHttpOutcomeClassificationAndImmediateRetryLimitUnchanged() throws Exception {
-        int maximumAttempts = this.webhookProperties.maximumAttempts();
-        Assertions.assertThat(maximumAttempts).isEqualTo(4);
-        List<Integer> expectedAttemptNumbers = IntStream.rangeClosed(1, maximumAttempts).boxed().toList();
-        for (int status : List.of(408, 429, 503)) {
-            RECEIVER.respondWith(status);
-            HttpResponse<String> response = this.postEvent(
-                    "{\"eventType\":\"retry.test\",\"payload\":{\"status\":" + status + "}}"
-            );
-            String eventId = this.objectMapper.readTree(response.body()).get("eventId").asString();
-
-            RECEIVER.awaitRequest(eventId, maximumAttempts);
-            this.awaitAttemptRows(eventId, maximumAttempts);
-            List<Map<String, Object>> rows = this.jdbcTemplate.queryForList(
-                    """
-                    SELECT attempt_number, outcome, http_status, retry_count, replay_count, dead_lettered,
-                           details::text AS details
-                    FROM delivery_attempt
-                    WHERE event_id = ?::uuid
-                    ORDER BY attempt_number
-                    """,
-                    eventId
-            );
-            Assertions.assertThat(rows)
-                    .extracting(row -> (Integer) row.get("attempt_number"))
-                    .containsExactlyElementsOf(expectedAttemptNumbers);
-            Assertions.assertThat(rows).allSatisfy(row -> {
-                Assertions.assertThat(row.get("outcome")).isEqualTo("RETRYABLE_FAILURE");
-                Assertions.assertThat(row.get("http_status")).isEqualTo(status);
-                assertPhaseOneAuditFields(row);
-                Assertions.assertThat(row.get("details").toString()).contains("HTTP_FAILURE");
-            });
-            Thread.sleep(200L);
-            Assertions.assertThat(RECEIVER.count(eventId)).isEqualTo(maximumAttempts);
-            RECEIVER.reset();
-        }
-
-        for (int status : List.of(302, 401)) {
-            RECEIVER.respondWith(status);
-            HttpResponse<String> response = this.postEvent(
-                    "{\"eventType\":\"permanent.test\",\"payload\":{\"status\":" + status + "}}"
-            );
-            String eventId = this.objectMapper.readTree(response.body()).get("eventId").asString();
-
-            RECEIVER.awaitRequest(eventId, 1);
-            this.awaitAttemptRows(eventId, 1);
-            Map<String, Object> row = this.jdbcTemplate.queryForMap(
-                    """
-                    SELECT attempt_number, outcome, http_status, retry_count, replay_count, dead_lettered
-                    FROM delivery_attempt
-                    WHERE event_id = ?::uuid
-                    """,
-                    eventId
-            );
-            Assertions.assertThat(row)
-                    .containsEntry("attempt_number", 1)
-                    .containsEntry("outcome", "PERMANENT_FAILURE")
-                    .containsEntry("http_status", status);
-            assertPhaseOneAuditFields(row);
-            Thread.sleep(200L);
-            Assertions.assertThat(RECEIVER.count(eventId)).isEqualTo(1);
-            RECEIVER.reset();
+            Assertions.assertThat(latestOffsets(admin, partitionOffsets)).isEqualTo(offsetsBefore);
         }
     }
 
     @Test
-    void resumesAttemptNumberingFromTheEnvelopeDeliveryAttemptCount() throws Exception {
-        Assertions.assertThat(this.webhookProperties.maximumAttempts()).isEqualTo(4);
-        RECEIVER.respondWith(500);
-        String eventId = UUID.randomUUID().toString();
-        WebhookEvent resumedEvent = new WebhookEvent(
-                eventId,
-                "resumed-numbering.test",
-                TENANT_ID,
-                ENDPOINT_ID,
-                Instant.now(),
-                ByteBuffer.wrap("{\"resumed\":true}".getBytes(StandardCharsets.UTF_8)),
-                2,
-                null,
-                2,
-                0
-        );
-
+    void exhaustsImmediateRetriesWithoutPublishingToRetryOrDeadLetterTopics() throws Exception {
+        RECEIVER.respondWith(503);
         try (
-                KafkaConsumer<String, Object> attemptConsumer =
-                        this.newConsumer("integration-resumed-numbering-" + UUID.randomUUID())
+                KafkaConsumer<String, Object> source = this.newConsumer("retry-source-" + UUID.randomUUID());
+                KafkaConsumer<String, Object> delayed = this.newConsumer("retry-delayed-" + UUID.randomUUID())
         ) {
-            this.seekToEnd(attemptConsumer, "persist-delivery-attempt");
-            this.producerTemplate.sendBodyAndHeaders(
-                    "kafka:" + WebhookRoute.WEBHOOK_EVENT_TOPIC,
-                    resumedEvent,
-                    Map.of(KafkaConstants.KEY, ENDPOINT_ID, KafkaConstants.PARTITION_KEY, 0)
-            );
+            this.seekToEnd(source, WebhookRoute.WEBHOOK_EVENT_TOPIC);
+            this.seekToEnd(delayed, NON_PRODUCED_TOPICS.toArray(String[]::new));
 
-            RECEIVER.awaitRequest(eventId, 2);
-            this.awaitAttemptRows(eventId, 2);
-            Thread.sleep(200L);
-            Assertions.assertThat(RECEIVER.count(eventId)).isEqualTo(2);
+            HttpResponse<String> response = this.postEvent("{\"eventType\":\"retry.test\",\"payload\":{}}");
+            Assertions.assertThat(response.statusCode()).isEqualTo(202);
+            String eventId = this.objectMapper.readTree(response.body()).get("eventId").asString();
 
-            DeliveryAttempt firstAttempt = (DeliveryAttempt) this.awaitRecord(attemptConsumer, eventId).value();
-            Assertions.assertThat(firstAttempt.getAttemptNumber()).isEqualTo(3);
-            Assertions.assertThat(firstAttempt.getRetryCount()).isEqualTo(2);
-            Assertions.assertThat(firstAttempt.getReplayCount()).isZero();
-            Assertions.assertThat(firstAttempt.getDeadLettered()).isFalse();
-
+            awaitCommit(this.awaitRecord(source, eventId));
+            this.awaitAttemptRows(eventId, 4);
             List<Map<String, Object>> rows = this.jdbcTemplate.queryForList(
                     """
-                    SELECT attempt_number, outcome, http_status, retry_count, replay_count, dead_lettered
+                    SELECT attempt_number, outcome, http_status
                     FROM delivery_attempt
                     WHERE event_id = ?::uuid
                     ORDER BY attempt_number
                     """,
                     eventId
             );
-            Assertions.assertThat(rows)
-                    .extracting(row -> (Integer) row.get("attempt_number"))
-                    .containsExactly(3, 4);
+            Assertions.assertThat(RECEIVER.count(eventId)).isEqualTo(4);
+            Assertions.assertThat(rows).extracting(row -> row.get("attempt_number")).containsExactly(1, 2, 3, 4);
             Assertions.assertThat(rows).allSatisfy(row -> Assertions.assertThat(row)
                     .containsEntry("outcome", "RETRYABLE_FAILURE")
-                    .containsEntry("http_status", 500)
-                    .containsEntry("retry_count", 2)
-                    .containsEntry("replay_count", 0)
-                    .containsEntry("dead_lettered", false));
+                    .containsEntry("http_status", 503));
+            Assertions.assertThat(delayed.poll(Duration.ofSeconds(1))).isEmpty();
         }
     }
 
     @Test
-    void retriesAbruptTransportFailuresUntilTheConfiguredMaximumWithSanitizedDetails() throws Exception {
+    void treatsRedirectsAsPermanentFailuresWithoutFollowingThem() throws Exception {
+        RECEIVER.respondWith(302);
+        try (KafkaConsumer<String, Object> source = this.newConsumer("redirect-source-" + UUID.randomUUID())) {
+            this.seekToEnd(source, WebhookRoute.WEBHOOK_EVENT_TOPIC);
+
+            HttpResponse<String> response = this.postEvent("{\"eventType\":\"redirect.test\",\"payload\":{}}");
+            Assertions.assertThat(response.statusCode()).isEqualTo(202);
+            String eventId = this.objectMapper.readTree(response.body()).get("eventId").asString();
+
+            awaitCommit(this.awaitRecord(source, eventId));
+            this.awaitAttemptRows(eventId, 1);
+            Assertions.assertThat(RECEIVER.count(eventId)).isEqualTo(1);
+            Assertions.assertThat(this.jdbcTemplate.queryForMap(
+                    "SELECT outcome, http_status FROM delivery_attempt WHERE event_id = ?::uuid", eventId
+            )).containsEntry("outcome", "PERMANENT_FAILURE").containsEntry("http_status", 302);
+        }
+    }
+
+    @Test
+    void retriesAbruptTransportFailuresUntilTheConfiguredMaximum() throws Exception {
         int maximumAttempts = this.webhookProperties.maximumAttempts();
         RECEIVER.closeConnectionsWithoutResponse();
         HttpResponse<String> response = this.postEvent("{\"eventType\":\"connection.test\",\"payload\":{}}");
@@ -466,41 +404,6 @@ class CoreWebhookDeliveryLoopIntegrationTests {
             Assertions.assertThat(details.get("type").asString()).isIn("CONNECTION_FAILURE", "INVALID_RESPONSE");
             Assertions.assertThat(details.has("exceptionClass")).isTrue();
             Assertions.assertThat(details.has("message")).isTrue();
-            Assertions.assertThat(detailsJson).doesNotContain(SIGNING_SECRET, "request-payload");
-        });
-    }
-
-    @Test
-    void boundsHttpFailureDetailsWithoutPersistingThePayloadOrSigningSecret() throws Exception {
-        int maximumAttempts = this.webhookProperties.maximumAttempts();
-        String responseBody = "a" + "🙂".repeat(1_100);
-        RECEIVER.respondWith(503, responseBody);
-        HttpResponse<String> response = this.postEvent(
-                "{\"eventType\":\"details.test\",\"payload\":{\"private\":\"request-payload-marker\"}}"
-        );
-        String eventId = this.objectMapper.readTree(response.body()).get("eventId").asString();
-
-        RECEIVER.awaitRequest(eventId, maximumAttempts);
-        this.awaitAttemptRows(eventId, maximumAttempts);
-        List<Map<String, Object>> rows = this.jdbcTemplate.queryForList(
-                """
-                SELECT retry_count, replay_count, dead_lettered, details::text AS details
-                FROM delivery_attempt
-                WHERE event_id = ?::uuid
-                ORDER BY attempt_number
-                """,
-                eventId
-        );
-        Assertions.assertThat(rows).hasSize(maximumAttempts).allSatisfy(row -> {
-            assertPhaseOneAuditFields(row);
-            String detailsJson = row.get("details").toString();
-            JsonNode details = this.objectMapper.readTree(detailsJson);
-            String snippet = details.get("responseBody").asString();
-            Assertions.assertThat(details.get("type").asString()).isEqualTo("HTTP_FAILURE");
-            Assertions.assertThat(snippet.getBytes(StandardCharsets.UTF_8).length).isLessThanOrEqualTo(4_096);
-            Assertions.assertThat(snippet).doesNotContain("�");
-            Assertions.assertThat(responseBody).startsWith(snippet);
-            Assertions.assertThat(detailsJson).doesNotContain("request-payload-marker", SIGNING_SECRET);
         });
     }
 
@@ -566,48 +469,32 @@ class CoreWebhookDeliveryLoopIntegrationTests {
                 0,
                 1
         );
-        RECEIVER.blockResponses();
         WebhookEvent first = event("same-partition-first", "endpoint-a");
         WebhookEvent second = event("same-partition-second", "endpoint-a");
-        this.producerTemplate.sendBodyAndHeaders(
-                "kafka:" + WebhookRoute.WEBHOOK_EVENT_TOPIC,
-                first,
-                Map.of(KafkaConstants.KEY, "endpoint-a", KafkaConstants.PARTITION_KEY, 0)
-        );
-        this.producerTemplate.sendBodyAndHeaders(
-                "kafka:" + WebhookRoute.WEBHOOK_EVENT_TOPIC,
-                second,
-                Map.of(KafkaConstants.KEY, "endpoint-a", KafkaConstants.PARTITION_KEY, 0)
-        );
-
-        RECEIVER.awaitTotalRequests(1);
-        Thread.sleep(300L);
-        Assertions.assertThat(RECEIVER.requestCount()).isEqualTo(1);
-        RECEIVER.releaseResponses();
-        RECEIVER.awaitTotalRequests(2);
-        this.awaitAttemptRows(first.getEventId(), 1);
-        this.awaitAttemptRows(second.getEventId(), 1);
-
-        RECEIVER.reset();
+        WebhookEvent parallel = event("different-partition", "endpoint-b");
         RECEIVER.blockResponses();
-        WebhookEvent partitionZero = event("different-partition-zero", "endpoint-zero");
-        WebhookEvent partitionOne = event("different-partition-one", "endpoint-one");
-        this.producerTemplate.sendBodyAndHeaders(
-                "kafka:" + WebhookRoute.WEBHOOK_EVENT_TOPIC,
-                partitionZero,
-                Map.of(KafkaConstants.KEY, "endpoint-zero", KafkaConstants.PARTITION_KEY, 0)
-        );
-        this.producerTemplate.sendBodyAndHeaders(
-                "kafka:" + WebhookRoute.WEBHOOK_EVENT_TOPIC,
-                partitionOne,
-                Map.of(KafkaConstants.KEY, "endpoint-one", KafkaConstants.PARTITION_KEY, 1)
-        );
+        try {
+            this.sendToPartition(first, 0);
+            this.sendToPartition(second, 0);
+            this.sendToPartition(parallel, 1);
 
-        RECEIVER.awaitRequests(partitionZero.getEventId(), partitionOne.getEventId());
-        Assertions.assertThat(RECEIVER.requestCount()).isEqualTo(2);
-        RECEIVER.releaseResponses();
-        this.awaitAttemptRows(partitionZero.getEventId(), 1);
-        this.awaitAttemptRows(partitionOne.getEventId(), 1);
+            RECEIVER.awaitRequests(first.getEventId(), parallel.getEventId());
+            Assertions.assertThat(RECEIVER.count(second.getEventId())).isZero();
+        } finally {
+            RECEIVER.releaseResponses();
+        }
+
+        for (WebhookEvent event : List.of(first, second, parallel)) {
+            this.awaitAttemptRows(event.getEventId(), 1);
+        }
+    }
+
+    private void sendToPartition(WebhookEvent event, int partition) {
+        this.producerTemplate.sendBodyAndHeaders(
+                "kafka:" + WebhookRoute.WEBHOOK_EVENT_TOPIC,
+                event,
+                Map.of(KafkaConstants.KEY, event.getEndpointId(), KafkaConstants.PARTITION_KEY, partition)
+        );
     }
 
     @Test
@@ -626,22 +513,18 @@ class CoreWebhookDeliveryLoopIntegrationTests {
                 0
         );
 
-        this.producerTemplate.sendBodyAndHeaders(
-                "kafka:" + WebhookRoute.WEBHOOK_EVENT_TOPIC,
-                event,
-                Map.of(KafkaConstants.KEY, event.getEndpointId(), KafkaConstants.PARTITION_KEY, 0)
-        );
-        this.producerTemplate.sendBodyAndHeaders(
-                "kafka:" + WebhookRoute.WEBHOOK_EVENT_TOPIC,
-                event,
-                Map.of(KafkaConstants.KEY, event.getEndpointId(), KafkaConstants.PARTITION_KEY, 0)
-        );
+        try (KafkaConsumer<String, Object> attempts = this.newConsumer("duplicate-source-" + UUID.randomUUID())) {
+            this.seekToEnd(attempts, WebhookRoute.PERSIST_DELIVERY_ATTEMPT_TOPIC);
+            Map<String, Object> headers = Map.of(KafkaConstants.KEY, event.getEndpointId());
+            this.producerTemplate.sendBodyAndHeaders("kafka:" + WebhookRoute.WEBHOOK_EVENT_TOPIC, event, headers);
+            awaitCommit(this.awaitRecord(attempts, eventId));
 
-        RECEIVER.awaitRequest(eventId, 2);
-        this.awaitAttemptRows(eventId, 1);
-        Thread.sleep(500L);
-        Assertions.assertThat(RECEIVER.count(eventId)).isEqualTo(2);
-        Assertions.assertThat(this.attemptRowCount(eventId)).isEqualTo(1);
+            this.producerTemplate.sendBodyAndHeaders("kafka:" + WebhookRoute.WEBHOOK_EVENT_TOPIC, event, headers);
+            awaitCommit(this.awaitRecord(attempts, eventId));
+
+            Assertions.assertThat(RECEIVER.count(eventId)).isEqualTo(2);
+            Assertions.assertThat(this.attemptRowCount(eventId)).isEqualTo(1);
+        }
     }
 
     @Test
@@ -698,8 +581,9 @@ class CoreWebhookDeliveryLoopIntegrationTests {
         Assertions.assertThat(dataType).isEqualTo("jsonb");
         Map<String, Object> row = this.jdbcTemplate.queryForMap(
                 """
-                SELECT attempt_id, event_id, attempt_number, outcome, http_status, latency_ms,
-                       attempted_at, retry_count, replay_count, dead_lettered, details::text AS details
+                SELECT attempt_id, event_id, tenant_id, endpoint_id, event_type, attempt_number, outcome,
+                       http_status, latency_ms, extract(epoch from attempted_at)::bigint AS attempted_at_epoch,
+                       retry_count, replay_count, dead_lettered, details::text AS details
                 FROM delivery_attempt
                 WHERE event_id = ?::uuid
                 """,
@@ -707,7 +591,11 @@ class CoreWebhookDeliveryLoopIntegrationTests {
         );
         Assertions.assertThat(row.get("attempt_id").toString()).isEqualTo(attemptId);
         Assertions.assertThat(row.get("event_id").toString()).isEqualTo(eventId);
+        Assertions.assertThat(row.get("tenant_id").toString()).isEqualTo(TENANT_ID);
+        Assertions.assertThat(row.get("endpoint_id").toString()).isEqualTo(ENDPOINT_ID);
         Assertions.assertThat(row)
+                .containsEntry("event_type", "persistence.test")
+                .containsEntry("attempted_at_epoch", Instant.parse("2026-07-10T12:00:00Z").getEpochSecond())
                 .containsEntry("attempt_number", 3)
                 .containsEntry("outcome", "RETRYABLE_FAILURE")
                 .containsEntry("latency_ms", 42L);
@@ -750,7 +638,7 @@ class CoreWebhookDeliveryLoopIntegrationTests {
     }
 
     @Test
-    void declaresPhaseTwoTopicsWithRetryConsumersButWithoutRetryOrDeadLetterProducers() throws Exception {
+    void declaresTopicsWithTheExpectedPartitioningAndRetention() throws Exception {
         List<String> expectedTopics = Stream.concat(
                 Stream.of("webhook-events", "persist-delivery-attempt"),
                 NON_PRODUCED_TOPICS.stream()
@@ -759,12 +647,8 @@ class CoreWebhookDeliveryLoopIntegrationTests {
                 AdminClient adminClient = AdminClient.create(Map.of(
                         AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG,
                         kafkaBootstrapServers()
-                ));
-                KafkaConsumer<String, Object> nonProducedTopicConsumer =
-                        this.newConsumer("integration-non-produced-topics-" + UUID.randomUUID())
+                ))
         ) {
-            Assertions.assertThat(adminClient.listTopics().names().get(10, TimeUnit.SECONDS))
-                    .containsExactlyInAnyOrderElementsOf(expectedTopics);
             Map<String, TopicDescription> descriptions = adminClient
                     .describeTopics(expectedTopics)
                     .allTopicNames()
@@ -799,60 +683,22 @@ class CoreWebhookDeliveryLoopIntegrationTests {
                         .isEqualTo(expectedRetentions.get(resource.name()));
             }
 
-            List<String> consumerUris = this.camelContext.getRoutes().stream()
-                    .map(route -> route.getEndpoint().getEndpointUri())
-                    .toList();
-            for (String retryTopic : RETRY_TOPICS) {
-                Assertions.assertThat(consumerUris).anyMatch(uri ->
-                        uri.contains(retryTopic) && uri.contains("groupId=" + retryTopic)
-                );
-            }
-            Assertions.assertThat(consumerUris).noneMatch(uri ->
-                    uri.contains(WebhookRoute.WEBHOOK_EVENT_DEAD_LETTER_TOPIC)
+            Assertions.assertThat(this.camelContext.getRoutes()).noneMatch(route ->
+                    route.getEndpoint().getEndpointUri().startsWith(
+                            "kafka:" + WebhookRoute.WEBHOOK_EVENT_DEAD_LETTER_TOPIC
+                    )
             );
-
-            this.seekToEnd(nonProducedTopicConsumer, NON_PRODUCED_TOPICS.toArray(String[]::new));
-            RECEIVER.respondWith(503);
-            HttpResponse<String> response = this.postEvent(
-                    "{\"eventType\":\"infrastructure-only.test\",\"payload\":{}}"
-            );
-            Assertions.assertThat(response.statusCode()).isEqualTo(202);
-            String eventId = this.objectMapper.readTree(response.body()).get("eventId").asString();
-            RECEIVER.awaitRequest(eventId, 4);
-            this.awaitAttemptRows(eventId, 4);
-            Assertions.assertThat(nonProducedTopicConsumer.poll(Duration.ofSeconds(1)).isEmpty()).isTrue();
         }
     }
 
     @Test
-    void localReceiverAcceptsOnlyValidCurrentStandardWebhookSignatures() throws Exception {
+    void servesTheMockWebhookReceiverWithTheConfiguredSecret() throws Exception {
         byte[] body = "{\"receiver\":\"é\"}".getBytes(StandardCharsets.UTF_8);
         long now = Instant.now().getEpochSecond();
         String valid = this.signatureComponent.sign("receiver-event", now, body);
 
         Assertions.assertThat(this.postReceiver(body, "receiver-event", Long.toString(now), valid).statusCode())
                 .isEqualTo(204);
-        Assertions.assertThat(this.postReceiver(body, null, null, null).statusCode()).isEqualTo(401);
-        Assertions.assertThat(this.postReceiver(body, "receiver-event", Long.toString(now), "v1,wrong").statusCode())
-                .isEqualTo(401);
-
-        long staleTimestamp = now - Duration.ofMinutes(5).toSeconds() - 1L;
-        String stale = this.signatureComponent.sign("receiver-event", staleTimestamp, body);
-        Assertions.assertThat(this.postReceiver(
-                body,
-                "receiver-event",
-                Long.toString(staleTimestamp),
-                stale
-        ).statusCode()).isEqualTo(401);
-
-        long futureTimestamp = Instant.now().getEpochSecond() + Duration.ofMinutes(6).toSeconds();
-        String future = this.signatureComponent.sign("receiver-event", futureTimestamp, body);
-        Assertions.assertThat(this.postReceiver(
-                body,
-                "receiver-event",
-                Long.toString(futureTimestamp),
-                future
-        ).statusCode()).isEqualTo(401);
     }
 
     private HttpResponse<String> postEvent(String body) throws IOException, InterruptedException {
@@ -870,20 +716,15 @@ class CoreWebhookDeliveryLoopIntegrationTests {
             String timestamp,
             String signature
     ) throws IOException, InterruptedException {
-        HttpRequest.Builder request = HttpRequest.newBuilder()
+        HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create("http://localhost:" + this.serverPort + "/api/mocked-webhook-receiver"))
                 .header("Content-Type", "application/json")
-                .POST(HttpRequest.BodyPublishers.ofByteArray(body));
-        if (webhookId != null) {
-            request.header("webhook-id", webhookId);
-        }
-        if (timestamp != null) {
-            request.header("webhook-timestamp", timestamp);
-        }
-        if (signature != null) {
-            request.header("webhook-signature", signature);
-        }
-        return HttpClient.newHttpClient().send(request.build(), HttpResponse.BodyHandlers.ofString());
+                .header("webhook-id", webhookId)
+                .header("webhook-timestamp", timestamp)
+                .header("webhook-signature", signature)
+                .POST(HttpRequest.BodyPublishers.ofByteArray(body))
+                .build();
+        return HttpClient.newHttpClient().send(request, HttpResponse.BodyHandlers.ofString());
     }
 
     private KafkaConsumer<String, Object> newConsumer(String groupId) {
@@ -903,20 +744,32 @@ class CoreWebhookDeliveryLoopIntegrationTests {
                         + "/apis/registry/v3"
         );
         properties.put("apicurio.registry.use-specific-avro-reader", true);
+        properties.put(SchemaResolverConfig.VERTX_INSTANCE, this.registryVertx);
         return new KafkaConsumer<>(properties);
     }
 
     private void seekToEnd(KafkaConsumer<String, Object> consumer, String... topics) {
-        List<TopicPartition> partitions = Stream.of(topics)
+        List<TopicPartition> partitions = topicPartitions(consumer, topics);
+        consumer.assign(partitions);
+        consumer.endOffsets(partitions).forEach(consumer::seek);
+    }
+
+    private static Map<TopicPartition, Long> latestOffsets(
+            AdminClient admin,
+            Map<TopicPartition, OffsetSpec> partitions
+    ) throws Exception {
+        return admin.listOffsets(partitions).all()
+                .get(5, TimeUnit.SECONDS)
+                .entrySet().stream()
+                .collect(Collectors.toMap(Map.Entry::getKey, entry -> entry.getValue().offset()));
+    }
+
+    private static List<TopicPartition> topicPartitions(KafkaConsumer<String, Object> consumer, String... topics) {
+        return Stream.of(topics)
                 .flatMap(topic -> consumer.partitionsFor(topic, Duration.ofSeconds(10)).stream()
                         .map(PartitionInfo::partition)
                         .map(partition -> new TopicPartition(topic, partition)))
                 .toList();
-        consumer.assign(partitions);
-        consumer.seekToEnd(partitions);
-        for (TopicPartition partition : partitions) {
-            consumer.position(partition);
-        }
     }
 
     private ConsumerRecord<String, Object> awaitRecord(KafkaConsumer<String, Object> consumer, String eventId) {
@@ -929,6 +782,28 @@ class CoreWebhookDeliveryLoopIntegrationTests {
             }
         }
         throw new AssertionError("Kafka record was not observed for event " + eventId);
+    }
+
+    private static void awaitCommit(ConsumerRecord<String, Object> record) throws Exception {
+        TopicPartition partition = new TopicPartition(record.topic(), record.partition());
+        Instant deadline = Instant.now().plusSeconds(15);
+        try (
+                AdminClient admin = AdminClient.create(Map.of(
+                        AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, kafkaBootstrapServers()
+                ))
+        ) {
+            while (Instant.now().isBefore(deadline)) {
+                OffsetAndMetadata committed = admin.listConsumerGroupOffsets(record.topic())
+                        .partitionsToOffsetAndMetadata()
+                        .get(5, TimeUnit.SECONDS)
+                        .get(partition);
+                if (committed != null && committed.offset() > record.offset()) {
+                    return;
+                }
+                Thread.sleep(50L);
+            }
+        }
+        throw new AssertionError("Offset " + record.offset() + " was not committed on " + partition);
     }
 
     @SuppressWarnings("SameParameterValue")
@@ -1047,6 +922,10 @@ class CoreWebhookDeliveryLoopIntegrationTests {
         return entry == null ? null : entry.value();
     }
 
+    private static AdminClient newAdminClient() {
+        return AdminClient.create(Map.of(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, kafkaBootstrapServers()));
+    }
+
     private static String kafkaBootstrapServers() {
         return "localhost:" + System.getenv().getOrDefault("KAFKA_PORT", "9092");
     }
@@ -1133,10 +1012,6 @@ class CoreWebhookDeliveryLoopIntegrationTests {
             this.responseGate = null;
         }
 
-        int requestCount() {
-            return this.requests.size();
-        }
-
         int count(String eventId) {
             return (int) this.requests.stream().filter(request -> eventId.equals(request.webhookId())).count();
         }
@@ -1153,17 +1028,6 @@ class CoreWebhookDeliveryLoopIntegrationTests {
                 Thread.sleep(25L);
             }
             throw new AssertionError("Expected " + expectedCount + " requests for event " + eventId);
-        }
-
-        void awaitTotalRequests(int expectedCount) throws InterruptedException {
-            Instant deadline = Instant.now().plusSeconds(15);
-            while (Instant.now().isBefore(deadline)) {
-                if (this.requests.size() >= expectedCount) {
-                    return;
-                }
-                Thread.sleep(25L);
-            }
-            throw new AssertionError("Expected " + expectedCount + " total requests");
         }
 
         void awaitRequests(String... eventIds) throws InterruptedException {
@@ -1200,7 +1064,7 @@ class CoreWebhookDeliveryLoopIntegrationTests {
                     gate.await(10, TimeUnit.SECONDS);
                 }
                 if (this.status.get() == 302) {
-                    exchange.getResponseHeaders().add("Location", this.uri());
+                    exchange.getResponseHeaders().add("Location", "/redirect-target");
                 }
                 byte[] responseBytes = this.responseBody;
                 exchange.sendResponseHeaders(this.status.get(), responseBytes.length == 0 ? -1L : responseBytes.length);

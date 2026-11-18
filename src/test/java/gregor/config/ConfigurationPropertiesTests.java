@@ -9,19 +9,23 @@ import org.springframework.boot.autoconfigure.AutoConfigurations;
 import org.springframework.boot.autoconfigure.context.ConfigurationPropertiesAutoConfiguration;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.boot.context.properties.bind.validation.BindValidationException;
+import org.springframework.boot.env.YamlPropertySourceLoader;
 import org.springframework.boot.test.context.ConfigDataApplicationContextInitializer;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.boot.validation.autoconfigure.ValidationAutoConfiguration;
 import org.springframework.context.annotation.Configuration;
-import tools.jackson.databind.JsonNode;
+import org.springframework.core.env.EnumerablePropertySource;
+import org.springframework.core.io.FileSystemResource;
 import tools.jackson.databind.ObjectMapper;
 
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
-import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 class ConfigurationPropertiesTests {
 
@@ -91,22 +95,21 @@ class ConfigurationPropertiesTests {
     }
 
     @Test
-    void declaresKafkaMaxPollIntervalConfigurationMetadata() throws IOException {
-        JsonNode properties = new ObjectMapper().readTree(Files.readString(Path.of(
+    void documentsEveryCamelPropertyUsedInProduction() throws IOException {
+        Set<String> documented = new HashSet<>();
+        new ObjectMapper().readTree(Files.readString(Path.of(
                 "src/main/resources/META-INF/additional-spring-configuration-metadata.json"
-        ))).get("properties");
-        List<JsonNode> matchingProperties = new ArrayList<>();
-        properties.forEach(property -> {
-            if ("camel.component.kafka.max-poll-interval-ms".equals(property.get("name").asString())) {
-                matchingProperties.add(property);
-            }
-        });
+        ))).get("properties").forEach(property -> documented.add(property.get("name").asString()));
+        List<String> configured = new YamlPropertySourceLoader()
+                .load("production", new FileSystemResource("src/main/resources/application.yaml"))
+                .stream()
+                .flatMap(source -> Arrays.stream(((EnumerablePropertySource<?>) source).getPropertyNames()))
+                .filter(name -> name.startsWith("camel."))
+                .map(name -> name.replaceFirst("\\.?\\[.*", ""))
+                .distinct()
+                .toList();
 
-        Assertions.assertThat(matchingProperties).singleElement().satisfies(property -> {
-            Assertions.assertThat(property.get("type").asString()).isEqualTo("java.lang.Integer");
-            Assertions.assertThat(property.get("sourceType").asString())
-                    .isEqualTo("org.apache.camel.component.kafka.springboot.KafkaComponentConfiguration");
-        });
+        Assertions.assertThat(documented).containsAll(configured);
     }
 
     @Test

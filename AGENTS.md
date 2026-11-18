@@ -33,6 +33,10 @@ However, when a recent JDK release provides a new feature that simplifies the im
 
 ## Tests
 
+- Test each behavior at the cheapest layer that can prove it. Put status and validation matrices in focused tests; use representative cases in full-stack tests to prove HTTP, Kafka, or PostgreSQL wiring and failure recovery.
+- Assert observable behavior and published contracts. Do not pin annotations, generated accessors, private fields, bean names, or Camel route counts. Verify Avro compatibility by decoding old writer data and persistence mappings by writing to PostgreSQL.
+- Use explicit expected values or fixed test vectors. Do not copy production branches into assertions or use the production signer to generate the expected digest in its own test.
+- Do not use fixed sleeps to infer completion or absence. Wait for a Kafka offset, a persisted row, or a latch with a deadline. On shared infrastructure, scope assertions by event ID or compare broker offsets before and after the action instead of asserting global receiver counts.
 - All assertion API calls go through `org.assertj.core.api.Assertions` as qualified calls — `Assertions.assertThat(...)`, `Assertions.catchThrowableOfType(...)` — never JUnit's assertion API. Tests can throw `AssertionError` directly for custom failure paths.
 - Do not test log text or assert on log output. Do not use `CapturedOutput` or `OutputCaptureExtension`. Tests can verify that a method whose effect is logging was called.
 - After every change to Java, tests, Avro schemas, Gradle files, or application configuration, run `docker compose up -d` and then `./gradlew test`. Leave the services running afterward.

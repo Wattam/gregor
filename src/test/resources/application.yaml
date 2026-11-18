@@ -50,8 +50,9 @@ spring:
         username: sa
         password:
     jpa:
+        open-in-view: false
         hibernate:
-            ddl-auto: create-drop
+            ddl-auto: none # Tests that exercise persistence override this and use PostgreSQL
     kafka:
         admin:
             auto-create: false

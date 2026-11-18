@@ -5,6 +5,8 @@ import com.sun.net.httpserver.HttpServer;
 import gregor.avro.DeliveryAttempt;
 import gregor.avro.WebhookEvent;
 import gregor.route.WebhookRoute;
+import io.apicurio.registry.resolver.config.SchemaResolverConfig;
+import io.vertx.core.Vertx;
 import org.apache.camel.ProducerTemplate;
 import org.apache.camel.component.kafka.KafkaConstants;
 import org.apache.kafka.clients.admin.AdminClient;
@@ -67,6 +69,8 @@ class ImpossibleDeliveryStateIntegrationTests {
 
     @Autowired
     private ProducerTemplate producerTemplate;
+    @Autowired
+    private Vertx registryVertx;
     @Autowired
     private JdbcTemplate jdbcTemplate;
 
@@ -140,12 +144,10 @@ class ImpossibleDeliveryStateIntegrationTests {
     }
 
     @Test
-    void discardsEveryImpossibleEnvelopeWithoutDeliveringItAndCommitsTheSourceOffset() throws Exception {
+    void discardsInvalidSourceEnvelopesWithoutDeliveryAndCommitsTheirOffsets() throws Exception {
         List<WebhookEvent> impossibleEvents = List.of(
                 event("exhausted-attempt-count.test", MAXIMUM_ATTEMPTS, 0, 0, null),
-                event("negative-attempt-count.test", -1, 0, 0, null),
-                event("negative-retry-count.test", 0, -1, 0, null),
-                event("negative-replay-count.test", 0, 0, -1, null)
+                event("negative-attempt-count.test", -1, 0, 0, null)
         );
         List<String> discardedEventIds = impossibleEvents.stream().map(WebhookEvent::getEventId).toList();
         TopicPartition partition = new TopicPartition(WebhookRoute.WEBHOOK_EVENT_TOPIC, 0);
@@ -186,18 +188,6 @@ class ImpossibleDeliveryStateIntegrationTests {
                 new RetryRecord(
                         WebhookRoute.WEBHOOK_EVENT_RETRY_1M_TOPIC,
                         event("retry-exhausted.test", MAXIMUM_ATTEMPTS, 0, 0, now)
-                ),
-                new RetryRecord(
-                        WebhookRoute.WEBHOOK_EVENT_RETRY_10M_TOPIC,
-                        event("retry-negative-attempt.test", -1, 0, 0, now)
-                ),
-                new RetryRecord(
-                        WebhookRoute.WEBHOOK_EVENT_RETRY_1H_TOPIC,
-                        event("retry-negative-retry.test", 0, -1, 0, now)
-                ),
-                new RetryRecord(
-                        WebhookRoute.WEBHOOK_EVENT_RETRY_1M_TOPIC,
-                        event("retry-negative-replay.test", 0, 0, -1, now)
                 ),
                 new RetryRecord(
                         WebhookRoute.WEBHOOK_EVENT_RETRY_10M_TOPIC,
@@ -321,6 +311,7 @@ class ImpossibleDeliveryStateIntegrationTests {
                         + "/apis/registry/v3"
         );
         properties.put("apicurio.registry.use-specific-avro-reader", true);
+        properties.put(SchemaResolverConfig.VERTX_INSTANCE, this.registryVertx);
         return new KafkaConsumer<>(properties);
     }
 

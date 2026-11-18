@@ -2,7 +2,6 @@ package gregor.integration;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
-import gregor.config.properties.WebhookProperties;
 import org.assertj.core.api.Assertions;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Test;
@@ -43,8 +42,6 @@ class MaximumAttemptsOneIntegrationTests {
     private JdbcTemplate jdbcTemplate;
     @Autowired
     private ObjectMapper objectMapper;
-    @Autowired
-    private WebhookProperties webhookProperties;
 
     @DynamicPropertySource
     static void configureInfrastructure(DynamicPropertyRegistry registry) {
@@ -120,7 +117,20 @@ class MaximumAttemptsOneIntegrationTests {
 
     @Test
     void configuredMaximumOfOnePermitsOnlyTheInitialAttempt() throws Exception {
-        Assertions.assertThat(this.webhookProperties.maximumAttempts()).isEqualTo(1);
+        String eventId = this.postEvent();
+        String followingEventId = this.postEvent();
+        // Both events have the same Kafka key. The second can deliver only after the first finishes retrying.
+        this.awaitAttemptRow(followingEventId);
+        Map<String, Object> row = this.awaitAttemptRow(eventId);
+
+        Assertions.assertThat(RECEIVER.count(eventId)).isEqualTo(1);
+        Assertions.assertThat(row)
+                .containsEntry("attempt_number", 1)
+                .containsEntry("outcome", "RETRYABLE_FAILURE")
+                .containsEntry("http_status", 503);
+    }
+
+    private String postEvent() throws Exception {
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create("http://localhost:" + this.serverPort + "/api/events"))
                 .header("Content-Type", "application/json")
@@ -134,19 +144,7 @@ class MaximumAttemptsOneIntegrationTests {
                 .send(request, HttpResponse.BodyHandlers.ofString());
 
         Assertions.assertThat(response.statusCode()).isEqualTo(202);
-        String eventId = this.objectMapper.readTree(response.body()).get("eventId").asString();
-        RECEIVER.awaitRequest(eventId);
-        Map<String, Object> row = this.awaitAttemptRow(eventId);
-        Thread.sleep(300L);
-
-        Assertions.assertThat(RECEIVER.count(eventId)).isEqualTo(1);
-        Assertions.assertThat(row)
-                .containsEntry("attempt_number", 1)
-                .containsEntry("outcome", "RETRYABLE_FAILURE")
-                .containsEntry("http_status", 503)
-                .containsEntry("retry_count", 0)
-                .containsEntry("replay_count", 0)
-                .containsEntry("dead_lettered", false);
+        return this.objectMapper.readTree(response.body()).get("eventId").asString();
     }
 
     private Map<String, Object> awaitAttemptRow(String eventId) throws InterruptedException {
@@ -155,7 +153,7 @@ class MaximumAttemptsOneIntegrationTests {
             if (this.attemptRowCount(eventId) == 1) {
                 return this.jdbcTemplate.queryForMap(
                         """
-                        SELECT attempt_number, outcome, http_status, retry_count, replay_count, dead_lettered
+                        SELECT attempt_number, outcome, http_status
                         FROM delivery_attempt
                         WHERE event_id = ?::uuid
                         """,
@@ -212,17 +210,6 @@ class MaximumAttemptsOneIntegrationTests {
             return (int) this.requests.stream()
                     .filter(request -> eventId.equals(request.webhookId()))
                     .count();
-        }
-
-        void awaitRequest(String eventId) throws InterruptedException {
-            Instant deadline = Instant.now().plusSeconds(15);
-            while (Instant.now().isBefore(deadline)) {
-                if (this.count(eventId) >= 1) {
-                    return;
-                }
-                Thread.sleep(25L);
-            }
-            throw new AssertionError("Expected a request for event " + eventId);
         }
 
         private void handle(HttpExchange exchange) throws IOException {

@@ -2,7 +2,12 @@ package gregor.config;
 
 import gregor.config.properties.KafkaTopicProperties;
 import gregor.route.WebhookRoute;
+import io.apicurio.registry.resolver.config.SchemaResolverConfig;
+import io.vertx.core.Vertx;
 import lombok.AllArgsConstructor;
+import org.apache.camel.Ordered;
+import org.apache.camel.component.kafka.KafkaComponent;
+import org.apache.camel.spi.ComponentCustomizer;
 import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.common.config.TopicConfig;
 import org.springframework.context.annotation.Bean;
@@ -16,6 +21,24 @@ import java.time.Duration;
 public class KafkaConfiguration {
 
     private final KafkaTopicProperties kafkaTopicProperties;
+
+    @Bean(destroyMethod = "close")
+    public Vertx registryVertx() {
+        return Vertx.vertx();
+    }
+
+    @Bean
+    public ComponentCustomizer registryVertxCustomizer(Vertx registryVertx) {
+        return ComponentCustomizer
+                .builder(KafkaComponent.class)
+                .withOrder(Ordered.LOWEST)
+                .build(
+                        component -> component
+                                .getConfiguration()
+                                .getAdditionalProperties()
+                                .put(SchemaResolverConfig.VERTX_INSTANCE, registryVertx)
+                );
+    }
 
     @Bean
     public NewTopic webhookEventsTopic() {

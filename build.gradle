@@ -23,6 +23,10 @@ repositories {
     mavenCentral()
 }
 
+// Override Spring Boot's managed versions for the Apicurio client dependency chain.
+ext['netty.version'] = '4.2.21.Final'
+ext['commons-codec.version'] = '1.23.0'
+
 dependencyManagement {
     imports {
         mavenBom 'org.apache.camel.springboot:camel-spring-boot-bom:4.21.0'
@@ -36,7 +40,9 @@ configurations {
 dependencies {
     implementation 'org.apache.camel.springboot:camel-spring-boot-starter'
     implementation 'org.apache.camel.springboot:camel-kafka-starter'
-    implementation 'io.apicurio:apicurio-registry-avro-serde-kafka:3.2.6'
+    implementation 'io.apicurio:apicurio-registry-avro-serde-kafka:3.3.4'
+    implementation platform('io.vertx:vertx-dependencies:4.5.36')
+    implementation 'io.vertx:vertx-core'
     implementation 'org.apache.avro:avro:1.12.1'
     implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
     implementation 'org.springframework.boot:spring-boot-starter-kafka'
@@ -68,5 +74,5 @@ dependencies {
 
 tasks.named('test', Test) {
     useJUnitPlatform()
-    jvmArgs("-javaagent:${configurations.mockitoAgent.asPath}")
+    jvmArgs("-Xshare:off", "-javaagent:${configurations.mockitoAgent.asPath}")
 }

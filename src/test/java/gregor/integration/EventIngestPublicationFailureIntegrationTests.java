@@ -4,10 +4,8 @@ import org.apache.camel.ProducerTemplate;
 import org.assertj.core.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
-import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 
@@ -27,21 +25,8 @@ class EventIngestPublicationFailureIntegrationTests {
     @LocalServerPort
     private int serverPort;
 
-    @Autowired
-    private JdbcTemplate jdbcTemplate;
-
     @MockitoBean
     private ProducerTemplate producerTemplate;
-
-    @Test
-    void h2DoesNotCreateThePostgresqlSpecificAttemptTable() {
-        Integer tableCount = this.jdbcTemplate.queryForObject(
-                "SELECT count(*) FROM information_schema.tables WHERE table_name = 'DELIVERY_ATTEMPT'",
-                Integer.class
-        );
-
-        Assertions.assertThat(tableCount).isZero();
-    }
 
     @Test
     void returnsServiceUnavailableWithoutReportingAcceptanceWhenKafkaPublicationFails() throws Exception {

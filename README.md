@@ -90,6 +90,8 @@ docker compose exec -T postgres psql -U gregor -d gregor -c \
 
 The `details` column is PostgreSQL JSONB. Attempt rows do not contain the webhook payload or signing secret.
 
+Apicurio registry clients share a Spring-managed Vert.x instance that closes on application shutdown.
+
 Kafka declares this topic topology:
 
 | Topic                        | Retention                                           | Consumer group                    |
