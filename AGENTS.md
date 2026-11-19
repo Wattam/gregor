@@ -1,42 +1,24 @@
-Gregor is a local-development Spring Boot service that uses Apache Camel, Kafka, Avro, Apicurio Registry, and PostgreSQL to deliver signed HTTP webhooks and persist delivery attempts.
+## Scope
 
-When creating or implementing anything, or selecting a tech stack, use the most established standards for Java/Spring Boot services.
-However, when a recent JDK release provides a new feature that simplifies the implementation, prefer that feature over established standards. Use only finalized JDK features; never use preview or incubator features.
+- Read `IMPLEMENTATION-PHASES.md` before implementation. Update the phase status when its increment lands.
+- Document only current behavior in `README.md`. Omit roadmap references and future work.
 
-## Scope & documentation
+## Java
 
-- `IMPLEMENTATION-PHASES.md` defines what belongs to the increment being implemented. Read it before starting work, and update the phase status when an increment lands.
-- `README.md` documents only the actual current state of the project. Never reference `IMPLEMENTATION-PHASES.md`, planned phases, or future work from it.
+- Prefer newer finalized JDK features when they simplify the code. Never use preview or incubator features.
+- Name fields, parameters, and locals after their declared type (`ObjectMapper objectMapper`). If several variables share a type, prefix their roles (`receivedWebhookEvent`, `attemptedWebhookEvent`). Apply the same rule to constants in uppercase snake case (`TEST_RECEIVER`).
+- Use plural names for collections, maps, arrays, and similar containers (`List<WebhookEvent> webhookEvents`). Use descriptive names for primitives, boxed primitives, `String`, `Object`, and value types such as `UUID`, `Instant`, and `Duration`.
+- Limit lines to 240 columns. For calls and declarations, put all arguments or parameters on one line or exactly one per line. Never mix. Put `)` on its own line when wrapping inside the parentheses. Break chains before the dot.
+- Qualify instance members with `this.` or `super.`. Qualify external statics with their declaring class; leave own statics unqualified. Never use static imports.
+- Use Lombok `@Slf4j` with bracketed fields: `log.info("Published event [id={}]", eventId)`.
+- Format Camel routes as EIP trees between `// @formatter:off` and `// @formatter:on`. Indent nested steps four spaces, align `.end()` with its opener, and keep each EIP's calls together (`.choice().when().method(...)`).
+- Use Jackson 3 (`tools.jackson.databind`), not transitive Jackson 2. Keep core annotations under `com.fasterxml.jackson.annotation`. Inject the configured mapper in production.
 
-## Source layout & style
+## Configuration and tests
 
-- Maximum line length is 120. When a call does not fit, either break after `=` and indent the whole call onto the next line, or split it one argument per line with the closing `)` on its own new line.
-  Method chains break before the leading `.`.
-- Access instance members through `this.` (`this.bean`, `this.method(...)`); use `super.` for members inherited from the superclass.
-- Reference statics through their declaring class when accessing them from another class (`Mockito.mock(...)`, `StandardCharsets.UTF_8`).
-  When accessing a static method, variable, or class declared by the current class, omit the class qualifier (`run(...)`, `MAXIMUM_ATTEMPTS`, `NestedClass`). Never use static imports.
-- Log through the Slf4j `log` field with bracketed placeholders: `log.info("Clipping field boundary [z={}] [x={}] [y={}]", z, x, y)`. Add the field with Lombok's `@Slf4j`.
-- Format Camel route definitions as EIP trees inside `// @formatter:off` and `// @formatter:on`: indent nested EIPs by four spaces, align steps in the same scope, and align each `.end()` with the EIP it closes.
-  Keep calls forming one EIP on the same line, such as `.multicast().stopOnException()` and `.choice().when().method(...)`.
-- Apply these Java style rules to production and test code.
-- Never edit generated Avro Java. Edit the source `.avsc` schemas and regenerate it through Gradle.
-- Generated Avro records have no setters (`createSetters = false`). Derive a changed record with `WebhookEvent.newBuilder(existing).setDeliveryAttemptCount(...).build()`.
-- Jackson is version 3. Take `ObjectMapper`, `JsonMapper`, `JsonNode`, and node factories from `tools.jackson.databind`, and databind annotations (`@JsonSerialize`, `@JsonDeserialize`, `@JsonNaming`) from `tools.jackson.databind.annotation`.
-  Jackson 3 ships no annotation package of its own, so the core annotations (`@JsonProperty`, `@JsonInclude`, `@JsonCreator`) still come from `com.fasterxml.jackson.annotation`.
-  Never import `com.fasterxml.jackson.databind`: Jackson 2 is on the compile classpath transitively, so the wrong mapper compiles and fails only at runtime.
-- Production code injects the `@Primary JsonMapper` bean declared by `JacksonConfiguration` instead of constructing a mapper.
-
-## Configuration & persistence
-
-- The Camel starter publishes no configuration metadata. Every `camel.*` property used in `application.yaml` needs a matching entry in `src/main/resources/META-INF/additional-spring-configuration-metadata.json`.
-- There are no database migrations: `ddl-auto: update` derives the schema from the JPA entities. After changing a persisted column, recreate the volumes with `docker compose down --volumes` and `docker compose up -d` before running tests.
-
-## Tests
-
-- Test each behavior at the cheapest layer that can prove it. Put status and validation matrices in focused tests; use representative cases in full-stack tests to prove HTTP, Kafka, or PostgreSQL wiring and failure recovery.
-- Assert observable behavior and published contracts. Do not pin annotations, generated accessors, private fields, bean names, or Camel route counts. Verify Avro compatibility by decoding old writer data and persistence mappings by writing to PostgreSQL.
-- Use explicit expected values or fixed test vectors. Do not copy production branches into assertions or use the production signer to generate the expected digest in its own test.
-- Do not use fixed sleeps to infer completion or absence. Wait for a Kafka offset, a persisted row, or a latch with a deadline. On shared infrastructure, scope assertions by event ID or compare broker offsets before and after the action instead of asserting global receiver counts.
-- All assertion API calls go through `org.assertj.core.api.Assertions` as qualified calls — `Assertions.assertThat(...)`, `Assertions.catchThrowableOfType(...)` — never JUnit's assertion API. Tests can throw `AssertionError` directly for custom failure paths.
-- Do not test log text or assert on log output. Do not use `CapturedOutput` or `OutputCaptureExtension`. Tests can verify that a method whose effect is logging was called.
-- After every change to Java, tests, Avro schemas, Gradle files, or application configuration, run `docker compose up -d` and then `./gradlew test`. Leave the services running afterward.
+- Add metadata for every `camel.*` key in `application.yaml` to `src/main/resources/META-INF/additional-spring-configuration-metadata.json`; Camel does not supply it.
+- After changing a persisted column, run `docker compose down -v` before testing. This deletes local PostgreSQL, Kafka, and Apicurio data.
+- After Java, test, Avro, Gradle, or application configuration changes, run `docker compose up -d` then `./gradlew test`. Leave the services running.
+- Cover status and validation matrices in focused tests. Use full-stack tests for representative wiring and recovery cases. Verify Avro compatibility by decoding old writer data and persistence mappings against PostgreSQL.
+- Use qualified AssertJ `Assertions` calls. Assert behavior with explicit expected values or fixed vectors, not implementation details or log output.
+- Do not use fixed sleeps to infer completion or absence. Wait for offsets, rows, or latches with a deadline. Scope shared-infrastructure assertions by event ID or offset delta, not global counts.
