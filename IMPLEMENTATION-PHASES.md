@@ -1,6 +1,6 @@
 # Webhook Delivery Service: Build Phases
 
-This document is the complete implementation roadmap for the webhook delivery service. Phase 1 and Phases 2A through 2C are implemented and are kept
+This document is the complete implementation roadmap for the webhook delivery service. Phase 1 and Phases 2A through 2D are implemented and are kept
 whole. Every remaining phase is broken into the smallest dependency-ordered increment that still has a useful, independently testable
 boundary and its own completion gate. Phase 6 stays one release unit because splitting it would advertise an ordering guarantee that does
 not hold yet. Completing groundwork or an isolated test suite does not mark an increment as implemented.
@@ -13,7 +13,8 @@ not hold yet. Completing groundwork or an isolated test suite does not mark an i
 | Phase 2A            | Implemented                        | Phase 1                                                             |
 | Phase 2B            | Implemented                        | Phase 2A                                                            |
 | Phase 2C            | Implemented                        | Phase 2B                                                            |
-| Phase 2D through 2J | Planned                            | Phase 2C, in listed order                                           |
+| Phase 2D            | Implemented                        | Phase 2C                                                            |
+| Phase 2E through 2J | Planned                            | Phase 2D, in listed order                                           |
 | Phase 3A through 3J | Planned                            | Phase 2; subphases in listed order                                  |
 | Phase 4A through 4F | Planned                            | Stable Phase 2 event contract; can proceed in parallel with Phase 3 |
 | Phase 5A through 5R | Planned                            | Phases 2 through 4; subphases in listed order                       |
@@ -75,11 +76,12 @@ signed webhook delivery and durable logical-attempt history.
 - There is no retry topic, dead-letter queue, replay, endpoint management, production security, tenant isolation, or strict FIFO mode.
 - Endpoint configuration and tenant identity are single configured values rather than managed or authenticated runtime state.
 
-## Phase 2: Retry Topology, Dead-Letter Queue, and Replay (PHASES 2A THROUGH 2C IMPLEMENTED, REST PLANNED)
+## Phase 2: Retry Topology, Dead-Letter Queue, and Replay (PHASES 2A THROUGH 2D IMPLEMENTED, REST PLANNED)
 
 Phase 2 is split because contracts, retry consumption, retry publication, terminal retention, dead-letter persistence, and replay each have
-a separate testable boundary. The subphases must be implemented in order. Retry attempts for one event remain sequential, but later events
-for the same endpoint may pass an event waiting for delayed retry. Strict FIFO is deferred to Phase 6.
+a separate testable boundary. The subphases must be implemented in order. Retry attempts are sequential within a single non-redelivered
+chain, not across duplicate copies of the same event. Later events for the same endpoint may pass an event waiting for delayed retry.
+Strict FIFO is deferred to Phase 6.
 
 ### Phase 2A: Delivery-state contracts and Kafka topology (IMPLEMENTED)
 
@@ -187,22 +189,22 @@ delivery behavior is unchanged.
 - Recursive immediate retries remain active through the configured cumulative maximum.
 - Retry delivery completes HTTP before attempt-publication acknowledgement and completes all attempt publications before retry-offset commit. A failure in this window can repeat the physical request with the same `webhook-id` and logical attempt number.
 
-### Phase 2D: Kafka-backed delayed retry cutover
+### Phase 2D: Kafka-backed delayed retry cutover (IMPLEMENTED)
 
 **Goal:** Replace recursive immediate retries with durable, endpoint-keyed Kafka retry tiers.
 
 #### Tasks
 
-- [ ] After a retryable failure, publish an updated event to the next retry topic with the same event ID, tenant ID, endpoint ID, payload,
+- [x] After a retryable failure, publish an updated event to the next retry topic with the same event ID, tenant ID, endpoint ID, payload,
   and endpoint Kafka key.
-- [ ] Derive `nextEligibleAt` from the captured completion time of the failed request and the fixed 1-minute, 10-minute, and 1-hour tier
+- [x] Derive `nextEligibleAt` from the captured completion time of the failed request and the fixed 1-minute, 10-minute, and 1-hour tier
   delays.
-- [ ] Advance `retryCount`, select the tier from it, and honor `gregor.webhook.maximum-attempts` so lower values use a shorter tier subset.
-- [ ] Remove the recursive immediate retry path so one consumption performs at most one HTTP request.
-- [ ] Ensure retry-publication and attempt-publication acknowledgement precede the consumed offset commit.
-- [ ] Verify that a delayed event does not block a later event for the same endpoint and document this non-FIFO behavior.
-- [ ] Document every duplicate-delivery window created by publishing a retry record after the HTTP request.
-- [ ] Test all tiers, every valid maximum-attempt setting, restart recovery, source redelivery, retry-publication failure, endpoint keys,
+- [x] Advance `retryCount`, select the tier from it, and honor `gregor.webhook.maximum-attempts` so lower values use a shorter tier subset.
+- [x] Remove the recursive immediate retry path so one consumption performs at most one HTTP request.
+- [x] Ensure retry-publication and attempt-publication acknowledgement precede the consumed offset commit.
+- [x] Verify that a delayed event does not block a later event for the same endpoint and document this non-FIFO behavior.
+- [x] Document every duplicate-delivery window created by publishing a retry record after the HTTP request.
+- [x] Test all tiers, every valid maximum-attempt setting, restart recovery, source redelivery, retry-publication failure, endpoint keys,
   and offset-commit ordering.
 
 #### Completion gate

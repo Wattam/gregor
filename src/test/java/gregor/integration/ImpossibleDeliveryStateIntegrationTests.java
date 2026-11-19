@@ -2,23 +2,13 @@ package gregor.integration;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
-import gregor.avro.DeliveryAttempt;
 import gregor.avro.WebhookEvent;
 import gregor.route.WebhookRoute;
-import io.apicurio.registry.resolver.config.SchemaResolverConfig;
-import io.vertx.core.Vertx;
 import org.apache.camel.ProducerTemplate;
 import org.apache.camel.component.kafka.KafkaConstants;
 import org.apache.kafka.clients.admin.AdminClient;
-import org.apache.kafka.clients.admin.AdminClientConfig;
 import org.apache.kafka.clients.admin.OffsetSpec;
-import org.apache.kafka.clients.consumer.ConsumerConfig;
-import org.apache.kafka.clients.consumer.ConsumerRecord;
-import org.apache.kafka.clients.consumer.KafkaConsumer;
-import org.apache.kafka.clients.consumer.OffsetAndMetadata;
-import org.apache.kafka.common.PartitionInfo;
 import org.apache.kafka.common.TopicPartition;
-import org.apache.kafka.common.serialization.StringDeserializer;
 import org.assertj.core.api.Assertions;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Test;
@@ -35,21 +25,21 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.ArrayList;
 import java.util.Base64;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Properties;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
-import java.util.stream.Stream;
 
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.NONE, properties = "gregor.webhook.maximum-attempts=4")
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.NONE, properties = {
+        "gregor.webhook.maximum-attempts=4",
+        "camel.component.kafka.max-poll-interval-ms=4500000"
+})
 class ImpossibleDeliveryStateIntegrationTests {
 
     private static final int MAXIMUM_ATTEMPTS = 4;
@@ -59,18 +49,15 @@ class ImpossibleDeliveryStateIntegrationTests {
     private static final String SIGNING_SECRET = "whsec_" + Base64.getEncoder().encodeToString(
             "01234567890123456789012345678901".getBytes(StandardCharsets.UTF_8)
     );
-    private static final List<String> NON_PRODUCED_TOPICS = List.of(
-            WebhookRoute.WEBHOOK_EVENT_RETRY_1M_TOPIC,
-            WebhookRoute.WEBHOOK_EVENT_RETRY_10M_TOPIC,
-            WebhookRoute.WEBHOOK_EVENT_RETRY_1H_TOPIC,
+    private static final String[] DOWNSTREAM_TOPICS = {
+            WebhookRoute.PERSIST_DELIVERY_ATTEMPT_TOPIC, WebhookRoute.WEBHOOK_EVENT_RETRY_1M_TOPIC,
+            WebhookRoute.WEBHOOK_EVENT_RETRY_10M_TOPIC, WebhookRoute.WEBHOOK_EVENT_RETRY_1H_TOPIC,
             WebhookRoute.WEBHOOK_EVENT_DEAD_LETTER_TOPIC
-    );
+    };
     private static final TestReceiver RECEIVER = TestReceiver.start();
 
     @Autowired
     private ProducerTemplate producerTemplate;
-    @Autowired
-    private Vertx registryVertx;
     @Autowired
     private JdbcTemplate jdbcTemplate;
 
@@ -149,40 +136,18 @@ class ImpossibleDeliveryStateIntegrationTests {
                 event("exhausted-attempt-count.test", MAXIMUM_ATTEMPTS, 0, 0, null),
                 event("negative-attempt-count.test", -1, 0, 0, null)
         );
-        List<String> discardedEventIds = impossibleEvents.stream().map(WebhookEvent::getEventId).toList();
         TopicPartition partition = new TopicPartition(WebhookRoute.WEBHOOK_EVENT_TOPIC, 0);
-        try (
-                KafkaConsumer<String, Object> downstreamConsumer =
-                        this.newConsumer("integration-impossible-state-" + UUID.randomUUID())
-        ) {
-            this.seekToEnd(downstreamConsumer, downstreamTopics());
-
+        try (AdminClient adminClient = KafkaTestRecords.adminClient()) {
+            Map<TopicPartition, Long> before = KafkaTestRecords.endOffsets(adminClient, DOWNSTREAM_TOPICS);
             for (WebhookEvent impossibleEvent : impossibleEvents) {
-                this.producerTemplate.sendBodyAndHeaders(
-                        "kafka:" + WebhookRoute.WEBHOOK_EVENT_TOPIC,
-                        impossibleEvent,
-                        Map.of(KafkaConstants.KEY, ENDPOINT_ID, KafkaConstants.PARTITION_KEY, 0)
-                );
-
-                this.awaitCommittedOffset(WebhookRoute.WEBHOOK_EVENT_TOPIC, partition, this.endOffset(partition));
-                Assertions.assertThat(RECEIVER.count(impossibleEvent.getEventId())).isZero();
-                Assertions.assertThat(this.attemptRowCount(impossibleEvent.getEventId())).isZero();
+                this.assertDiscarded(adminClient, partition, impossibleEvent);
             }
-
-            List<ConsumerRecord<String, Object>> downstreamRecords = new ArrayList<>();
-            downstreamConsumer.poll(Duration.ofSeconds(1)).forEach(downstreamRecords::add);
-            Assertions.assertThat(downstreamRecords)
-                    .extracting(record -> eventId(record.value()))
-                    .doesNotContainAnyElementsOf(discardedEventIds);
-            Assertions.assertThat(downstreamRecords)
-                    .extracting(ConsumerRecord::topic)
-                    .doesNotContainAnyElementsOf(NON_PRODUCED_TOPICS);
+            Assertions.assertThat(KafkaTestRecords.endOffsets(adminClient, DOWNSTREAM_TOPICS)).isEqualTo(before);
         }
     }
 
     @Test
-    void discardsMalformedRetryEnvelopesWithoutDeliveryOrDownstreamPublicationAndCommitsOffsets()
-            throws Exception {
+    void discardsMalformedRetryEnvelopesWithoutDeliveryOrDownstreamPublicationAndCommitsOffsets() throws Exception {
         Instant now = Instant.now();
         List<RetryRecord> malformedRecords = List.of(
                 new RetryRecord(
@@ -198,50 +163,14 @@ class ImpossibleDeliveryStateIntegrationTests {
                         event("retry-distant-eligibility.test", 0, 0, 0, now.plus(Duration.ofHours(2)))
                 )
         );
-        List<String> discardedEventIds = malformedRecords.stream()
-                .map(record -> record.event().getEventId())
-                .toList();
-        Map<String, Long> startingRetryOffsets = new HashMap<>();
-        Map<String, Integer> sentRecordsByTopic = new HashMap<>();
-        for (String retryTopic : NON_PRODUCED_TOPICS.subList(0, 3)) {
-            startingRetryOffsets.put(retryTopic, this.endOffset(new TopicPartition(retryTopic, 0)));
-        }
-
-        try (
-                KafkaConsumer<String, Object> downstreamConsumer =
-                        this.newConsumer("integration-malformed-retry-" + UUID.randomUUID())
-        ) {
-            this.seekToEnd(
-                    downstreamConsumer,
-                    WebhookRoute.PERSIST_DELIVERY_ATTEMPT_TOPIC,
-                    WebhookRoute.WEBHOOK_EVENT_DEAD_LETTER_TOPIC
-            );
-
+        try (AdminClient admin = KafkaTestRecords.adminClient()) {
+            Map<TopicPartition, Long> expected = new HashMap<>(KafkaTestRecords.endOffsets(admin, DOWNSTREAM_TOPICS));
             for (RetryRecord malformedRecord : malformedRecords) {
                 TopicPartition partition = new TopicPartition(malformedRecord.topic(), 0);
-                this.producerTemplate.sendBodyAndHeaders(
-                        "kafka:" + malformedRecord.topic(),
-                        malformedRecord.event(),
-                        Map.of(KafkaConstants.KEY, ENDPOINT_ID, KafkaConstants.PARTITION_KEY, 0)
-                );
-                sentRecordsByTopic.merge(malformedRecord.topic(), 1, Integer::sum);
-
-                this.awaitCommittedOffset(malformedRecord.topic(), partition, this.endOffset(partition));
-                Assertions.assertThat(RECEIVER.count(malformedRecord.event().getEventId())).isZero();
-                Assertions.assertThat(this.attemptRowCount(malformedRecord.event().getEventId())).isZero();
+                this.assertDiscarded(admin, partition, malformedRecord.event());
+                expected.compute(partition, (_, offset) -> offset + 1);
             }
-
-            List<ConsumerRecord<String, Object>> downstreamRecords = new ArrayList<>();
-            downstreamConsumer.poll(Duration.ofSeconds(1)).forEach(downstreamRecords::add);
-            Assertions.assertThat(downstreamRecords)
-                    .extracting(record -> eventId(record.value()))
-                    .doesNotContainAnyElementsOf(discardedEventIds);
-        }
-
-        for (Map.Entry<String, Long> startingOffset : startingRetryOffsets.entrySet()) {
-            long expectedOffset = startingOffset.getValue() + sentRecordsByTopic.get(startingOffset.getKey());
-            Assertions.assertThat(this.endOffset(new TopicPartition(startingOffset.getKey(), 0)))
-                    .isEqualTo(expectedOffset);
+            Assertions.assertThat(KafkaTestRecords.endOffsets(admin, DOWNSTREAM_TOPICS)).isEqualTo(expected);
         }
     }
 
@@ -252,7 +181,7 @@ class ImpossibleDeliveryStateIntegrationTests {
                 0,
                 0,
                 0,
-                Instant.now().plus(Duration.ofHours(1))
+                Instant.now().plus(Duration.ofHours(2))
         );
         Instant sendStartedAt = Instant.now();
 
@@ -294,73 +223,16 @@ class ImpossibleDeliveryStateIntegrationTests {
                 .containsEntry("dead_lettered", false);
     }
 
-    private KafkaConsumer<String, Object> newConsumer(String groupId) {
-        Properties properties = new Properties();
-        properties.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, kafkaBootstrapServers());
-        properties.put(ConsumerConfig.GROUP_ID_CONFIG, groupId);
-        properties.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);
-        properties.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
-        properties.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
-        properties.put(
-                ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG,
-                "io.apicurio.registry.serde.avro.AvroKafkaDeserializer"
+    private void assertDiscarded(AdminClient admin, TopicPartition partition, WebhookEvent event) throws Exception {
+        long inputOffset = admin.listOffsets(Map.of(partition, OffsetSpec.latest()))
+                .partitionResult(partition).get(5, TimeUnit.SECONDS).offset();
+        this.producerTemplate.sendBodyAndHeaders(
+                "kafka:" + partition.topic(), event,
+                Map.of(KafkaConstants.KEY, ENDPOINT_ID, KafkaConstants.PARTITION_KEY, partition.partition())
         );
-        properties.put(
-                "apicurio.registry.url",
-                "http://localhost:" + System.getenv().getOrDefault("SCHEMA_REGISTRY_PORT", "8081")
-                        + "/apis/registry/v3"
-        );
-        properties.put("apicurio.registry.use-specific-avro-reader", true);
-        properties.put(SchemaResolverConfig.VERTX_INSTANCE, this.registryVertx);
-        return new KafkaConsumer<>(properties);
-    }
-
-    private void seekToEnd(KafkaConsumer<String, Object> consumer, String... topics) {
-        List<TopicPartition> partitions = Stream.of(topics)
-                .flatMap(topic -> consumer.partitionsFor(topic, Duration.ofSeconds(10)).stream()
-                        .map(PartitionInfo::partition)
-                        .map(partition -> new TopicPartition(topic, partition)))
-                .toList();
-        consumer.assign(partitions);
-        consumer.seekToEnd(partitions);
-        for (TopicPartition partition : partitions) {
-            consumer.position(partition);
-        }
-    }
-
-    private long endOffset(TopicPartition partition) throws Exception {
-        try (AdminClient adminClient = this.adminClient()) {
-            return adminClient.listOffsets(Map.of(partition, OffsetSpec.latest()))
-                    .partitionResult(partition)
-                    .get(5, TimeUnit.SECONDS)
-                    .offset();
-        }
-    }
-
-    private void awaitCommittedOffset(
-            String groupId,
-            TopicPartition partition,
-            long expectedOffset
-    ) throws Exception {
-        try (AdminClient adminClient = this.adminClient()) {
-            Instant deadline = Instant.now().plusSeconds(15);
-            while (Instant.now().isBefore(deadline)) {
-                Map<TopicPartition, OffsetAndMetadata> offsets = adminClient
-                        .listConsumerGroupOffsets(groupId)
-                        .partitionsToOffsetAndMetadata()
-                        .get(5, TimeUnit.SECONDS);
-                OffsetAndMetadata committed = offsets.get(partition);
-                if (committed != null && committed.offset() >= expectedOffset) {
-                    return;
-                }
-                Thread.sleep(50L);
-            }
-        }
-        Assertions.fail("Offset was not committed after the record was discarded from group " + groupId);
-    }
-
-    private AdminClient adminClient() {
-        return AdminClient.create(Map.of(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, kafkaBootstrapServers()));
+        KafkaTestRecords.awaitCommit(admin, partition, inputOffset);
+        Assertions.assertThat(RECEIVER.count(event.getEventId())).isZero();
+        Assertions.assertThat(this.attemptRowCount(event.getEventId())).isZero();
     }
 
     private Map<String, Object> awaitAttemptRow(String eventId) throws InterruptedException {
@@ -390,13 +262,6 @@ class ImpossibleDeliveryStateIntegrationTests {
         return count == null ? 0 : count;
     }
 
-    private static String[] downstreamTopics() {
-        return Stream.concat(
-                Stream.of(WebhookRoute.PERSIST_DELIVERY_ATTEMPT_TOPIC),
-                NON_PRODUCED_TOPICS.stream()
-        ).toArray(String[]::new);
-    }
-
     private static WebhookEvent event(
             String eventType,
             int deliveryAttemptCount,
@@ -416,20 +281,6 @@ class ImpossibleDeliveryStateIntegrationTests {
                 deliveryAttemptCount,
                 replayCount
         );
-    }
-
-    private static String eventId(Object value) {
-        if (value instanceof WebhookEvent event) {
-            return event.getEventId();
-        }
-        if (value instanceof DeliveryAttempt attempt) {
-            return attempt.getEventId();
-        }
-        return null;
-    }
-
-    private static String kafkaBootstrapServers() {
-        return "localhost:" + System.getenv().getOrDefault("KAFKA_PORT", "9092");
     }
 
     private record RetryRecord(String topic, WebhookEvent event) {

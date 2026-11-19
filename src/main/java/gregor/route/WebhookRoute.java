@@ -2,11 +2,15 @@ package gregor.route;
 
 import gregor.avro.DeliveryAttempt;
 import gregor.avro.WebhookEvent;
+import gregor.dto.RetryPublication;
 import gregor.dto.WebhookRouteMessage;
 import gregor.service.WebhookService;
 import lombok.AllArgsConstructor;
 import org.apache.camel.component.kafka.KafkaConstants;
+import org.apache.camel.processor.aggregate.UseOriginalAggregationStrategy;
 import org.springframework.stereotype.Component;
+
+import java.util.Optional;
 
 @Component
 @AllArgsConstructor
@@ -66,16 +70,22 @@ public class WebhookRoute extends BaseRoute {
             .end();
 
         super.routeDefinition(WEBHOOK_DELIVERY_RESULT_DIRECT, WebhookRouteMessage.class)
-            .multicast().stopOnException()
+            .multicast(new UseOriginalAggregationStrategy()).stopOnException().synchronous()
                 .pipeline()
                     .bean(this.webhookService, "createAttempt")
                     .removeHeaders("*")
-                    .setHeader(KafkaConstants.KEY).simple("${body.eventId}")
+                    .setHeader(KafkaConstants.KEY).body(DeliveryAttempt.class, DeliveryAttempt::getEventId)
                     .to(super.kafkaProducerUri(PERSIST_DELIVERY_ATTEMPT_TOPIC))
                 .end()
                 .pipeline()
-                    .choice().when().method(this.webhookService, "shouldRetry")
-                        .to(WEBHOOK_DELIVERY_ATTEMPT_DIRECT)
+                    .bean(this.webhookService, "planRetry")
+                    .filter().body(Optional.class, Optional::isPresent)
+                        .setBody().body(Optional.class, Optional::get)
+                        .removeHeaders("*")
+                        .setHeader(KafkaConstants.OVERRIDE_TOPIC).body(RetryPublication.class, RetryPublication::topic)
+                        .setBody().body(RetryPublication.class, RetryPublication::webhookEvent)
+                        .setHeader(KafkaConstants.KEY).body(WebhookEvent.class, WebhookEvent::getEndpointId)
+                        .to(super.kafkaProducerUri(WEBHOOK_EVENT_RETRY_1M_TOPIC))
                     .end()
                 .end()
             .end();

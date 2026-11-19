@@ -5,10 +5,9 @@ and store delivery attempts in PostgreSQL.
 
 ## Run locally
 
-After this schema change, recreate the local PostgreSQL and Kafka volumes before running Gregor. This reset is required:
+Start Kafka, Apicurio Registry, and PostgreSQL:
 
 ```bash
-docker compose down --volumes
 docker compose up -d
 ```
 
@@ -60,13 +59,23 @@ Receivers must handle duplicate deliveries idempotently. Attempt persistence ign
 
 ## Delivery state and attempt numbering
 
-Delivery state lives on the durable `WebhookEvent` envelope rather than in worker memory. The logical attempt number of an HTTP request is the envelope's `deliveryAttemptCount` at the time of that request plus `1`, and the envelope carried onward reports the count of the request just performed. Each published attempt takes its `attempt_number`, `retry_count`, and `replay_count` from that envelope. `dead_lettered` is always `false`.
+Each valid Kafka consumption performs at most one HTTP request. The attempt number is the incoming `deliveryAttemptCount + 1`. The attempt audits the incoming `retryCount` and `replayCount`, with `dead_lettered=false`.
 
-Nothing republishes an updated envelope yet. A source record that Kafka redelivers arrives with `deliveryAttemptCount=0` and restarts numbering at logical attempt `1`.
+HTTP `2xx` succeeds. Connection failures, timeouts, `408`, `429`, and `5xx` are retryable. Redirects and other `4xx` responses are permanent failures.
+
+The delivery result route schedules a successor only after a retryable failure below the attempt limit and with a higher tier available. The maximum defaults to 4 and accepts 1–4. The successor increments `retryCount`, carries the completed `deliveryAttemptCount`, and is keyed by `endpointId`. The envelope count selects the tier regardless of the incoming Kafka topic.
+
+| Successor `retryCount` | Topic | Delay |
+|---:|---|---|
+| 1 | `webhook-events-retry-1m` | 1 minute |
+| 2 | `webhook-events-retry-10m` | 10 minutes |
+| 3 | `webhook-events-retry-1h` | 1 hour |
+
+`nextEligibleAt` is the HTTP completion time plus the tier delay, truncated to millisecond precision. Success, permanent failure, attempt exhaustion, and absence of a higher tier produce no successor.
 
 The source consumer routes directly to the shared delivery path. It ignores `nextEligibleAt`. A source record with a future `nextEligibleAt` does not wait.
 
-Before every HTTP request, including each immediate retry re-entry, the shared delivery path rejects these impossible states:
+Before every HTTP request, the shared delivery path rejects these impossible states:
 
 - `deliveryAttemptCount < 0`
 - `retryCount < 0`
@@ -77,9 +86,19 @@ For a source record, rejection writes one ERROR log line with the event, tenant,
 
 Each retry consumer first checks the same impossible states. It also rejects a retry envelope when `nextEligibleAt` is null or later than the current time plus the maximum permitted wait. A topic and `retryCount` mismatch is valid. Rejection writes one sanitized ERROR log line. It does not include the payload or signing secret. The retry consumer then commits and discards the record. It produces no HTTP request or downstream record.
 
-An accepted retry record waits synchronously until `nextEligibleAt`. An eligible or overdue record does not wait. The record then enters the shared delivery path. It keeps the envelope attempt numbering and audit counters. Retryable failures still use recursive immediate retries through the configured maximum.
+An accepted retry record waits synchronously until `nextEligibleAt`. A due or overdue record proceeds without waiting, including after startup or partition assignment. Pending retries survive worker restart within Kafka retention and retain their stored eligibility and counters. An interrupted wait restores the interrupt flag, fails processing, and leaves the offset uncommitted. Redelivery evaluates eligibility again.
 
-HTTP delivery finishes before attempt publication acknowledgement. All attempt publications finish before the consumed retry offset commits. A failure after an HTTP request and before attempt publication acknowledgement or offset commit can cause Kafka to deliver the record again. This can repeat the physical HTTP request with the same `webhook-id` and logical attempt number. Attempt-publication failure and interrupted eligibility waiting leave the retry offset uncommitted.
+Later source records on the same partition and endpoint can pass a pending retry. Endpoint keys provide no FIFO ordering across topics. A synchronous eligibility wait blocks every partition assigned to that retry consumer, but does not block other consumers or groups.
+
+## Publication order and redelivery
+
+HTTP delivery finishes first. Kafka must acknowledge the attempt before the delivery result route publishes any required retry. Kafka must acknowledge all required publications before the source or retry offset commits. The PostgreSQL consumer persists the acknowledged attempt independently. Neither retry publication nor delivery-offset commit waits for a database row.
+
+A failure before the attempt becomes durable can leave the first physical request without an audit row. A failed attempt publication does not schedule a retry. A failure after Kafka acknowledges the attempt but before the retry becomes durable can repeat HTTP despite the durable attempt record.
+
+If Kafka stores a retry but its acknowledgement is lost, or if Kafka acknowledges the retry but the consumed offset does not commit, redelivery can publish another copy of the same logical successor. Copies have the same event ID and counters but can have different eligibility times. They can produce duplicate delayed HTTP requests and further duplicate successors. A later success does not cancel a published retry.
+
+Repeated requests carry the same `webhook-id`. Redelivery of the same envelope repeats the logical attempt number. PostgreSQL deduplication by `(event_id, attempt_number)` does not prevent HTTP requests or deduplicate Kafka retries. Receivers must handle repeated IDs idempotently.
 
 ## Inspect attempts
 
@@ -94,18 +113,16 @@ Apicurio registry clients share a Spring-managed Vert.x instance that closes on 
 
 Kafka declares this topic topology:
 
-| Topic                        | Retention                                           | Consumer group                    |
-|------------------------------|-----------------------------------------------------|-----------------------------------|
-| `webhook-events`             | 7 days                                              | `webhook-events`                  |
-| `persist-delivery-attempt`   | 30 days                                             | `persist-delivery-attempt`        |
-| `webhook-events-retry-1m`    | Configured retry retention (`7d` by default)        | `webhook-events-retry-1m`         |
-| `webhook-events-retry-10m`   | Configured retry retention (`7d` by default)        | `webhook-events-retry-10m`        |
-| `webhook-events-retry-1h`    | Configured retry retention (`7d` by default)        | `webhook-events-retry-1h`         |
-| `webhook-events-dead-letter` | Configured dead-letter retention (`30d` by default) | None                              |
+| Topic | Retention | Producer | Consumer group |
+|---|---|---|---|
+| `webhook-events` | 7 days | `POST /api/events` | Source delivery (`webhook-events`) |
+| `persist-delivery-attempt` | 30 days | Delivery result route | PostgreSQL persistence (`persist-delivery-attempt`) |
+| `webhook-events-retry-1m` | Configured retry retention (`7d` by default) | Delivery result route | Time-gated 1-minute tier (`webhook-events-retry-1m`) |
+| `webhook-events-retry-10m` | Configured retry retention (`7d` by default) | Delivery result route | Time-gated 10-minute tier (`webhook-events-retry-10m`) |
+| `webhook-events-retry-1h` | Configured retry retention (`7d` by default) | Delivery result route | Time-gated 1-hour tier (`webhook-events-retry-1h`) |
+| `webhook-events-dead-letter` | Configured dead-letter retention (`30d` by default) | None | None |
 
-All topics use 12 default partitions and replication factor 1. Each retry tier has an active consumer group named after its topic. A synchronous eligibility wait blocks every partition assigned to that Kafka consumer. Other consumers in the same retry group can process their assigned partitions. The source consumer group, the attempt-persistence consumer group, and the other retry consumer groups continue independently.
-
-No route produces a retry record or a dead-letter record. The dead-letter topic has no consumer. Automatic delayed retries and dead-lettering remain inactive. An external producer can put a record on a retry topic. Source retryable failures still run immediately up to the configured maximum attempt count.
+All topics use 12 default partitions and replication factor 1.
 
 ## Local receiver and signatures
 
@@ -115,6 +132,6 @@ empty `401 Unauthorized` response. The default timestamp tolerance is five minut
 
 ## Safety boundaries
 
-Both HTTP endpoints are publicly reachable without application authentication or authorization. This phase has no SSRF protection, rate limiting, tenant isolation, or production-safe secret
+Both HTTP endpoints are publicly reachable without application authentication or authorization. Gregor has no SSRF protection, rate limiting, tenant isolation, or production-safe secret
 management. The configured signing secret is a local-development default and must not be used in production. Do not expose this service to untrusted networks or use it as a production webhook
 platform.

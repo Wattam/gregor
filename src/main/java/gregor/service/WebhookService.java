@@ -8,6 +8,8 @@ import gregor.config.properties.WebhookProperties;
 import gregor.dto.DeliveryAttemptResult;
 import gregor.dto.DeliveryOutcome;
 import gregor.dto.EventIngestRequest;
+import gregor.dto.RetryPublication;
+import gregor.dto.RetryTier;
 import gregor.dto.WebhookRouteMessage;
 import gregor.exception.EligibilityWaitInterruptedException;
 import gregor.exception.EventPublicationException;
@@ -28,13 +30,22 @@ import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
+import java.util.List;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.UUID;
 
 @Slf4j
 @Service
 @AllArgsConstructor
 public class WebhookService {
+
+    private static final List<RetryTier> RETRY_TIERS = List.of(
+            new RetryTier(WebhookRoute.WEBHOOK_EVENT_RETRY_1M_TOPIC, Duration.ofMinutes(1)),
+            new RetryTier(WebhookRoute.WEBHOOK_EVENT_RETRY_10M_TOPIC, Duration.ofMinutes(10)),
+            new RetryTier(WebhookRoute.WEBHOOK_EVENT_RETRY_1H_TOPIC, Duration.ofHours(1))
+    );
 
     private final RestComponent restComponent;
     private final DeliveryAttemptRepository deliveryAttemptRepository;
@@ -157,38 +168,55 @@ public class WebhookService {
     public WebhookRouteMessage sendWebhookEvent(@Body WebhookRouteMessage webhookRouteMessage) {
         WebhookEvent webhookEvent = webhookRouteMessage.webhookEvent();
         DeliveryAttemptResult deliveryAttemptResult = this.restComponent.sendWebhook(webhookEvent);
-        WebhookEvent advancedWebhookEvent = WebhookEvent.newBuilder(webhookEvent)
+        WebhookEvent advancedWebhookEvent = WebhookEvent
+                .newBuilder(webhookEvent)
                 .setDeliveryAttemptCount(webhookEvent.getDeliveryAttemptCount() + 1)
                 .build();
         return new WebhookRouteMessage(advancedWebhookEvent, deliveryAttemptResult);
     }
 
     public DeliveryAttempt createAttempt(@Body WebhookRouteMessage webhookRouteMessage) {
-        WebhookEvent event = webhookRouteMessage.webhookEvent();
-        DeliveryAttemptResult result = webhookRouteMessage.deliveryAttemptResult();
-        byte[] details = this.objectMapper.writeValueAsBytes(result.details());
+        WebhookEvent webhookEvent = webhookRouteMessage.webhookEvent();
+        DeliveryAttemptResult deliveryAttemptResult = webhookRouteMessage.deliveryAttemptResult();
+        byte[] details = this.objectMapper.writeValueAsBytes(deliveryAttemptResult.details());
         return new DeliveryAttempt(
                 UUID.randomUUID().toString(),
-                event.getEventId(),
-                event.getTenantId(),
-                event.getEndpointId(),
-                event.getEventType(),
-                event.getDeliveryAttemptCount(),
-                mapOutcome(result.outcome()),
-                result.httpStatus(),
-                result.latencyMs(),
-                result.attemptedAt(),
+                webhookEvent.getEventId(),
+                webhookEvent.getTenantId(),
+                webhookEvent.getEndpointId(),
+                webhookEvent.getEventType(),
+                webhookEvent.getDeliveryAttemptCount(),
+                mapOutcome(deliveryAttemptResult.outcome()),
+                deliveryAttemptResult.httpStatus(),
+                deliveryAttemptResult.latencyMs(),
+                deliveryAttemptResult.attemptedAt(),
                 ByteBuffer.wrap(details),
-                event.getRetryCount(),
-                event.getReplayCount(),
+                webhookEvent.getRetryCount(),
+                webhookEvent.getReplayCount(),
                 false
         );
     }
 
-    public boolean shouldRetry(@Body WebhookRouteMessage webhookRouteMessage) {
-        int deliveryAttemptCount = webhookRouteMessage.webhookEvent().getDeliveryAttemptCount();
-        return webhookRouteMessage.deliveryAttemptResult().outcome() == DeliveryOutcome.RETRYABLE_FAILURE
-                && deliveryAttemptCount < this.webhookProperties.maximumAttempts();
+    public Optional<RetryPublication> planRetry(@Body WebhookRouteMessage webhookRouteMessage) {
+        WebhookEvent webhookEvent = webhookRouteMessage.webhookEvent();
+        DeliveryAttemptResult deliveryAttemptResult = webhookRouteMessage.deliveryAttemptResult();
+        int retryCount = webhookEvent.getRetryCount();
+        if (deliveryAttemptResult.outcome() != DeliveryOutcome.RETRYABLE_FAILURE
+                || webhookEvent.getDeliveryAttemptCount() >= this.webhookProperties.maximumAttempts()
+                || retryCount < 0
+                || retryCount >= RETRY_TIERS.size()) {
+            return Optional.empty();
+        }
+
+        RetryTier retryTier = RETRY_TIERS.get(retryCount);
+        WebhookEvent successorWebhookEvent = WebhookEvent
+                .newBuilder(webhookEvent)
+                .setRetryCount(retryCount + 1)
+                .setNextEligibleAt(
+                        deliveryAttemptResult.completedAt().plus(retryTier.delay()).truncatedTo(ChronoUnit.MILLIS)
+                )
+                .build();
+        return Optional.of(new RetryPublication(retryTier.topic(), successorWebhookEvent));
     }
 
     @Transactional

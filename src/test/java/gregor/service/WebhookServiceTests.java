@@ -9,6 +9,7 @@ import gregor.config.properties.WebhookProperties;
 import gregor.dto.DeliveryAttemptResult;
 import gregor.dto.DeliveryOutcome;
 import gregor.dto.EventIngestRequest;
+import gregor.dto.RetryPublication;
 import gregor.dto.WebhookRouteMessage;
 import gregor.exception.EligibilityWaitInterruptedException;
 import gregor.exception.EventPublicationException;
@@ -30,6 +31,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -153,22 +155,149 @@ class WebhookServiceTests {
 
     @ParameterizedTest
     @CsvSource({
-            "RETRYABLE_FAILURE, 2, true",
-            "RETRYABLE_FAILURE, 3, false",
-            "RETRYABLE_FAILURE, 4, false",
-            "SUCCEEDED, 2, false",
-            "PERMANENT_FAILURE, 2, false"
+            "0, 1, webhook-events-retry-1m, 2026-07-10T12:01:02.123Z",
+            "1, 2, webhook-events-retry-10m, 2026-07-10T12:10:02.123Z",
+            "2, 3, webhook-events-retry-1h, 2026-07-10T13:00:02.123Z"
     })
-    void retriesOnlyRetryableFailuresBelowTheConfiguredMaximumAttempts(
-            DeliveryOutcome outcome, int attemptCount, boolean shouldRetry
+    void plansEachTierFromHttpCompletionPreservingTheEnvelope(
+            int retryCount, int successorCount, String topic, Instant eligibility
     ) {
+        RestComponent restComponent = Mockito.mock(RestComponent.class);
+        DeliveryAttemptRepository deliveryAttemptRepository = Mockito.mock(DeliveryAttemptRepository.class);
+        ProducerTemplate producerTemplate = Mockito.mock(ProducerTemplate.class);
+        Clock clock = Mockito.mock(Clock.class);
+        Mockito.when(clock.instant()).thenReturn(Instant.parse("2026-07-10T12:00:10Z"));
+        WebhookService webhookService = new WebhookService(
+                restComponent,
+                deliveryAttemptRepository,
+                new ObjectMapper(),
+                WebhookPropertiesFixtures.create(4),
+                KAFKA_CONSUMER_PROPERTIES,
+                producerTemplate,
+                clock
+        );
+        Instant previousEligibility = Instant.parse("2026-07-10T11:55:00Z");
+        byte[] payload = {0, -1, 10, 32};
+        WebhookEvent input = WebhookEvent
+                .newBuilder(event(2, retryCount, 5, previousEligibility))
+                .setPayload(ByteBuffer.wrap(payload))
+                .build();
+        WebhookEvent expected = WebhookEvent
+                .newBuilder(input)
+                .setRetryCount(successorCount)
+                .setNextEligibleAt(eligibility)
+                .build();
+
+        Assertions.assertThat(webhookService.planRetry(new WebhookRouteMessage(input, retryableResult())))
+                .contains(new RetryPublication(topic, expected));
+        Assertions.assertThat(input.getRetryCount()).isEqualTo(retryCount);
+        Assertions.assertThat(input.getNextEligibleAt()).isEqualTo(previousEligibility);
+        Assertions.assertThat(bytes(input.getPayload())).isEqualTo(payload);
+        Mockito.verifyNoInteractions(restComponent, deliveryAttemptRepository, producerTemplate, clock);
+    }
+
+    @ParameterizedTest
+    @CsvSource({"TIMEOUT", "CONNECTION_FAILURE"})
+    void plansARetryForTransportFailuresWithoutAnHttpStatus(String failureType) {
+        WebhookService webhookService = service(new ObjectMapper(), WebhookPropertiesFixtures.create(2));
+        WebhookEvent input = event(1);
+        DeliveryAttemptResult result = new DeliveryAttemptResult(
+                DeliveryOutcome.RETRYABLE_FAILURE, null, 2_123L,
+                Instant.parse("2026-07-10T12:00:00Z"), Instant.parse("2026-07-10T12:00:02.123456789Z"),
+                Map.of("type", failureType)
+        );
+        WebhookEvent expected = event(1, 1, 0, Instant.parse("2026-07-10T12:01:02.123Z"));
+
+        Assertions.assertThat(webhookService.planRetry(new WebhookRouteMessage(input, result)))
+                .contains(new RetryPublication("webhook-events-retry-1m", expected));
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "RETRYABLE_FAILURE, 3, 0",
+            "RETRYABLE_FAILURE, 4, 0",
+            "SUCCEEDED, 2, 0",
+            "PERMANENT_FAILURE, 2, 0",
+            "RETRYABLE_FAILURE, 2, -1",
+            "RETRYABLE_FAILURE, 2, 3",
+            "RETRYABLE_FAILURE, 2, 7",
+            "RETRYABLE_FAILURE, 2, 2147483647"
+    })
+    void doesNotPlanASuccessorForTerminalOrUnsupportedState(DeliveryOutcome outcome, int attempt, int retries) {
         WebhookService webhookService = service(new ObjectMapper(), WebhookPropertiesFixtures.create(3));
-        WebhookRouteMessage message = new WebhookRouteMessage(
-                event(attemptCount),
+        WebhookRouteMessage webhookRouteMessage = new WebhookRouteMessage(
+                event(attempt, retries, 0),
                 new DeliveryAttemptResult(outcome, null, 1L, Instant.EPOCH, Instant.EPOCH, Map.of())
         );
 
-        Assertions.assertThat(webhookService.shouldRetry(message)).isEqualTo(shouldRetry);
+        Assertions.assertThat(webhookService.planRetry(webhookRouteMessage)).isEmpty();
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "1, 1, 0, ''",
+            "2, 1/2, 0/1, webhook-events-retry-1m",
+            "3, 1/2/3, 0/1/2, webhook-events-retry-1m/webhook-events-retry-10m",
+            "4, 1/2/3/4, 0/1/2/3, webhook-events-retry-1m/webhook-events-retry-10m/webhook-events-retry-1h"
+    })
+    void advancesOneCumulativeAttemptAndAuditCountPerEnvelope(
+            int maximum, String attemptNumbers, String retryCounts, String tiers
+    ) {
+        RestComponent restComponent = Mockito.mock(RestComponent.class);
+        Mockito.when(restComponent.sendWebhook(Mockito.any())).thenReturn(retryableResult());
+        ObjectMapper objectMapper = new ObjectMapper();
+        ProducerTemplate producerTemplate = Mockito.mock(ProducerTemplate.class);
+        WebhookService webhookService = new WebhookService(
+                restComponent,
+                Mockito.mock(DeliveryAttemptRepository.class),
+                objectMapper,
+                WebhookPropertiesFixtures.create(maximum),
+                KAFKA_CONSUMER_PROPERTIES,
+                producerTemplate,
+                Clock.systemUTC()
+        );
+        webhookService.ingestEvent(new EventIngestRequest("order.created", objectMapper.createObjectNode()));
+        ArgumentCaptor<WebhookEvent> ingested = ArgumentCaptor.forClass(WebhookEvent.class);
+        Mockito.verify(producerTemplate).sendBodyAndHeader(
+                Mockito.anyString(), ingested.capture(), Mockito.anyString(), Mockito.any()
+        );
+        WebhookEvent next = ingested.getValue();
+        List<Integer> attempts = new ArrayList<>();
+        List<Integer> retries = new ArrayList<>();
+        List<String> topics = new ArrayList<>();
+        for (int delivery = 0; delivery < 4 && next != null; delivery++) {
+            WebhookRouteMessage result =
+                    webhookService.sendWebhookEvent(webhookService.createWebhookRouteMessage(next));
+            DeliveryAttempt attempt = webhookService.createAttempt(result);
+            attempts.add(attempt.getAttemptNumber());
+            retries.add(attempt.getRetryCount());
+            RetryPublication successor = webhookService.planRetry(result).orElse(null);
+            next = successor == null ? null : successor.webhookEvent();
+            if (successor != null) {
+                topics.add(successor.topic());
+            }
+        }
+
+        Assertions.assertThat(attempts).containsExactlyElementsOf(numbers(attemptNumbers));
+        Assertions.assertThat(retries).containsExactlyElementsOf(numbers(retryCounts));
+        Assertions.assertThat(String.join("/", topics)).isEqualTo(tiers);
+        Assertions.assertThat(next).isNull();
+        Mockito.verify(restComponent, Mockito.times(maximum)).sendWebhook(Mockito.any());
+    }
+
+    private static List<Integer> numbers(String values) {
+        return Arrays.stream(values.split("/")).map(Integer::valueOf).toList();
+    }
+
+    private static DeliveryAttemptResult retryableResult() {
+        return new DeliveryAttemptResult(
+                DeliveryOutcome.RETRYABLE_FAILURE,
+                503,
+                2_123L,
+                Instant.parse("2026-07-10T12:00:00Z"),
+                Instant.parse("2026-07-10T12:00:02.123456789Z"),
+                Map.of()
+        );
     }
 
     @Test
@@ -203,7 +332,7 @@ class WebhookServiceTests {
                 Mockito.mock(ProducerTemplate.class),
                 Clock.fixed(now, ZoneOffset.UTC)
         );
-        Duration maximumPermittedWait = KAFKA_CONSUMER_PROPERTIES.maximumPermittedWait();
+        Duration maximumPermittedWait = Duration.ofMinutes(70);
         Map<WebhookEvent, Boolean> cases = new LinkedHashMap<>();
         cases.put(event(0, 0, 0, null), true);
         cases.put(event(4, 0, 0, now), true);
@@ -266,12 +395,12 @@ class WebhookServiceTests {
 
         Thread.currentThread().interrupt();
         try {
-            EligibilityWaitInterruptedException exception = Assertions.catchThrowableOfType(
+            EligibilityWaitInterruptedException eligibilityWaitInterruptedException = Assertions.catchThrowableOfType(
                     EligibilityWaitInterruptedException.class,
                     () -> webhookService.awaitEligibility(webhookRouteMessage)
             );
 
-            Assertions.assertThat(exception)
+            Assertions.assertThat(eligibilityWaitInterruptedException)
                     .hasMessage("Eligibility wait was interrupted")
                     .hasCauseInstanceOf(InterruptedException.class);
             Assertions.assertThat(Thread.currentThread().isInterrupted()).isTrue();

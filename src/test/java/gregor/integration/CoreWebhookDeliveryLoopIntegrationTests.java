@@ -6,36 +6,32 @@ import gregor.avro.DeliveryAttempt;
 import gregor.avro.DeliveryOutcome;
 import gregor.avro.WebhookEvent;
 import gregor.component.SignatureComponent;
-import gregor.config.properties.WebhookProperties;
 import gregor.route.WebhookRoute;
 import gregor.service.WebhookService;
-import io.apicurio.registry.resolver.config.SchemaResolverConfig;
 import io.vertx.core.Vertx;
 import org.apache.camel.CamelContext;
 import org.apache.camel.ProducerTemplate;
 import org.apache.camel.component.kafka.KafkaConstants;
+import org.apache.camel.spi.RouteController;
 import org.apache.kafka.clients.admin.AdminClient;
-import org.apache.kafka.clients.admin.AdminClientConfig;
 import org.apache.kafka.clients.admin.Config;
 import org.apache.kafka.clients.admin.ConfigEntry;
 import org.apache.kafka.clients.admin.ConsumerGroupDescription;
 import org.apache.kafka.clients.admin.MemberDescription;
-import org.apache.kafka.clients.admin.OffsetSpec;
 import org.apache.kafka.clients.admin.TopicDescription;
-import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
-import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.common.GroupState;
-import org.apache.kafka.common.PartitionInfo;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.config.ConfigResource;
 import org.apache.kafka.common.config.TopicConfig;
-import org.apache.kafka.common.serialization.StringDeserializer;
 import org.assertj.core.api.Assertions;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
+import org.mockito.Mockito;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
@@ -43,6 +39,7 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 
@@ -54,13 +51,13 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
-import java.util.Properties;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
@@ -70,11 +67,14 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.stream.Collectors;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
+@SpringBootTest(
+        webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
+        properties = "gregor.webhook.maximum-attempts=4"
+)
 class CoreWebhookDeliveryLoopIntegrationTests {
 
     private static final String TENANT_ID = "00000000-0000-0000-0000-000000000001";
@@ -83,15 +83,7 @@ class CoreWebhookDeliveryLoopIntegrationTests {
             "01234567890123456789012345678901".getBytes(StandardCharsets.UTF_8)
     );
     private static final TestReceiver RECEIVER = TestReceiver.start();
-    private static final List<String> RETRY_TOPICS = List.of(
-            WebhookRoute.WEBHOOK_EVENT_RETRY_1M_TOPIC,
-            WebhookRoute.WEBHOOK_EVENT_RETRY_10M_TOPIC,
-            WebhookRoute.WEBHOOK_EVENT_RETRY_1H_TOPIC
-    );
-    private static final List<String> NON_PRODUCED_TOPICS = Stream.concat(
-            RETRY_TOPICS.stream(),
-            Stream.of(WebhookRoute.WEBHOOK_EVENT_DEAD_LETTER_TOPIC)
-    ).toList();
+    private static final String RETRY_TOPIC = WebhookRoute.WEBHOOK_EVENT_RETRY_1M_TOPIC;
 
     @LocalServerPort
     private int serverPort;
@@ -107,10 +99,10 @@ class CoreWebhookDeliveryLoopIntegrationTests {
     private ObjectMapper objectMapper;
     @Autowired
     private SignatureComponent signatureComponent;
-    @Autowired
+    @MockitoSpyBean
     private WebhookService webhookService;
-    @Autowired
-    private WebhookProperties webhookProperties;
+    @MockitoSpyBean
+    private Clock clock;
 
     @DynamicPropertySource
     static void configureInfrastructure(DynamicPropertyRegistry registry) {
@@ -139,6 +131,8 @@ class CoreWebhookDeliveryLoopIntegrationTests {
         registry.add("camel.component.kafka.break-on-first-error", () -> "true");
         registry.add("camel.component.kafka.auto-offset-reset", () -> "earliest");
         registry.add("camel.component.kafka.max-poll-records", () -> "1");
+        // Interrupt the pending wait before the first tier's real delay can elapse during shutdown.
+        registry.add("camel.component.kafka.shutdown-timeout", () -> "1000");
         registry.add("camel.main.auto-startup", () -> "true");
         registry.add("camel.component.kafka.request-required-acks", () -> "all");
         registry.add(
@@ -189,36 +183,34 @@ class CoreWebhookDeliveryLoopIntegrationTests {
     @Test
     void acceptsAndDeliversAnEndpointKeyedSpecificAvroEventThenPersistsItsAttempt() throws Exception {
         try (
+                AdminClient adminClient = KafkaTestRecords.adminClient();
                 KafkaConsumer<String, Object> eventConsumer =
-                        this.newConsumer("integration-events-" + UUID.randomUUID());
+                        this.observeNewRecords(adminClient, WebhookRoute.WEBHOOK_EVENT_TOPIC);
                 KafkaConsumer<String, Object> attemptConsumer =
-                        this.newConsumer("integration-attempts-" + UUID.randomUUID())
+                        this.observeNewRecords(adminClient, WebhookRoute.PERSIST_DELIVERY_ATTEMPT_TOPIC)
         ) {
-            this.seekToEnd(eventConsumer, "webhook-events");
-            this.seekToEnd(attemptConsumer, "persist-delivery-attempt");
-
-            HttpResponse<String> response = this.postEvent(
+            HttpResponse<String> httpResponse = this.postEvent(
                     "{\"eventType\":\"order.created\",\"payload\":{\"orderId\":\"123\",\"name\":\"é\"}}"
             );
 
-            Assertions.assertThat(response.statusCode()).isEqualTo(202);
-            String eventId = this.objectMapper.readTree(response.body()).get("eventId").asString();
+            Assertions.assertThat(httpResponse.statusCode()).isEqualTo(202);
+            String eventId = this.objectMapper.readTree(httpResponse.body()).get("eventId").asString();
             Assertions.assertThatCode(() -> UUID.fromString(eventId)).doesNotThrowAnyException();
 
-            ConsumerRecord<String, Object> eventRecord = this.awaitRecord(eventConsumer, eventId);
+            ConsumerRecord<String, Object> eventRecord = KafkaTestRecords.awaitRecord(eventConsumer, eventId);
             Assertions.assertThat(eventRecord.key()).isEqualTo(ENDPOINT_ID);
             Assertions.assertThat(eventRecord.value()).isInstanceOf(WebhookEvent.class);
-            WebhookEvent event = (WebhookEvent) eventRecord.value();
-            Assertions.assertThat(event.getEventId()).isEqualTo(eventId);
-            Assertions.assertThat(event.getEventType()).isEqualTo("order.created");
-            Assertions.assertThat(event.getTenantId()).isEqualTo(TENANT_ID);
-            Assertions.assertThat(event.getEndpointId()).isEqualTo(ENDPOINT_ID);
-            Assertions.assertThat(event.getCreatedAt()).isBeforeOrEqualTo(Instant.now());
-            Assertions.assertThat(event.getRetryCount()).isZero();
-            Assertions.assertThat(event.getNextEligibleAt()).isNull();
-            Assertions.assertThat(event.getDeliveryAttemptCount()).isZero();
-            Assertions.assertThat(event.getReplayCount()).isZero();
-            Assertions.assertThat(bytes(event.getPayload()))
+            WebhookEvent webhookEvent = (WebhookEvent) eventRecord.value();
+            Assertions.assertThat(webhookEvent.getEventId()).isEqualTo(eventId);
+            Assertions.assertThat(webhookEvent.getEventType()).isEqualTo("order.created");
+            Assertions.assertThat(webhookEvent.getTenantId()).isEqualTo(TENANT_ID);
+            Assertions.assertThat(webhookEvent.getEndpointId()).isEqualTo(ENDPOINT_ID);
+            Assertions.assertThat(webhookEvent.getCreatedAt()).isBeforeOrEqualTo(Instant.now());
+            Assertions.assertThat(webhookEvent.getRetryCount()).isZero();
+            Assertions.assertThat(webhookEvent.getNextEligibleAt()).isNull();
+            Assertions.assertThat(webhookEvent.getDeliveryAttemptCount()).isZero();
+            Assertions.assertThat(webhookEvent.getReplayCount()).isZero();
+            Assertions.assertThat(bytes(webhookEvent.getPayload()))
                     .isEqualTo("{\"orderId\":\"123\",\"name\":\"é\"}".getBytes(StandardCharsets.UTF_8));
 
             CapturedRequest delivered = RECEIVER.awaitRequest(eventId, 1);
@@ -232,7 +224,7 @@ class CoreWebhookDeliveryLoopIntegrationTests {
                     delivered.body()
             ));
 
-            ConsumerRecord<String, Object> attemptRecord = this.awaitRecord(attemptConsumer, eventId);
+            ConsumerRecord<String, Object> attemptRecord = KafkaTestRecords.awaitRecord(attemptConsumer, eventId);
             Assertions.assertThat(attemptRecord.key()).isEqualTo(eventId);
             Assertions.assertThat(attemptRecord.value()).isInstanceOf(DeliveryAttempt.class);
             DeliveryAttempt attempt = (DeliveryAttempt) attemptRecord.value();
@@ -305,16 +297,8 @@ class CoreWebhookDeliveryLoopIntegrationTests {
                 "{\"eventType\":\"order.created\",\"payload\":null}"
         );
         String topic = WebhookRoute.WEBHOOK_EVENT_TOPIC;
-        try (AdminClient admin = newAdminClient()) {
-            Map<TopicPartition, OffsetSpec> partitionOffsets = admin.describeTopics(List.of(topic))
-                    .topicNameValues().get(topic)
-                    .get(5, TimeUnit.SECONDS)
-                    .partitions().stream()
-                    .collect(Collectors.toMap(
-                            partition -> new TopicPartition(topic, partition.partition()),
-                            _ -> OffsetSpec.latest()
-                    ));
-            Map<TopicPartition, Long> offsetsBefore = latestOffsets(admin, partitionOffsets);
+        try (AdminClient adminClient = KafkaTestRecords.adminClient()) {
+            Map<TopicPartition, Long> offsetsBefore = KafkaTestRecords.endOffsets(adminClient, topic);
             for (String body : invalidBodies) {
                 HttpResponse<String> response = this.postEvent(body);
                 Assertions.assertThat(response.statusCode()).as("response for %s", body).isEqualTo(400);
@@ -322,55 +306,114 @@ class CoreWebhookDeliveryLoopIntegrationTests {
                         .contains("\"title\":\"Invalid request\"")
                         .contains("\"detail\":\"Request body is malformed or invalid.\"");
             }
-            Assertions.assertThat(latestOffsets(admin, partitionOffsets)).isEqualTo(offsetsBefore);
+            Assertions.assertThat(KafkaTestRecords.endOffsets(adminClient, topic)).isEqualTo(offsetsBefore);
         }
     }
 
     @Test
-    void exhaustsImmediateRetriesWithoutPublishingToRetryOrDeadLetterTopics() throws Exception {
-        RECEIVER.respondWith(503);
-        try (
-                KafkaConsumer<String, Object> source = this.newConsumer("retry-source-" + UUID.randomUUID());
-                KafkaConsumer<String, Object> delayed = this.newConsumer("retry-delayed-" + UUID.randomUUID())
-        ) {
-            this.seekToEnd(source, WebhookRoute.WEBHOOK_EVENT_TOPIC);
-            this.seekToEnd(delayed, NON_PRODUCED_TOPICS.toArray(String[]::new));
+    void deliversALaterSourceEventBeforeThePendingRetryAndResumesTheRetryAfterRestart() throws Exception {
+        Instant initial = Instant.parse("2026-07-25T12:00:00.123Z");
+        Instant due = Instant.parse("2026-07-25T12:01:00.123Z");
+        AtomicReference<Instant> now = new AtomicReference<>(initial);
+        Mockito.doAnswer(_ -> now.get()).when(this.clock).instant();
+        WebhookEvent first = event("delayed-first.test", ENDPOINT_ID);
+        WebhookEvent later = event("delayed-later.test", ENDPOINT_ID);
+        String eventId = first.getEventId();
+        CountDownLatch eligibilityStarted = new CountDownLatch(1);
+        Mockito.doAnswer(invocation -> {
+            eligibilityStarted.countDown();
+            return invocation.callRealMethod();
+        }).when(this.webhookService).awaitEligibility(Mockito.argThat(
+                message -> eventId.equals(message.webhookEvent().getEventId())
+        ));
+        String retryRoute = KafkaTestRecords.consumerRoute(RETRY_TOPIC);
+        RouteController routeController = this.camelContext.getRouteController();
+        String sourceTopic = WebhookRoute.WEBHOOK_EVENT_TOPIC;
+        try (AdminClient adminClient = KafkaTestRecords.adminClient()) {
+            Map<TopicPartition, Long> sourceOffsets = KafkaTestRecords.endOffsets(adminClient, sourceTopic);
+            Map<TopicPartition, Long> retryOffsets = KafkaTestRecords.retryEndOffsets(adminClient);
+            try (
+                    AutoCloseable _ = () -> {
+                        RECEIVER.clearRetryableFailure();
+                        try {
+                            KafkaTestRecords.awaitPublishedCommits(adminClient, sourceTopic, sourceOffsets);
+                        } finally {
+                            KafkaTestRecords.drainRetries(adminClient, routeController, retryOffsets, now);
+                            if (routeController.getRouteStatus(retryRoute).isStopped()) {
+                                routeController.startRoute(retryRoute);
+                            }
+                        }
+                    };
+                    KafkaConsumer<String, Object> source =
+                            KafkaTestRecords.consumer(this.registryVertx, sourceOffsets);
+                    KafkaConsumer<String, Object> delayed =
+                            KafkaTestRecords.consumer(this.registryVertx, retryOffsets)
+            ) {
+                RECEIVER.failOnly(eventId);
+                this.sendToPartition(first, 0);
+                KafkaTestRecords.awaitCommit(adminClient, KafkaTestRecords.awaitRecord(source, eventId));
+                ConsumerRecord<String, Object> pending = KafkaTestRecords.awaitRecord(delayed, eventId);
+                Assertions.assertThat(pending.topic()).isEqualTo(RETRY_TOPIC);
+                WebhookEvent successor = (WebhookEvent) pending.value();
+                Assertions.assertThat(pending.key()).isEqualTo(first.getEndpointId());
+                Assertions.assertThat(successor.getNextEligibleAt()).isEqualTo(due);
+                Assertions.assertThat(eligibilityStarted.await(15, TimeUnit.SECONDS)).isTrue();
 
-            HttpResponse<String> response = this.postEvent("{\"eventType\":\"retry.test\",\"payload\":{}}");
-            Assertions.assertThat(response.statusCode()).isEqualTo(202);
-            String eventId = this.objectMapper.readTree(response.body()).get("eventId").asString();
+                this.sendToPartition(later, 0);
+                KafkaTestRecords.awaitCommit(adminClient, KafkaTestRecords.awaitRecord(source, later.getEventId()));
+                RECEIVER.awaitRequest(later.getEventId(), 1);
+                this.awaitAttemptRows(later.getEventId(), 1);
+                Assertions.assertThat(this.jdbcTemplate.queryForObject(
+                        "SELECT outcome FROM delivery_attempt WHERE event_id = ?::uuid",
+                        String.class,
+                        later.getEventId()
+                )).isEqualTo("SUCCEEDED");
+                Assertions.assertThat(now.get()).isBefore(due);
+                Assertions.assertThat(RECEIVER.count(eventId)).isEqualTo(1);
+                this.awaitAttemptRows(eventId, 1);
 
-            awaitCommit(this.awaitRecord(source, eventId));
-            this.awaitAttemptRows(eventId, 4);
-            List<Map<String, Object>> rows = this.jdbcTemplate.queryForList(
-                    """
-                    SELECT attempt_number, outcome, http_status
-                    FROM delivery_attempt
-                    WHERE event_id = ?::uuid
-                    ORDER BY attempt_number
-                    """,
-                    eventId
-            );
-            Assertions.assertThat(RECEIVER.count(eventId)).isEqualTo(4);
-            Assertions.assertThat(rows).extracting(row -> row.get("attempt_number")).containsExactly(1, 2, 3, 4);
-            Assertions.assertThat(rows).allSatisfy(row -> Assertions.assertThat(row)
-                    .containsEntry("outcome", "RETRYABLE_FAILURE")
-                    .containsEntry("http_status", 503));
-            Assertions.assertThat(delayed.poll(Duration.ofSeconds(1))).isEmpty();
+                KafkaTestRecords.stopRetryConsumer(routeController, retryRoute);
+                Assertions.assertThat(RECEIVER.count(eventId)).isEqualTo(1);
+                RECEIVER.clearRetryableFailure();
+                now.set(due);
+                routeController.startRoute(retryRoute);
+                CapturedRequest retried = RECEIVER.awaitRequest(eventId, 2);
+                KafkaTestRecords.awaitCommit(adminClient, pending);
+                this.awaitAttemptRows(eventId, 2);
+                Assertions.assertThat(RECEIVER.count(eventId)).isEqualTo(2);
+                Assertions.assertThat(retried.webhookId()).isEqualTo(eventId);
+                Assertions.assertThat(retried.timestamp()).isEqualTo(Long.toString(due.getEpochSecond()));
+                Assertions.assertThat(retried.body()).isEqualTo(bytes(first.getPayload()));
+                Assertions.assertThat(this.jdbcTemplate.queryForList(
+                        """
+                        SELECT attempt_number, retry_count, replay_count, outcome
+                        FROM delivery_attempt WHERE event_id = ?::uuid ORDER BY attempt_number
+                        """,
+                        eventId
+                )).containsExactly(
+                        Map.of("attempt_number", 1, "retry_count", 0, "replay_count", 0, "outcome", "RETRYABLE_FAILURE"),
+                        Map.of("attempt_number", 2, "retry_count", 1, "replay_count", 0, "outcome", "SUCCEEDED")
+                );
+            }
         }
     }
 
     @Test
     void treatsRedirectsAsPermanentFailuresWithoutFollowingThem() throws Exception {
         RECEIVER.respondWith(302);
-        try (KafkaConsumer<String, Object> source = this.newConsumer("redirect-source-" + UUID.randomUUID())) {
-            this.seekToEnd(source, WebhookRoute.WEBHOOK_EVENT_TOPIC);
+        try (
+                AdminClient adminClient = KafkaTestRecords.adminClient();
+                KafkaConsumer<String, Object> source = this.observeNewRecords(
+                        adminClient,
+                        WebhookRoute.WEBHOOK_EVENT_TOPIC
+                )
+        ) {
 
-            HttpResponse<String> response = this.postEvent("{\"eventType\":\"redirect.test\",\"payload\":{}}");
-            Assertions.assertThat(response.statusCode()).isEqualTo(202);
-            String eventId = this.objectMapper.readTree(response.body()).get("eventId").asString();
+            HttpResponse<String> httpResponse = this.postEvent("{\"eventType\":\"redirect.test\",\"payload\":{}}");
+            Assertions.assertThat(httpResponse.statusCode()).isEqualTo(202);
+            String eventId = this.objectMapper.readTree(httpResponse.body()).get("eventId").asString();
 
-            awaitCommit(this.awaitRecord(source, eventId));
+            KafkaTestRecords.awaitCommit(adminClient, KafkaTestRecords.awaitRecord(source, eventId));
             this.awaitAttemptRows(eventId, 1);
             Assertions.assertThat(RECEIVER.count(eventId)).isEqualTo(1);
             Assertions.assertThat(this.jdbcTemplate.queryForMap(
@@ -379,32 +422,57 @@ class CoreWebhookDeliveryLoopIntegrationTests {
         }
     }
 
-    @Test
-    void retriesAbruptTransportFailuresUntilTheConfiguredMaximum() throws Exception {
-        int maximumAttempts = this.webhookProperties.maximumAttempts();
-        RECEIVER.closeConnectionsWithoutResponse();
-        HttpResponse<String> response = this.postEvent("{\"eventType\":\"connection.test\",\"payload\":{}}");
-        String eventId = this.objectMapper.readTree(response.body()).get("eventId").asString();
-
-        RECEIVER.awaitRequest(eventId, maximumAttempts);
-        this.awaitAttemptRows(eventId, maximumAttempts);
-        List<Map<String, Object>> rows = this.jdbcTemplate.queryForList(
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void auditsOneTransportFailureWithNoHttpStatusWhenNoHigherTierExists(boolean timeout) throws Exception {
+        WebhookEvent event = WebhookEvent.newBuilder(event("transport.test", ENDPOINT_ID))
+                .setRetryCount(3)
+                .setDeliveryAttemptCount(3)
+                .setNextEligibleAt(Instant.EPOCH)
+                .build();
+        WebhookEvent unrelated = WebhookEvent.newBuilder(event).setEventId(UUID.randomUUID().toString()).build();
+        String topic = WebhookRoute.WEBHOOK_EVENT_RETRY_1H_TOPIC;
+        RECEIVER.failTransportOnly(event.getEventId(), timeout);
+        try (
+                AdminClient adminClient = KafkaTestRecords.adminClient();
+                KafkaConsumer<String, Object> input = this.observeNewRecords(adminClient, topic)
+        ) {
+            for (WebhookEvent message : List.of(unrelated, event)) {
+                this.producerTemplate.sendBodyAndHeader(
+                        "kafka:" + topic, message, KafkaConstants.KEY, message.getEndpointId()
+                );
+                KafkaTestRecords.awaitCommit(adminClient, KafkaTestRecords.awaitRecord(input, message.getEventId()));
+            }
+        } finally {
+            RECEIVER.clearTransportFailure();
+        }
+        this.awaitAttemptRows(unrelated.getEventId(), 1);
+        Assertions.assertThat(this.jdbcTemplate.queryForObject(
+                "SELECT outcome FROM delivery_attempt WHERE event_id = ?::uuid", String.class, unrelated.getEventId()
+        )).isEqualTo("SUCCEEDED");
+        this.awaitAttemptRows(event.getEventId(), 1);
+        Assertions.assertThat(RECEIVER.count(event.getEventId())).isEqualTo(1);
+        Map<String, Object> row = this.jdbcTemplate.queryForMap(
                 """
-                SELECT retry_count, replay_count, dead_lettered, details::text AS details
-                FROM delivery_attempt
-                WHERE event_id = ?::uuid
-                ORDER BY attempt_number
+                SELECT attempt_number, outcome, http_status, retry_count, replay_count, dead_lettered,
+                       details::text AS details
+                FROM delivery_attempt WHERE event_id = ?::uuid
                 """,
-                eventId
+                event.getEventId()
         );
-        Assertions.assertThat(rows).hasSize(maximumAttempts).allSatisfy(row -> {
-            assertPhaseOneAuditFields(row);
-            String detailsJson = row.get("details").toString();
-            JsonNode details = this.objectMapper.readTree(detailsJson);
-            Assertions.assertThat(details.get("type").asString()).isIn("CONNECTION_FAILURE", "INVALID_RESPONSE");
-            Assertions.assertThat(details.has("exceptionClass")).isTrue();
-            Assertions.assertThat(details.has("message")).isTrue();
-        });
+        Assertions.assertThat(row)
+                .containsEntry("attempt_number", 4)
+                .containsEntry("outcome", "RETRYABLE_FAILURE")
+                .containsEntry("http_status", null)
+                .containsEntry("retry_count", 3)
+                .containsEntry("replay_count", 0)
+                .containsEntry("dead_lettered", false);
+        JsonNode details = this.objectMapper.readTree(row.get("details").toString());
+        Assertions.assertThat(details.get("type").asString()).isIn(
+                timeout ? List.of("TIMEOUT") : List.of("CONNECTION_FAILURE", "INVALID_RESPONSE")
+        );
+        Assertions.assertThat(details.has("exceptionClass")).isTrue();
+        Assertions.assertThat(details.has("message")).isTrue();
     }
 
     @Test
@@ -432,33 +500,6 @@ class CoreWebhookDeliveryLoopIntegrationTests {
         Assertions.assertThat(this.objectMapper.readTree(detailsJson))
                 .isEqualTo(this.objectMapper.readTree("{\"type\":\"HTTP_FAILURE\"}"));
         Assertions.assertThat(detailsJson).doesNotContain(payload, SIGNING_SECRET);
-    }
-
-    @Test
-    void retriesTimedOutRequestsUntilTheConfiguredMaximumWithNullableStatus() throws Exception {
-        int maximumAttempts = this.webhookProperties.maximumAttempts();
-        RECEIVER.delayResponses(Duration.ofSeconds(6));
-        HttpResponse<String> response = this.postEvent("{\"eventType\":\"timeout.test\",\"payload\":{}}");
-        String eventId = this.objectMapper.readTree(response.body()).get("eventId").asString();
-
-        RECEIVER.awaitRequest(eventId, maximumAttempts);
-        this.awaitAttemptRows(eventId, maximumAttempts);
-        List<Map<String, Object>> rows = this.jdbcTemplate.queryForList(
-                """
-                SELECT attempt_number, outcome, http_status, retry_count, replay_count, dead_lettered,
-                       details::text AS details
-                FROM delivery_attempt
-                WHERE event_id = ?::uuid
-                ORDER BY attempt_number
-                """,
-                eventId
-        );
-        Assertions.assertThat(rows).hasSize(maximumAttempts).allSatisfy(row -> {
-            Assertions.assertThat(row.get("outcome")).isEqualTo("RETRYABLE_FAILURE");
-            Assertions.assertThat(row.get("http_status")).isNull();
-            assertPhaseOneAuditFields(row);
-            Assertions.assertThat(row.get("details").toString()).contains("TIMEOUT");
-        });
     }
 
     @Test
@@ -513,14 +554,17 @@ class CoreWebhookDeliveryLoopIntegrationTests {
                 0
         );
 
-        try (KafkaConsumer<String, Object> attempts = this.newConsumer("duplicate-source-" + UUID.randomUUID())) {
-            this.seekToEnd(attempts, WebhookRoute.PERSIST_DELIVERY_ATTEMPT_TOPIC);
+        try (
+                AdminClient admin = KafkaTestRecords.adminClient();
+                KafkaConsumer<String, Object> attempts =
+                        this.observeNewRecords(admin, WebhookRoute.PERSIST_DELIVERY_ATTEMPT_TOPIC)
+        ) {
             Map<String, Object> headers = Map.of(KafkaConstants.KEY, event.getEndpointId());
             this.producerTemplate.sendBodyAndHeaders("kafka:" + WebhookRoute.WEBHOOK_EVENT_TOPIC, event, headers);
-            awaitCommit(this.awaitRecord(attempts, eventId));
+            KafkaTestRecords.awaitCommit(admin, KafkaTestRecords.awaitRecord(attempts, eventId));
 
             this.producerTemplate.sendBodyAndHeaders("kafka:" + WebhookRoute.WEBHOOK_EVENT_TOPIC, event, headers);
-            awaitCommit(this.awaitRecord(attempts, eventId));
+            KafkaTestRecords.awaitCommit(admin, KafkaTestRecords.awaitRecord(attempts, eventId));
 
             Assertions.assertThat(RECEIVER.count(eventId)).isEqualTo(2);
             Assertions.assertThat(this.attemptRowCount(eventId)).isEqualTo(1);
@@ -639,20 +683,13 @@ class CoreWebhookDeliveryLoopIntegrationTests {
 
     @Test
     void declaresTopicsWithTheExpectedPartitioningAndRetention() throws Exception {
-        List<String> expectedTopics = Stream.concat(
-                Stream.of("webhook-events", "persist-delivery-attempt"),
-                NON_PRODUCED_TOPICS.stream()
-        ).toList();
-        try (
-                AdminClient adminClient = AdminClient.create(Map.of(
-                        AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG,
-                        kafkaBootstrapServers()
-                ))
-        ) {
-            Map<String, TopicDescription> descriptions = adminClient
-                    .describeTopics(expectedTopics)
-                    .allTopicNames()
-                    .get(10, TimeUnit.SECONDS);
+        List<String> expectedTopics = List.of(
+                "webhook-events", "persist-delivery-attempt", "webhook-events-retry-1m", "webhook-events-retry-10m",
+                "webhook-events-retry-1h", "webhook-events-dead-letter"
+        );
+        try (AdminClient adminClient = KafkaTestRecords.adminClient()) {
+            Map<String, TopicDescription> descriptions =
+                    adminClient.describeTopics(expectedTopics).allTopicNames().get(10, TimeUnit.SECONDS);
             Assertions.assertThat(descriptions.keySet()).containsExactlyInAnyOrderElementsOf(expectedTopics);
             Assertions.assertThat(descriptions.values()).allSatisfy(description -> {
                 Assertions.assertThat(description.partitions()).hasSize(12);
@@ -669,18 +706,18 @@ class CoreWebhookDeliveryLoopIntegrationTests {
                     "webhook-events-retry-1h", "604800000",
                     "webhook-events-dead-letter", "2592000000"
             );
-            List<ConfigResource> resources = expectedTopics.stream()
+            List<ConfigResource> configResources = expectedTopics.stream()
                     .map(topic -> new ConfigResource(ConfigResource.Type.TOPIC, topic))
                     .toList();
             Map<ConfigResource, Config> configs = adminClient
-                    .describeConfigs(resources)
+                    .describeConfigs(configResources)
                     .all()
                     .get(10, TimeUnit.SECONDS);
-            for (ConfigResource resource : resources) {
-                Assertions.assertThat(configValue(configs.get(resource), TopicConfig.CLEANUP_POLICY_CONFIG))
+            for (ConfigResource configResource : configResources) {
+                Assertions.assertThat(configValue(configs.get(configResource), TopicConfig.CLEANUP_POLICY_CONFIG))
                         .isEqualTo(TopicConfig.CLEANUP_POLICY_DELETE);
-                Assertions.assertThat(configValue(configs.get(resource), TopicConfig.RETENTION_MS_CONFIG))
-                        .isEqualTo(expectedRetentions.get(resource.name()));
+                Assertions.assertThat(configValue(configs.get(configResource), TopicConfig.RETENTION_MS_CONFIG))
+                        .isEqualTo(expectedRetentions.get(configResource.name()));
             }
 
             Assertions.assertThat(this.camelContext.getRoutes()).noneMatch(route ->
@@ -702,12 +739,12 @@ class CoreWebhookDeliveryLoopIntegrationTests {
     }
 
     private HttpResponse<String> postEvent(String body) throws IOException, InterruptedException {
-        HttpRequest request = HttpRequest.newBuilder()
+        HttpRequest httpRequest = HttpRequest.newBuilder()
                 .uri(URI.create("http://localhost:" + this.serverPort + "/api/events"))
                 .header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
                 .build();
-        return HttpClient.newHttpClient().send(request, HttpResponse.BodyHandlers.ofString());
+        return HttpClient.newHttpClient().send(httpRequest, HttpResponse.BodyHandlers.ofString());
     }
 
     private HttpResponse<String> postReceiver(
@@ -716,7 +753,8 @@ class CoreWebhookDeliveryLoopIntegrationTests {
             String timestamp,
             String signature
     ) throws IOException, InterruptedException {
-        HttpRequest request = HttpRequest.newBuilder()
+        HttpRequest httpRequest = HttpRequest
+                .newBuilder()
                 .uri(URI.create("http://localhost:" + this.serverPort + "/api/mocked-webhook-receiver"))
                 .header("Content-Type", "application/json")
                 .header("webhook-id", webhookId)
@@ -724,86 +762,11 @@ class CoreWebhookDeliveryLoopIntegrationTests {
                 .header("webhook-signature", signature)
                 .POST(HttpRequest.BodyPublishers.ofByteArray(body))
                 .build();
-        return HttpClient.newHttpClient().send(request, HttpResponse.BodyHandlers.ofString());
+        return HttpClient.newHttpClient().send(httpRequest, HttpResponse.BodyHandlers.ofString());
     }
 
-    private KafkaConsumer<String, Object> newConsumer(String groupId) {
-        Properties properties = new Properties();
-        properties.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, kafkaBootstrapServers());
-        properties.put(ConsumerConfig.GROUP_ID_CONFIG, groupId);
-        properties.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, false);
-        properties.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
-        properties.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, StringDeserializer.class);
-        properties.put(
-                ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG,
-                "io.apicurio.registry.serde.avro.AvroKafkaDeserializer"
-        );
-        properties.put(
-                "apicurio.registry.url",
-                "http://localhost:" + System.getenv().getOrDefault("SCHEMA_REGISTRY_PORT", "8081")
-                        + "/apis/registry/v3"
-        );
-        properties.put("apicurio.registry.use-specific-avro-reader", true);
-        properties.put(SchemaResolverConfig.VERTX_INSTANCE, this.registryVertx);
-        return new KafkaConsumer<>(properties);
-    }
-
-    private void seekToEnd(KafkaConsumer<String, Object> consumer, String... topics) {
-        List<TopicPartition> partitions = topicPartitions(consumer, topics);
-        consumer.assign(partitions);
-        consumer.endOffsets(partitions).forEach(consumer::seek);
-    }
-
-    private static Map<TopicPartition, Long> latestOffsets(
-            AdminClient admin,
-            Map<TopicPartition, OffsetSpec> partitions
-    ) throws Exception {
-        return admin.listOffsets(partitions).all()
-                .get(5, TimeUnit.SECONDS)
-                .entrySet().stream()
-                .collect(Collectors.toMap(Map.Entry::getKey, entry -> entry.getValue().offset()));
-    }
-
-    private static List<TopicPartition> topicPartitions(KafkaConsumer<String, Object> consumer, String... topics) {
-        return Stream.of(topics)
-                .flatMap(topic -> consumer.partitionsFor(topic, Duration.ofSeconds(10)).stream()
-                        .map(PartitionInfo::partition)
-                        .map(partition -> new TopicPartition(topic, partition)))
-                .toList();
-    }
-
-    private ConsumerRecord<String, Object> awaitRecord(KafkaConsumer<String, Object> consumer, String eventId) {
-        Instant deadline = Instant.now().plusSeconds(15);
-        while (Instant.now().isBefore(deadline)) {
-            for (ConsumerRecord<String, Object> record : consumer.poll(Duration.ofMillis(200))) {
-                if (eventId.equals(eventId(record.value()))) {
-                    return record;
-                }
-            }
-        }
-        throw new AssertionError("Kafka record was not observed for event " + eventId);
-    }
-
-    private static void awaitCommit(ConsumerRecord<String, Object> record) throws Exception {
-        TopicPartition partition = new TopicPartition(record.topic(), record.partition());
-        Instant deadline = Instant.now().plusSeconds(15);
-        try (
-                AdminClient admin = AdminClient.create(Map.of(
-                        AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, kafkaBootstrapServers()
-                ))
-        ) {
-            while (Instant.now().isBefore(deadline)) {
-                OffsetAndMetadata committed = admin.listConsumerGroupOffsets(record.topic())
-                        .partitionsToOffsetAndMetadata()
-                        .get(5, TimeUnit.SECONDS)
-                        .get(partition);
-                if (committed != null && committed.offset() > record.offset()) {
-                    return;
-                }
-                Thread.sleep(50L);
-            }
-        }
-        throw new AssertionError("Offset " + record.offset() + " was not committed on " + partition);
+    private KafkaConsumer<String, Object> observeNewRecords(AdminClient admin, String topic) throws Exception {
+        return KafkaTestRecords.consumer(this.registryVertx, KafkaTestRecords.endOffsets(admin, topic));
     }
 
     @SuppressWarnings("SameParameterValue")
@@ -816,12 +779,7 @@ class CoreWebhookDeliveryLoopIntegrationTests {
         TopicPartition first = new TopicPartition(topic, firstPartition);
         TopicPartition second = new TopicPartition(topic, secondPartition);
         Instant deadline = Instant.now().plusSeconds(15);
-        try (
-                AdminClient admin = AdminClient.create(Map.of(
-                        AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG,
-                        kafkaBootstrapServers()
-                ))
-        ) {
+        try (AdminClient admin = KafkaTestRecords.adminClient()) {
             while (Instant.now().isBefore(deadline)) {
                 try {
                     ConsumerGroupDescription description = admin
@@ -892,16 +850,6 @@ class CoreWebhookDeliveryLoopIntegrationTests {
         return bytes;
     }
 
-    private static String eventId(Object value) {
-        if (value instanceof WebhookEvent event) {
-            return event.getEventId();
-        }
-        if (value instanceof DeliveryAttempt attempt) {
-            return attempt.getEventId();
-        }
-        return null;
-    }
-
     private static WebhookEvent event(String eventType, String endpointId) {
         return new WebhookEvent(
                 UUID.randomUUID().toString(),
@@ -922,14 +870,6 @@ class CoreWebhookDeliveryLoopIntegrationTests {
         return entry == null ? null : entry.value();
     }
 
-    private static AdminClient newAdminClient() {
-        return AdminClient.create(Map.of(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, kafkaBootstrapServers()));
-    }
-
-    private static String kafkaBootstrapServers() {
-        return "localhost:" + System.getenv().getOrDefault("KAFKA_PORT", "9092");
-    }
-
     private record CapturedRequest(
             byte[] body,
             String eventType,
@@ -946,9 +886,9 @@ class CoreWebhookDeliveryLoopIntegrationTests {
         private final ExecutorService executor;
         private final ConcurrentLinkedQueue<CapturedRequest> requests = new ConcurrentLinkedQueue<>();
         private final AtomicInteger status = new AtomicInteger(204);
-        private volatile Duration delay = Duration.ZERO;
+        private volatile String retryableEventId;
+        private volatile TransportFailure transportFailure;
         private volatile byte[] responseBody = new byte[0];
-        private volatile boolean closeWithoutResponse;
         private volatile CountDownLatch responseGate;
 
         private TestReceiver(HttpServer server, ExecutorService executor) {
@@ -983,12 +923,20 @@ class CoreWebhookDeliveryLoopIntegrationTests {
             this.responseBody = body.getBytes(StandardCharsets.UTF_8);
         }
 
-        void delayResponses(Duration responseDelay) {
-            this.delay = responseDelay;
+        void failOnly(String eventId) {
+            this.retryableEventId = eventId;
         }
 
-        void closeConnectionsWithoutResponse() {
-            this.closeWithoutResponse = true;
+        void clearRetryableFailure() {
+            this.retryableEventId = null;
+        }
+
+        void failTransportOnly(String eventId, boolean timeout) {
+            this.transportFailure = new TransportFailure(eventId, timeout);
+        }
+
+        void clearTransportFailure() {
+            this.transportFailure = null;
         }
 
         void blockResponses() {
@@ -1006,9 +954,9 @@ class CoreWebhookDeliveryLoopIntegrationTests {
             this.releaseResponses();
             this.requests.clear();
             this.status.set(204);
-            this.delay = Duration.ZERO;
+            this.clearRetryableFailure();
+            this.clearTransportFailure();
             this.responseBody = new byte[0];
-            this.closeWithoutResponse = false;
             this.responseGate = null;
         }
 
@@ -1044,30 +992,33 @@ class CoreWebhookDeliveryLoopIntegrationTests {
 
         private void handle(HttpExchange exchange) throws IOException {
             byte[] body = exchange.getRequestBody().readAllBytes();
+            String eventId = exchange.getRequestHeaders().getFirst("webhook-id");
             this.requests.add(new CapturedRequest(
                     body,
                     exchange.getRequestHeaders().getFirst("webhook-event-type"),
-                    exchange.getRequestHeaders().getFirst("webhook-id"),
+                    eventId,
                     exchange.getRequestHeaders().getFirst("webhook-timestamp"),
                     exchange.getRequestHeaders().getFirst("webhook-signature"),
                     exchange.getRequestHeaders().getFirst("Content-Type")
             ));
             try (exchange) {
-                if (this.closeWithoutResponse) {
-                    return;
-                }
-                if (!this.delay.isZero()) {
-                    Thread.sleep(this.delay);
+                TransportFailure failure = this.transportFailure;
+                if (failure != null && failure.eventId().equals(eventId)) {
+                    if (!failure.timeout()) {
+                        return;
+                    }
+                    Thread.sleep(Duration.ofSeconds(6));
                 }
                 CountDownLatch gate = this.responseGate;
                 if (gate != null) {
                     gate.await(10, TimeUnit.SECONDS);
                 }
-                if (this.status.get() == 302) {
+                int responseStatus = eventId != null && eventId.equals(this.retryableEventId) ? 503 : this.status.get();
+                if (responseStatus == 302) {
                     exchange.getResponseHeaders().add("Location", "/redirect-target");
                 }
                 byte[] responseBytes = this.responseBody;
-                exchange.sendResponseHeaders(this.status.get(), responseBytes.length == 0 ? -1L : responseBytes.length);
+                exchange.sendResponseHeaders(responseStatus, responseBytes.length == 0 ? -1L : responseBytes.length);
                 if (responseBytes.length > 0) {
                     exchange.getResponseBody().write(responseBytes);
                 }
@@ -1081,6 +1032,9 @@ class CoreWebhookDeliveryLoopIntegrationTests {
             this.releaseResponses();
             this.server.stop(0);
             this.executor.shutdownNow();
+        }
+
+        private record TransportFailure(String eventId, boolean timeout) {
         }
     }
 }
