@@ -2,7 +2,7 @@ package gregor.exception;
 
 public class EligibilityWaitInterruptedException extends RuntimeException {
 
-    public EligibilityWaitInterruptedException(Throwable cause) {
-        super("Eligibility wait was interrupted", cause);
+    public EligibilityWaitInterruptedException(Throwable waitFailureThrowable) {
+        super("Eligibility wait was interrupted", waitFailureThrowable);
     }
 }

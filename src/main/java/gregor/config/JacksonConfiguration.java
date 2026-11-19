@@ -12,10 +12,7 @@ public class JacksonConfiguration {
 
     @Bean
     @Primary
-    public JsonMapper jsonMapper(JsonMapper.Builder builder) {
-        return builder
-                .disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
-                .changeDefaultPropertyInclusion(jiv -> jiv.withValueInclusion(JsonInclude.Include.NON_EMPTY))
-                .build();
+    public JsonMapper jsonMapper(JsonMapper.Builder jsonMapperBuilder) {
+        return jsonMapperBuilder.disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES).changeDefaultPropertyInclusion(jsonIncludeValue -> jsonIncludeValue.withValueInclusion(JsonInclude.Include.NON_EMPTY)).build();
     }
 }

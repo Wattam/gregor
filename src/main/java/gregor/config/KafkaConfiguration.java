@@ -31,15 +31,7 @@ public class KafkaConfiguration {
 
     @Bean
     public ComponentCustomizer registryVertxCustomizer(Vertx registryVertx) {
-        return ComponentCustomizer
-                .builder(KafkaComponent.class)
-                .withOrder(Ordered.LOWEST)
-                .build(
-                        component -> component
-                                .getConfiguration()
-                                .getAdditionalProperties()
-                                .put(SchemaResolverConfig.VERTX_INSTANCE, registryVertx)
-                );
+        return ComponentCustomizer.builder(KafkaComponent.class).withOrder(Ordered.LOWEST).build(kafkaComponent -> kafkaComponent.getConfiguration().getAdditionalProperties().put(SchemaResolverConfig.VERTX_INSTANCE, registryVertx));
     }
 
     @Bean
@@ -59,39 +51,27 @@ public class KafkaConfiguration {
 
     @Bean
     public NewTopic webhookEventsRetry1mTopic() {
-        return this.newTopicWithDeleteCleanupPolicy(
-                WebhookRoute.WEBHOOK_EVENT_RETRY_1M_TOPIC,
-                this.kafkaTopicProperties.retryRetention()
-        );
+        return this.newTopicWithDeleteCleanupPolicy(WebhookRoute.WEBHOOK_EVENT_RETRY_1M_TOPIC, this.kafkaTopicProperties.retryRetention());
     }
 
     @Bean
     public NewTopic webhookEventsRetry10mTopic() {
-        return this.newTopicWithDeleteCleanupPolicy(
-                WebhookRoute.WEBHOOK_EVENT_RETRY_10M_TOPIC,
-                this.kafkaTopicProperties.retryRetention()
-        );
+        return this.newTopicWithDeleteCleanupPolicy(WebhookRoute.WEBHOOK_EVENT_RETRY_10M_TOPIC, this.kafkaTopicProperties.retryRetention());
     }
 
     @Bean
     public NewTopic webhookEventsRetry1hTopic() {
-        return this.newTopicWithDeleteCleanupPolicy(
-                WebhookRoute.WEBHOOK_EVENT_RETRY_1H_TOPIC,
-                this.kafkaTopicProperties.retryRetention()
-        );
+        return this.newTopicWithDeleteCleanupPolicy(WebhookRoute.WEBHOOK_EVENT_RETRY_1H_TOPIC, this.kafkaTopicProperties.retryRetention());
     }
 
     @Bean
     public NewTopic webhookEventsDeadLetterTopic() {
-        return this.newTopicWithDeleteCleanupPolicy(
-                WebhookRoute.WEBHOOK_EVENT_DEAD_LETTER_TOPIC,
-                this.kafkaTopicProperties.deadLetterRetention()
-        );
+        return this.newTopicWithDeleteCleanupPolicy(WebhookRoute.WEBHOOK_EVENT_DEAD_LETTER_TOPIC, this.kafkaTopicProperties.deadLetterRetention());
     }
 
-    private NewTopic newTopicWithDeleteCleanupPolicy(String name, Duration retention) {
+    private NewTopic newTopicWithDeleteCleanupPolicy(String topicName, Duration retention) {
         return TopicBuilder
-                .name(name)
+                .name(topicName)
                 .partitions(this.kafkaTopicProperties.defaultPartitions())
                 .replicas(this.kafkaTopicProperties.replicationFactor())
                 .config(TopicConfig.CLEANUP_POLICY_CONFIG, TopicConfig.CLEANUP_POLICY_DELETE)

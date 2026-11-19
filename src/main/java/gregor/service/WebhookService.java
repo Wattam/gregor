@@ -58,25 +58,20 @@ public class WebhookService {
     public UUID ingestEvent(EventIngestRequest eventIngestRequest) {
         UUID eventId = UUID.randomUUID();
         try {
-            byte[] payload = this.objectMapper.writeValueAsBytes(eventIngestRequest.payload());
+            byte[] payloadBytes = this.objectMapper.writeValueAsBytes(eventIngestRequest.payload());
             WebhookEvent webhookEvent = new WebhookEvent(
                     eventId.toString(),
                     eventIngestRequest.eventType(),
                     this.webhookProperties.tenantId(),
                     this.webhookProperties.endpointId(),
                     Instant.now(this.clock),
-                    ByteBuffer.wrap(payload),
+                    ByteBuffer.wrap(payloadBytes),
                     0,
                     null,
                     0,
                     0
             );
-            this.producerTemplate.sendBodyAndHeader(
-                    "kafka:" + WebhookRoute.WEBHOOK_EVENT_TOPIC,
-                    webhookEvent,
-                    KafkaConstants.KEY,
-                    this.webhookProperties.endpointId()
-            );
+            this.producerTemplate.sendBodyAndHeader("kafka:" + WebhookRoute.WEBHOOK_EVENT_TOPIC, webhookEvent, KafkaConstants.KEY, this.webhookProperties.endpointId());
             return eventId;
         } catch (Exception exception) {
             restoreInterruptIfNeeded(exception);
@@ -90,10 +85,7 @@ public class WebhookService {
 
     public boolean hasImpossibleDeliveryState(@Body WebhookRouteMessage webhookRouteMessage) {
         WebhookEvent webhookEvent = webhookRouteMessage.webhookEvent();
-        return webhookEvent.getDeliveryAttemptCount() < 0
-                || webhookEvent.getRetryCount() < 0
-                || webhookEvent.getReplayCount() < 0
-                || webhookEvent.getDeliveryAttemptCount() >= this.webhookProperties.maximumAttempts();
+        return webhookEvent.getDeliveryAttemptCount() < 0 || webhookEvent.getRetryCount() < 0 || webhookEvent.getReplayCount() < 0 || webhookEvent.getDeliveryAttemptCount() >= this.webhookProperties.maximumAttempts();
     }
 
     public boolean hasMalformedRetryEnvelope(@Body WebhookRouteMessage webhookRouteMessage) {
@@ -101,21 +93,15 @@ public class WebhookService {
         if (this.hasImpossibleDeliveryState(webhookRouteMessage) || Objects.isNull(nextEligibleAt)) {
             return true;
         }
-        Instant latestPermittedEligibility =
-                Instant.now(this.clock).plus(this.kafkaConsumerProperties.maximumPermittedWait());
+        Instant latestPermittedEligibility = Instant.now(this.clock).plus(this.kafkaConsumerProperties.maximumPermittedWait());
         return nextEligibleAt.isAfter(latestPermittedEligibility);
     }
 
-    public void logDiscardedRetryEnvelope(
-            @Body WebhookRouteMessage webhookRouteMessage,
-            @Header(KafkaConstants.TOPIC) String topic
-    ) {
+    public void logDiscardedRetryEnvelope(@Body WebhookRouteMessage webhookRouteMessage, @Header(KafkaConstants.TOPIC) String topicName) {
         WebhookEvent webhookEvent = webhookRouteMessage.webhookEvent();
         log.error(
-                "Discarding malformed retry envelope [topic={}] [eventId={}] [tenantId={}] [endpointId={}]"
-                        + " [deliveryAttemptCount={}] [retryCount={}] [replayCount={}] [nextEligibleAt={}]"
-                        + " [maximumAttempts={}] [maximumPermittedWait={}]",
-                topic,
+                "Discarding malformed retry envelope [topic={}] [eventId={}] [tenantId={}] [endpointId={}] [deliveryAttemptCount={}] [retryCount={}] [replayCount={}] [nextEligibleAt={}] [maximumAttempts={}] [maximumPermittedWait={}]",
+                topicName,
                 webhookEvent.getEventId(),
                 webhookEvent.getTenantId(),
                 webhookEvent.getEndpointId(),
@@ -133,28 +119,27 @@ public class WebhookService {
         if (Objects.isNull(nextEligibleAt)) {
             return Duration.ZERO;
         }
-        Duration wait = Duration.between(Instant.now(this.clock), nextEligibleAt);
-        return wait.isNegative() ? Duration.ZERO : wait;
+        Duration remainingWait = Duration.between(Instant.now(this.clock), nextEligibleAt);
+        return remainingWait.isNegative() ? Duration.ZERO : remainingWait;
     }
 
     public void awaitEligibility(@Body WebhookRouteMessage webhookRouteMessage) {
-        Duration wait = this.eligibilityWait(webhookRouteMessage);
-        if (wait.isZero()) {
+        Duration remainingWait = this.eligibilityWait(webhookRouteMessage);
+        if (remainingWait.isZero()) {
             return;
         }
         try {
-            Thread.sleep(wait);
-        } catch (InterruptedException exception) {
+            Thread.sleep(remainingWait);
+        } catch (InterruptedException interruptedException) {
             Thread.currentThread().interrupt();
-            throw new EligibilityWaitInterruptedException(exception);
+            throw new EligibilityWaitInterruptedException(interruptedException);
         }
     }
 
     public void logDiscardedEnvelope(@Body WebhookRouteMessage webhookRouteMessage) {
         WebhookEvent webhookEvent = webhookRouteMessage.webhookEvent();
         log.error(
-                "Discarding webhook event with impossible delivery state [eventId={}] [tenantId={}] [endpointId={}]"
-                        + " [deliveryAttemptCount={}] [retryCount={}] [replayCount={}] [maximumAttempts={}]",
+                "Discarding webhook event with impossible delivery state [eventId={}] [tenantId={}] [endpointId={}] [deliveryAttemptCount={}] [retryCount={}] [replayCount={}] [maximumAttempts={}]",
                 webhookEvent.getEventId(),
                 webhookEvent.getTenantId(),
                 webhookEvent.getEndpointId(),
@@ -166,19 +151,16 @@ public class WebhookService {
     }
 
     public WebhookRouteMessage sendWebhookEvent(@Body WebhookRouteMessage webhookRouteMessage) {
-        WebhookEvent webhookEvent = webhookRouteMessage.webhookEvent();
-        DeliveryAttemptResult deliveryAttemptResult = this.restComponent.sendWebhook(webhookEvent);
-        WebhookEvent advancedWebhookEvent = WebhookEvent
-                .newBuilder(webhookEvent)
-                .setDeliveryAttemptCount(webhookEvent.getDeliveryAttemptCount() + 1)
-                .build();
+        WebhookEvent receivedWebhookEvent = webhookRouteMessage.webhookEvent();
+        DeliveryAttemptResult deliveryAttemptResult = this.restComponent.sendWebhook(receivedWebhookEvent);
+        WebhookEvent advancedWebhookEvent = WebhookEvent.newBuilder(receivedWebhookEvent).setDeliveryAttemptCount(receivedWebhookEvent.getDeliveryAttemptCount() + 1).build();
         return new WebhookRouteMessage(advancedWebhookEvent, deliveryAttemptResult);
     }
 
     public DeliveryAttempt createAttempt(@Body WebhookRouteMessage webhookRouteMessage) {
         WebhookEvent webhookEvent = webhookRouteMessage.webhookEvent();
         DeliveryAttemptResult deliveryAttemptResult = webhookRouteMessage.deliveryAttemptResult();
-        byte[] details = this.objectMapper.writeValueAsBytes(deliveryAttemptResult.details());
+        byte[] detailsBytes = this.objectMapper.writeValueAsBytes(deliveryAttemptResult.details());
         return new DeliveryAttempt(
                 UUID.randomUUID().toString(),
                 webhookEvent.getEventId(),
@@ -190,7 +172,7 @@ public class WebhookService {
                 deliveryAttemptResult.httpStatus(),
                 deliveryAttemptResult.latencyMs(),
                 deliveryAttemptResult.attemptedAt(),
-                ByteBuffer.wrap(details),
+                ByteBuffer.wrap(detailsBytes),
                 webhookEvent.getRetryCount(),
                 webhookEvent.getReplayCount(),
                 false
@@ -198,37 +180,29 @@ public class WebhookService {
     }
 
     public Optional<RetryPublication> planRetry(@Body WebhookRouteMessage webhookRouteMessage) {
-        WebhookEvent webhookEvent = webhookRouteMessage.webhookEvent();
+        WebhookEvent attemptedWebhookEvent = webhookRouteMessage.webhookEvent();
         DeliveryAttemptResult deliveryAttemptResult = webhookRouteMessage.deliveryAttemptResult();
-        int retryCount = webhookEvent.getRetryCount();
-        if (deliveryAttemptResult.outcome() != DeliveryOutcome.RETRYABLE_FAILURE
-                || webhookEvent.getDeliveryAttemptCount() >= this.webhookProperties.maximumAttempts()
-                || retryCount < 0
-                || retryCount >= RETRY_TIERS.size()) {
+        int retryCount = attemptedWebhookEvent.getRetryCount();
+        if (deliveryAttemptResult.outcome() != DeliveryOutcome.RETRYABLE_FAILURE || attemptedWebhookEvent.getDeliveryAttemptCount() >= this.webhookProperties.maximumAttempts() || retryCount < 0 || retryCount >= RETRY_TIERS.size()) {
             return Optional.empty();
         }
 
         RetryTier retryTier = RETRY_TIERS.get(retryCount);
-        WebhookEvent successorWebhookEvent = WebhookEvent
-                .newBuilder(webhookEvent)
-                .setRetryCount(retryCount + 1)
-                .setNextEligibleAt(
-                        deliveryAttemptResult.completedAt().plus(retryTier.delay()).truncatedTo(ChronoUnit.MILLIS)
-                )
-                .build();
+        Instant nextEligibleAt = deliveryAttemptResult.completedAt().plus(retryTier.retryDelay()).truncatedTo(ChronoUnit.MILLIS);
+        WebhookEvent successorWebhookEvent = WebhookEvent.newBuilder(attemptedWebhookEvent).setRetryCount(retryCount + 1).setNextEligibleAt(nextEligibleAt).build();
         return Optional.of(new RetryPublication(retryTier.topic(), successorWebhookEvent));
     }
 
     @Transactional
     public void persistDeliveryAttempt(@Body DeliveryAttempt deliveryAttempt) {
-        byte[] detailBytes = copy(deliveryAttempt.getDetails());
+        byte[] detailsBytes = copy(deliveryAttempt.getDetails());
         try {
-            this.objectMapper.readTree(detailBytes);
+            this.objectMapper.readTree(detailsBytes);
         } catch (Exception exception) {
             throw new IllegalArgumentException("Delivery attempt details must contain valid JSON", exception);
         }
-        String details = new String(detailBytes, StandardCharsets.UTF_8);
-        int inserted = this.deliveryAttemptRepository.insertIfAbsent(
+        String detailsJson = new String(detailsBytes, StandardCharsets.UTF_8);
+        int insertedRowCount = this.deliveryAttemptRepository.insertIfAbsent(
                 UUID.fromString(deliveryAttempt.getAttemptId()),
                 UUID.fromString(deliveryAttempt.getEventId()),
                 UUID.fromString(deliveryAttempt.getTenantId()),
@@ -239,19 +213,19 @@ public class WebhookService {
                 deliveryAttempt.getHttpStatus(),
                 deliveryAttempt.getLatencyMs(),
                 deliveryAttempt.getAttemptedAt(),
-                details,
+                detailsJson,
                 deliveryAttempt.getRetryCount(),
                 deliveryAttempt.getReplayCount(),
                 deliveryAttempt.getDeadLettered()
         );
-        if (inserted != 0 && inserted != 1) {
-            throw new IllegalStateException("Unexpected delivery attempt insert count: " + inserted);
+        if (insertedRowCount != 0 && insertedRowCount != 1) {
+            throw new IllegalStateException("Unexpected delivery attempt insert count: " + insertedRowCount);
         }
     }
 
     private static void restoreInterruptIfNeeded(Throwable throwable) {
-        for (Throwable cause = throwable; cause != null; cause = cause.getCause()) {
-            if (cause instanceof InterruptedException) {
+        for (Throwable currentThrowable = throwable; currentThrowable != null; currentThrowable = currentThrowable.getCause()) {
+            if (currentThrowable instanceof InterruptedException) {
                 Thread.currentThread().interrupt();
                 return;
             }
@@ -266,10 +240,10 @@ public class WebhookService {
         };
     }
 
-    private static byte[] copy(ByteBuffer source) {
-        ByteBuffer copy = source.duplicate();
-        byte[] bytes = new byte[copy.remaining()];
-        copy.get(bytes);
+    private static byte[] copy(ByteBuffer sourceByteBuffer) {
+        ByteBuffer duplicateByteBuffer = sourceByteBuffer.duplicate();
+        byte[] bytes = new byte[duplicateByteBuffer.remaining()];
+        duplicateByteBuffer.get(bytes);
         return bytes;
     }
 }

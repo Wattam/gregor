@@ -23,11 +23,7 @@ public final class WebhookPropertiesFixtures {
         return create(signingSecret, receiverTimestampTolerance, 3);
     }
 
-    private static WebhookProperties create(
-            String signingSecret,
-            Duration receiverTimestampTolerance,
-            int maximumAttempts
-    ) {
+    private static WebhookProperties create(String signingSecret, Duration receiverTimestampTolerance, int maximumAttempts) {
         return new WebhookProperties(
                 "00000000-0000-0000-0000-000000000001",
                 "00000000-0000-0000-0000-000000000002",

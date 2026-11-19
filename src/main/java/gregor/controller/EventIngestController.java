@@ -21,8 +21,8 @@ public class EventIngestController {
     private final WebhookService webhookService;
 
     @PostMapping
-    public ResponseEntity<EventIngestResponse> ingest(@Valid @RequestBody EventIngestRequest request) {
-        UUID eventId = this.webhookService.ingestEvent(request);
+    public ResponseEntity<EventIngestResponse> ingest(@Valid @RequestBody EventIngestRequest eventIngestRequest) {
+        UUID eventId = this.webhookService.ingestEvent(eventIngestRequest);
         return ResponseEntity.accepted().body(new EventIngestResponse(eventId));
     }
 }

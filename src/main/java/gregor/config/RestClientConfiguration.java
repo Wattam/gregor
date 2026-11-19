@@ -12,14 +12,10 @@ import java.net.http.HttpClient;
 public class RestClientConfiguration {
 
     @Bean
-    public RestClient restClient(RestClient.Builder builder, WebhookProperties webhookProperties) {
-        HttpClient httpClient = HttpClient
-                .newBuilder()
-                .connectTimeout(webhookProperties.connectionTimeout())
-                .followRedirects(HttpClient.Redirect.NEVER)
-                .build();
+    public RestClient restClient(RestClient.Builder restClientBuilder, WebhookProperties webhookProperties) {
+        HttpClient httpClient = HttpClient.newBuilder().connectTimeout(webhookProperties.connectionTimeout()).followRedirects(HttpClient.Redirect.NEVER).build();
         JdkClientHttpRequestFactory jdkClientHttpRequestFactory = new JdkClientHttpRequestFactory(httpClient);
         jdkClientHttpRequestFactory.setReadTimeout(webhookProperties.responseTimeout());
-        return builder.requestFactory(jdkClientHttpRequestFactory).build();
+        return restClientBuilder.requestFactory(jdkClientHttpRequestFactory).build();
     }
 }

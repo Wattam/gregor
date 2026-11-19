@@ -13,35 +13,24 @@ class SignatureComponentTests {
 
     @Test
     void matchesAStandardWebhooksHmacTestVector() {
-        byte[] secret = "01234567890123456789012345678901".getBytes(StandardCharsets.UTF_8);
-        String configuredSecret = "whsec_" + Base64.getEncoder().encodeToString(secret);
-        SignatureComponent service = new SignatureComponent(WebhookPropertiesFixtures.create(
-                configuredSecret,
-                Duration.ofMinutes(5)
-        ));
-        byte[] body = "{\"x\":\"é\"}".getBytes(StandardCharsets.UTF_8);
+        byte[] secretBytes = "01234567890123456789012345678901".getBytes(StandardCharsets.UTF_8);
+        String configuredSecret = "whsec_" + Base64.getEncoder().encodeToString(secretBytes);
+        SignatureComponent signatureComponent = new SignatureComponent(WebhookPropertiesFixtures.create(configuredSecret, Duration.ofMinutes(5)));
+        byte[] bodyBytes = "{\"x\":\"é\"}".getBytes(StandardCharsets.UTF_8);
 
-        String signature = service.sign("event-123", 1_700_000_000L, body);
+        String signature = signatureComponent.sign("event-123", 1_700_000_000L, bodyBytes);
 
         Assertions.assertThat(signature).isEqualTo("v1,mhwyQeB5kaTceeNCFewr2qPTce8jPJfx5RT7Hd6SRQQ=");
     }
 
     @Test
     void rejectsSecretsWithoutThePrefixValidBase64OrRequiredDecodedLength() {
-        String tooShort = "whsec_" + Base64.getEncoder().encodeToString(new byte[23]);
-        String tooLong = "whsec_" + Base64.getEncoder().encodeToString(new byte[65]);
+        String tooShortSecret = "whsec_" + Base64.getEncoder().encodeToString(new byte[23]);
+        String tooLongSecret = "whsec_" + Base64.getEncoder().encodeToString(new byte[65]);
 
-        Assertions.assertThatThrownBy(() -> new SignatureComponent(
-                WebhookPropertiesFixtures.create("secret", Duration.ofMinutes(5))
-        )).isInstanceOf(IllegalArgumentException.class);
-        Assertions.assertThatThrownBy(() -> new SignatureComponent(
-                WebhookPropertiesFixtures.create("whsec_!", Duration.ofMinutes(5))
-        )).isInstanceOf(IllegalArgumentException.class);
-        Assertions.assertThatThrownBy(() -> new SignatureComponent(
-                WebhookPropertiesFixtures.create(tooShort, Duration.ofMinutes(5))
-        )).isInstanceOf(IllegalArgumentException.class);
-        Assertions.assertThatThrownBy(() -> new SignatureComponent(
-                WebhookPropertiesFixtures.create(tooLong, Duration.ofMinutes(5))
-        )).isInstanceOf(IllegalArgumentException.class);
+        Assertions.assertThatThrownBy(() -> new SignatureComponent(WebhookPropertiesFixtures.create("secret", Duration.ofMinutes(5)))).isInstanceOf(IllegalArgumentException.class);
+        Assertions.assertThatThrownBy(() -> new SignatureComponent(WebhookPropertiesFixtures.create("whsec_!", Duration.ofMinutes(5)))).isInstanceOf(IllegalArgumentException.class);
+        Assertions.assertThatThrownBy(() -> new SignatureComponent(WebhookPropertiesFixtures.create(tooShortSecret, Duration.ofMinutes(5)))).isInstanceOf(IllegalArgumentException.class);
+        Assertions.assertThatThrownBy(() -> new SignatureComponent(WebhookPropertiesFixtures.create(tooLongSecret, Duration.ofMinutes(5)))).isInstanceOf(IllegalArgumentException.class);
     }
 }

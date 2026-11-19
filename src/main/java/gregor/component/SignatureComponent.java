@@ -21,24 +21,24 @@ public class SignatureComponent {
     private final SecretKeySpec secretKeySpec;
 
     public SignatureComponent(WebhookProperties webhookProperties) {
-        byte[] secret = decodeSecret(webhookProperties.signingSecret());
-        this.secretKeySpec = new SecretKeySpec(secret, ALGORITHM);
+        byte[] secretBytes = decodeSecret(webhookProperties.signingSecret());
+        this.secretKeySpec = new SecretKeySpec(secretBytes, ALGORITHM);
     }
 
-    public String sign(String webhookId, long timestamp, byte[] body) {
-        byte[] digest = this.digest(webhookId, timestamp, body);
-        return "v1," + Base64.getEncoder().encodeToString(digest);
+    public String sign(String webhookId, long webhookTimestamp, byte[] bodyBytes) {
+        byte[] digestBytes = this.digest(webhookId, webhookTimestamp, bodyBytes);
+        return "v1," + Base64.getEncoder().encodeToString(digestBytes);
     }
 
-    private byte[] digest(String webhookId, long timestamp, byte[] body) {
+    private byte[] digest(String webhookId, long webhookTimestamp, byte[] bodyBytes) {
         try {
             Mac mac = Mac.getInstance(ALGORITHM);
             mac.init(this.secretKeySpec);
-            String prefix = webhookId + "." + timestamp + ".";
-            mac.update(prefix.getBytes(StandardCharsets.UTF_8));
-            return mac.doFinal(body);
-        } catch (NoSuchAlgorithmException | InvalidKeyException exception) {
-            throw new IllegalStateException("HMAC-SHA256 is unavailable", exception);
+            String signedMessagePrefix = webhookId + "." + webhookTimestamp + ".";
+            mac.update(signedMessagePrefix.getBytes(StandardCharsets.UTF_8));
+            return mac.doFinal(bodyBytes);
+        } catch (NoSuchAlgorithmException | InvalidKeyException securityException) {
+            throw new IllegalStateException("HMAC-SHA256 is unavailable", securityException);
         }
     }
 
@@ -47,15 +47,15 @@ public class SignatureComponent {
             throw new IllegalArgumentException("Webhook signing secret must use the whsec_ prefix");
         }
 
-        byte[] secret;
+        byte[] secretBytes;
         try {
-            secret = Base64.getDecoder().decode(configuredSecret.substring(SECRET_PREFIX.length()));
-        } catch (IllegalArgumentException exception) {
-            throw new IllegalArgumentException("Webhook signing secret must contain valid Base64", exception);
+            secretBytes = Base64.getDecoder().decode(configuredSecret.substring(SECRET_PREFIX.length()));
+        } catch (IllegalArgumentException illegalArgumentException) {
+            throw new IllegalArgumentException("Webhook signing secret must contain valid Base64", illegalArgumentException);
         }
-        if (secret.length < MINIMUM_SECRET_BYTES || secret.length > MAXIMUM_SECRET_BYTES) {
+        if (secretBytes.length < MINIMUM_SECRET_BYTES || secretBytes.length > MAXIMUM_SECRET_BYTES) {
             throw new IllegalArgumentException("Webhook signing secret must decode to between 24 and 64 bytes");
         }
-        return secret;
+        return secretBytes;
     }
 }

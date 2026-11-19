@@ -34,13 +34,10 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
-@SpringBootTest(
-        webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
-        properties = "gregor.webhook.maximum-attempts=1"
-)
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "gregor.webhook.maximum-attempts=1")
 class MaximumAttemptsOneIntegrationTests {
 
-    private static final TestReceiver RECEIVER = TestReceiver.start();
+    private static final TestReceiver TEST_RECEIVER = TestReceiver.start();
 
     @LocalServerPort
     private int serverPort;
@@ -59,16 +56,9 @@ class MaximumAttemptsOneIntegrationTests {
         String kafkaPort = System.getenv().getOrDefault("KAFKA_PORT", "9092");
         String registryPort = System.getenv().getOrDefault("SCHEMA_REGISTRY_PORT", "8081");
 
-        dynamicPropertyRegistry.add(
-                "spring.datasource.url",
-                () -> "jdbc:postgresql://" + postgresHost + ":" + postgresPort + "/" + postgresDatabase
-        );
-        dynamicPropertyRegistry.add("spring.datasource.username", () -> System.getenv()
-                .getOrDefault("POSTGRES_USER", "gregor"));
-        dynamicPropertyRegistry.add(
-                "spring.datasource.password",
-                () -> System.getenv().getOrDefault("POSTGRES_PASSWORD", "gregor")
-        );
+        dynamicPropertyRegistry.add("spring.datasource.url", () -> "jdbc:postgresql://" + postgresHost + ":" + postgresPort + "/" + postgresDatabase);
+        dynamicPropertyRegistry.add("spring.datasource.username", () -> System.getenv().getOrDefault("POSTGRES_USER", "gregor"));
+        dynamicPropertyRegistry.add("spring.datasource.password", () -> System.getenv().getOrDefault("POSTGRES_PASSWORD", "gregor"));
         dynamicPropertyRegistry.add("spring.jpa.hibernate.ddl-auto", () -> "update");
         dynamicPropertyRegistry.add("spring.kafka.bootstrap-servers", () -> "localhost:" + kafkaPort);
         dynamicPropertyRegistry.add("spring.kafka.admin.auto-create", () -> "true");
@@ -81,39 +71,18 @@ class MaximumAttemptsOneIntegrationTests {
         dynamicPropertyRegistry.add("camel.component.kafka.max-poll-records", () -> "1");
         dynamicPropertyRegistry.add("camel.main.auto-startup", () -> "true");
         dynamicPropertyRegistry.add("camel.component.kafka.request-required-acks", () -> "all");
-        dynamicPropertyRegistry.add(
-                "camel.component.kafka.key-serializer",
-                () -> "org.apache.kafka.common.serialization.StringSerializer"
-        );
-        dynamicPropertyRegistry.add(
-                "camel.component.kafka.value-serializer",
-                () -> "io.apicurio.registry.serde.avro.AvroKafkaSerializer"
-        );
-        dynamicPropertyRegistry.add(
-                "camel.component.kafka.key-deserializer",
-                () -> "org.apache.kafka.common.serialization.StringDeserializer"
-        );
-        dynamicPropertyRegistry.add(
-                "camel.component.kafka.value-deserializer",
-                () -> "io.apicurio.registry.serde.avro.AvroKafkaDeserializer"
-        );
-        dynamicPropertyRegistry.add(
-                "camel.component.kafka.additional-properties[apicurio.registry.url]",
-                () -> "http://localhost:" + registryPort + "/apis/registry/v3"
-        );
+        dynamicPropertyRegistry.add("camel.component.kafka.key-serializer", () -> "org.apache.kafka.common.serialization.StringSerializer");
+        dynamicPropertyRegistry.add("camel.component.kafka.value-serializer", () -> "io.apicurio.registry.serde.avro.AvroKafkaSerializer");
+        dynamicPropertyRegistry.add("camel.component.kafka.key-deserializer", () -> "org.apache.kafka.common.serialization.StringDeserializer");
+        dynamicPropertyRegistry.add("camel.component.kafka.value-deserializer", () -> "io.apicurio.registry.serde.avro.AvroKafkaDeserializer");
+        dynamicPropertyRegistry.add("camel.component.kafka.additional-properties[apicurio.registry.url]", () -> "http://localhost:" + registryPort + "/apis/registry/v3");
         dynamicPropertyRegistry.add("camel.component.kafka.additional-properties[apicurio.registry.auto-register]", () -> "true");
-        dynamicPropertyRegistry.add(
-                "camel.component.kafka.additional-properties[apicurio.registry.use-specific-avro-reader]",
-                () -> "true"
-        );
+        dynamicPropertyRegistry.add("camel.component.kafka.additional-properties[apicurio.registry.use-specific-avro-reader]", () -> "true");
         dynamicPropertyRegistry.add("gregor.kafka.listener-concurrency", () -> "1");
         dynamicPropertyRegistry.add("gregor.webhook.tenant-id", () -> "00000000-0000-0000-0000-000000000001");
         dynamicPropertyRegistry.add("gregor.webhook.endpoint-id", () -> "00000000-0000-0000-0000-000000000002");
-        dynamicPropertyRegistry.add("gregor.webhook.receiver-url", RECEIVER::uri);
-        dynamicPropertyRegistry.add(
-                "gregor.webhook.signing-secret",
-                () -> "whsec_MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE="
-        );
+        dynamicPropertyRegistry.add("gregor.webhook.receiver-url", TEST_RECEIVER::uri);
+        dynamicPropertyRegistry.add("gregor.webhook.signing-secret", () -> "whsec_MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=");
         dynamicPropertyRegistry.add("gregor.webhook.connection-timeout", () -> "2s");
         dynamicPropertyRegistry.add("gregor.webhook.response-timeout", () -> "5s");
         dynamicPropertyRegistry.add("gregor.webhook.receiver-timestamp-tolerance", () -> "5m");
@@ -121,26 +90,19 @@ class MaximumAttemptsOneIntegrationTests {
 
     @AfterAll
     static void stopReceiver() {
-        RECEIVER.close();
+        TEST_RECEIVER.close();
     }
 
     @Test
     void configuredMaximumOfOnePermitsOnlyTheInitialAttempt() throws Exception {
-        String[] delayedTopics = {
-                WebhookRoute.WEBHOOK_EVENT_RETRY_1M_TOPIC, WebhookRoute.WEBHOOK_EVENT_RETRY_10M_TOPIC,
-                WebhookRoute.WEBHOOK_EVENT_RETRY_1H_TOPIC, WebhookRoute.WEBHOOK_EVENT_DEAD_LETTER_TOPIC
-        };
-        try (AdminClient admin = KafkaTestRecords.adminClient()) {
-            Map<TopicPartition, Long> before = KafkaTestRecords.endOffsets(admin, delayedTopics);
-            try (
-                    KafkaConsumer<String, Object> source = KafkaTestRecords.consumer(
-                            this.registryVertx, KafkaTestRecords.endOffsets(admin, WebhookRoute.WEBHOOK_EVENT_TOPIC)
-                    )
-            ) {
+        String[] delayedTopics = {WebhookRoute.WEBHOOK_EVENT_RETRY_1M_TOPIC, WebhookRoute.WEBHOOK_EVENT_RETRY_10M_TOPIC, WebhookRoute.WEBHOOK_EVENT_RETRY_1H_TOPIC, WebhookRoute.WEBHOOK_EVENT_DEAD_LETTER_TOPIC};
+        try (AdminClient adminClient = KafkaTestRecords.adminClient()) {
+            Map<TopicPartition, Long> delayedOffsetsBefore = KafkaTestRecords.endOffsets(adminClient, delayedTopics);
+            try (KafkaConsumer<String, Object> sourceKafkaConsumer = KafkaTestRecords.consumer(this.registryVertx, KafkaTestRecords.endOffsets(adminClient, WebhookRoute.WEBHOOK_EVENT_TOPIC))) {
                 String eventId = this.postEvent();
-                ConsumerRecord<String, Object> input = KafkaTestRecords.awaitRecord(source, eventId);
-                KafkaTestRecords.awaitCommit(admin, input);
-                Assertions.assertThat(RECEIVER.count(eventId)).isEqualTo(1);
+                ConsumerRecord<String, Object> inputConsumerRecord = KafkaTestRecords.awaitRecord(sourceKafkaConsumer, eventId);
+                KafkaTestRecords.awaitCommit(adminClient, inputConsumerRecord);
+                Assertions.assertThat(TEST_RECEIVER.count(eventId)).isEqualTo(1);
                 Assertions.assertThat(this.awaitAttemptRow(eventId))
                         .containsEntry("attempt_number", 1)
                         .containsEntry("outcome", "RETRYABLE_FAILURE")
@@ -148,26 +110,22 @@ class MaximumAttemptsOneIntegrationTests {
                         .containsEntry("retry_count", 0)
                         .containsEntry("replay_count", 0)
                         .containsEntry("dead_lettered", false);
-                Assertions.assertThat(KafkaTestRecords.endOffsets(admin, delayedTopics)).isEqualTo(before);
+                Assertions.assertThat(KafkaTestRecords.endOffsets(adminClient, delayedTopics)).isEqualTo(delayedOffsetsBefore);
             }
         }
     }
 
     private String postEvent() throws Exception {
-        HttpRequest request = HttpRequest.newBuilder()
+        HttpRequest httpRequest = HttpRequest.newBuilder()
                 .uri(URI.create("http://localhost:" + this.serverPort + "/api/events"))
                 .header("Content-Type", "application/json")
-                .POST(HttpRequest.BodyPublishers.ofString(
-                        "{\"eventType\":\"single-attempt.test\",\"payload\":{}}",
-                        StandardCharsets.UTF_8
-                ))
+                .POST(HttpRequest.BodyPublishers.ofString("{\"eventType\":\"single-attempt.test\",\"payload\":{}}", StandardCharsets.UTF_8))
                 .build();
 
-        HttpResponse<String> response = HttpClient.newHttpClient()
-                .send(request, HttpResponse.BodyHandlers.ofString());
+        HttpResponse<String> httpResponse = HttpClient.newHttpClient().send(httpRequest, HttpResponse.BodyHandlers.ofString());
 
-        Assertions.assertThat(response.statusCode()).isEqualTo(202);
-        return this.objectMapper.readTree(response.body()).get("eventId").asString();
+        Assertions.assertThat(httpResponse.statusCode()).isEqualTo(202);
+        return this.objectMapper.readTree(httpResponse.body()).get("eventId").asString();
     }
 
     private Map<String, Object> awaitAttemptRow(String eventId) throws InterruptedException {
@@ -189,11 +147,7 @@ class MaximumAttemptsOneIntegrationTests {
     }
 
     private int attemptRowCount(String eventId) {
-        Integer count = this.jdbcTemplate.queryForObject(
-                "SELECT count(*) FROM delivery_attempt WHERE event_id = ?::uuid",
-                Integer.class,
-                eventId
-        );
+        Integer count = this.jdbcTemplate.queryForObject("SELECT count(*) FROM delivery_attempt WHERE event_id = ?::uuid", Integer.class, eventId);
         return count == null ? 0 : count;
     }
 
@@ -203,23 +157,23 @@ class MaximumAttemptsOneIntegrationTests {
     private static final class TestReceiver implements AutoCloseable {
 
         private final HttpServer httpServer;
-        private final ExecutorService executor;
-        private final ConcurrentLinkedQueue<CapturedRequest> requests = new ConcurrentLinkedQueue<>();
+        private final ExecutorService executorService;
+        private final ConcurrentLinkedQueue<CapturedRequest> capturedRequests = new ConcurrentLinkedQueue<>();
 
         private TestReceiver(HttpServer httpServer, ExecutorService executorService) {
             this.httpServer = httpServer;
-            this.executor = executorService;
+            this.executorService = executorService;
         }
 
         static TestReceiver start() {
             try {
-                HttpServer server = HttpServer.create(new InetSocketAddress("localhost", 0), 0);
-                ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
-                TestReceiver receiver = new TestReceiver(server, executor);
-                server.createContext("/webhook", receiver::handle);
-                server.setExecutor(executor);
-                server.start();
-                return receiver;
+                HttpServer httpServer = HttpServer.create(new InetSocketAddress("localhost", 0), 0);
+                ExecutorService executorService = Executors.newVirtualThreadPerTaskExecutor();
+                TestReceiver testReceiver = new TestReceiver(httpServer, executorService);
+                httpServer.createContext("/webhook", testReceiver::handle);
+                httpServer.setExecutor(executorService);
+                httpServer.start();
+                return testReceiver;
             } catch (IOException exception) {
                 throw new IllegalStateException("Could not start maximum-attempts receiver", exception);
             }
@@ -230,21 +184,21 @@ class MaximumAttemptsOneIntegrationTests {
         }
 
         int count(String eventId) {
-            return (int) this.requests.stream().filter(request -> eventId.equals(request.webhookId())).count();
+            return (int) this.capturedRequests.stream().filter(capturedRequest -> eventId.equals(capturedRequest.webhookId())).count();
         }
 
-        private void handle(HttpExchange exchange) throws IOException {
-            exchange.getRequestBody().readAllBytes();
-            this.requests.add(new CapturedRequest(exchange.getRequestHeaders().getFirst("webhook-id")));
-            try (exchange) {
-                exchange.sendResponseHeaders(503, -1L);
+        private void handle(HttpExchange httpExchange) throws IOException {
+            httpExchange.getRequestBody().readAllBytes();
+            this.capturedRequests.add(new CapturedRequest(httpExchange.getRequestHeaders().getFirst("webhook-id")));
+            try (httpExchange) {
+                httpExchange.sendResponseHeaders(503, -1L);
             }
         }
 
         @Override
         public void close() {
             this.httpServer.stop(0);
-            this.executor.shutdownNow();
+            this.executorService.shutdownNow();
         }
     }
 }

@@ -47,18 +47,16 @@ class WebhookRouteTests {
 
     @ParameterizedTest
     @CsvSource({
-            """
-            webhook-events, RETRYABLE_FAILURE, 0, 0, NONE, webhook-events-retry-1m, HTTP/attempt/retry/commit
-            webhook-events-retry-1m, RETRYABLE_FAILURE, 1, 2, NONE, webhook-events-retry-1h, HTTP/attempt/retry/commit
-            webhook-events, RETRYABLE_FAILURE, 0, 0, ATTEMPT, , HTTP/attempt
-            webhook-events-retry-1m, RETRYABLE_FAILURE, 1, 2, ATTEMPT, , HTTP/attempt
-            webhook-events, RETRYABLE_FAILURE, 0, 0, RETRY, webhook-events-retry-1m, HTTP/attempt/retry
-            webhook-events-retry-1m, RETRYABLE_FAILURE, 1, 2, RETRY, webhook-events-retry-1h, HTTP/attempt/retry
-            webhook-events, SUCCEEDED, 0, 0, NONE, , HTTP/attempt/commit
-            webhook-events, PERMANENT_FAILURE, 0, 0, NONE, , HTTP/attempt/commit
-            webhook-events-retry-1m, RETRYABLE_FAILURE, 3, 1, NONE, , HTTP/attempt/commit
-            webhook-events-retry-1m, RETRYABLE_FAILURE, 1, 7, NONE, , HTTP/attempt/commit
-            """
+            "webhook-events, RETRYABLE_FAILURE, 0, 0, NONE, webhook-events-retry-1m, HTTP/attempt/retry/commit",
+            "webhook-events-retry-1m, RETRYABLE_FAILURE, 1, 2, NONE, webhook-events-retry-1h, HTTP/attempt/retry/commit",
+            "webhook-events, RETRYABLE_FAILURE, 0, 0, ATTEMPT, , HTTP/attempt",
+            "webhook-events-retry-1m, RETRYABLE_FAILURE, 1, 2, ATTEMPT, , HTTP/attempt",
+            "webhook-events, RETRYABLE_FAILURE, 0, 0, RETRY, webhook-events-retry-1m, HTTP/attempt/retry",
+            "webhook-events-retry-1m, RETRYABLE_FAILURE, 1, 2, RETRY, webhook-events-retry-1h, HTTP/attempt/retry",
+            "webhook-events, SUCCEEDED, 0, 0, NONE, , HTTP/attempt/commit",
+            "webhook-events, PERMANENT_FAILURE, 0, 0, NONE, , HTTP/attempt/commit",
+            "webhook-events-retry-1m, RETRYABLE_FAILURE, 3, 1, NONE, , HTTP/attempt/commit",
+            "webhook-events-retry-1m, RETRYABLE_FAILURE, 1, 7, NONE, , HTTP/attempt/commit"
     })
     void publishesOnceInOrderAndCommitsOnlyAfterRequiredSends(
             String topic,
@@ -70,108 +68,89 @@ class WebhookRouteTests {
             String expectedOperations
     ) throws Exception {
         String consumerRoute = "kafka:" + topic + "?groupId=" + topic;
-        AdviceWith.adviceWith(this.camelContext, consumerRoute, advice -> advice.replaceFromWith(INPUT));
-        AdviceWith.adviceWith(this.camelContext, WebhookRoute.WEBHOOK_DELIVERY_RESULT_DIRECT, advice -> {
-            advice.weaveByToUri("kafka:" + WebhookRoute.PERSIST_DELIVERY_ATTEMPT_TOPIC).replace().to(ATTEMPT_OUTPUT);
-            advice.weaveByToUri("kafka:" + WebhookRoute.WEBHOOK_EVENT_RETRY_1M_TOPIC).replace().to(RETRY_OUTPUT);
-            advice.interceptSendToEndpoint("kafka:" + WebhookRoute.WEBHOOK_EVENT_DEAD_LETTER_TOPIC + "*")
-                    .skipSendToOriginalEndpoint().to("mock:dead-letter");
-        });
+        AdviceWith.adviceWith(this.camelContext, consumerRoute, adviceWithRouteBuilder -> adviceWithRouteBuilder.replaceFromWith(INPUT));
+        AdviceWith.adviceWith(
+                this.camelContext,
+                WebhookRoute.WEBHOOK_DELIVERY_RESULT_DIRECT,
+                adviceWithRouteBuilder -> {
+                    adviceWithRouteBuilder.weaveByToUri("kafka:" + WebhookRoute.PERSIST_DELIVERY_ATTEMPT_TOPIC).replace().to(ATTEMPT_OUTPUT);
+                    adviceWithRouteBuilder.weaveByToUri("kafka:" + WebhookRoute.WEBHOOK_EVENT_RETRY_1M_TOPIC).replace().to(RETRY_OUTPUT);
+                    adviceWithRouteBuilder.interceptSendToEndpoint("kafka:" + WebhookRoute.WEBHOOK_EVENT_DEAD_LETTER_TOPIC + "*").skipSendToOriginalEndpoint().to("mock:dead-letter");
+                }
+        );
 
         List<String> operations = new ArrayList<>();
-        WebhookEvent webhookEvent = new WebhookEvent(
-                "event-1",
-                "order.created",
-                "tenant-1",
-                "endpoint-1",
-                Instant.EPOCH,
-                ByteBuffer.wrap(new byte[]{'{', '}'}),
-                retryCount,
-                Instant.EPOCH,
-                priorAttempts,
-                3
-        );
-        int status = switch (deliveryOutcome) {
+        WebhookEvent webhookEvent = new WebhookEvent("event-1", "order.created", "tenant-1", "endpoint-1", Instant.EPOCH, ByteBuffer.wrap(new byte[]{'{', '}'}), retryCount, Instant.EPOCH, priorAttempts, 3);
+        int httpStatus = switch (deliveryOutcome) {
             case RETRYABLE_FAILURE -> 503;
             case PERMANENT_FAILURE -> 400;
             case SUCCEEDED -> 204;
         };
         Mockito.when(this.restComponent.sendWebhook(webhookEvent)).thenAnswer(_ -> {
             operations.add("HTTP");
-            return new DeliveryAttemptResult(deliveryOutcome, status, 1L, Instant.EPOCH, Instant.EPOCH, Map.of());
+            return new DeliveryAttemptResult(deliveryOutcome, httpStatus, 1L, Instant.EPOCH, Instant.EPOCH, Map.of());
         });
-        KafkaManualCommit manualCommit = Mockito.mock(KafkaManualCommit.class);
+        KafkaManualCommit kafkaManualCommit = Mockito.mock(KafkaManualCommit.class);
         Mockito.doAnswer(_ -> {
-            operations.add("commit");
-            return null;
-        }).when(manualCommit).commit();
+                    operations.add("commit");
+                    return null;
+                })
+                .when(kafkaManualCommit)
+                .commit();
 
-        IllegalStateException failure = new IllegalStateException("producer acknowledgement failed");
-        MockEndpoint attempts = this.camelContext.getEndpoint(ATTEMPT_OUTPUT, MockEndpoint.class);
-        attempts.whenAnyExchangeReceived(_ -> {
+        IllegalStateException publicationException = new IllegalStateException("producer acknowledgement failed");
+        MockEndpoint attemptMockEndpoint = this.camelContext.getEndpoint(ATTEMPT_OUTPUT, MockEndpoint.class);
+        attemptMockEndpoint.whenAnyExchangeReceived(_ -> {
             operations.add("attempt");
             if (failedPublication == FailedPublication.ATTEMPT) {
-                throw failure;
+                throw publicationException;
             }
         });
-        MockEndpoint retries = this.camelContext.getEndpoint(RETRY_OUTPUT, MockEndpoint.class);
-        retries.whenAnyExchangeReceived(_ -> {
+        MockEndpoint retryMockEndpoint = this.camelContext.getEndpoint(RETRY_OUTPUT, MockEndpoint.class);
+        retryMockEndpoint.whenAnyExchangeReceived(_ -> {
             operations.add("retry");
             if (failedPublication == FailedPublication.RETRY) {
-                throw failure;
+                throw publicationException;
             }
         });
-        MockEndpoint deadLetters = this.camelContext.getEndpoint("mock:dead-letter", MockEndpoint.class);
+        MockEndpoint deadLetterMockEndpoint = this.camelContext.getEndpoint("mock:dead-letter", MockEndpoint.class);
         this.camelContext.start();
-        for (String routeId : List.of(
-                WebhookRoute.WEBHOOK_DELIVERY_RESULT_DIRECT,
-                WebhookRoute.WEBHOOK_DELIVERY_ATTEMPT_DIRECT,
-                WebhookRoute.WEBHOOK_RETRY_ELIGIBILITY_DIRECT,
-                consumerRoute
-        )) {
+        for (String routeId : List.of(WebhookRoute.WEBHOOK_DELIVERY_RESULT_DIRECT, WebhookRoute.WEBHOOK_DELIVERY_ATTEMPT_DIRECT, WebhookRoute.WEBHOOK_RETRY_ELIGIBILITY_DIRECT, consumerRoute)) {
             this.camelContext.getRouteController().startRoute(routeId);
         }
 
-        Throwable thrown = Assertions.catchThrowable(() -> this.producerTemplate.sendBodyAndHeaders(
-                INPUT,
-                webhookEvent,
-                Map.of(
-                        KafkaConstants.MANUAL_COMMIT, manualCommit,
-                        KafkaConstants.KEY, "wrong-inbound-key",
-                        KafkaConstants.TOPIC, topic,
-                        KafkaConstants.PARTITION, 11,
-                        "source-metadata", "discard"
+        Throwable publicationFailure = Assertions.catchThrowable(
+                () -> this.producerTemplate.sendBodyAndHeaders(
+                        INPUT,
+                        webhookEvent,
+                        Map.of(KafkaConstants.MANUAL_COMMIT, kafkaManualCommit, KafkaConstants.KEY, "wrong-inbound-key", KafkaConstants.TOPIC, topic, KafkaConstants.PARTITION, 11, "source-metadata", "discard")
                 )
-        ));
+        );
 
         if (failedPublication == FailedPublication.NONE) {
-            Assertions.assertThat(thrown).isNull();
+            Assertions.assertThat(publicationFailure).isNull();
         } else {
-            Assertions.assertThat(thrown).hasRootCause(failure);
+            Assertions.assertThat(publicationFailure).hasRootCause(publicationException);
         }
         Assertions.assertThat(operations).containsExactly(expectedOperations.split("/"));
-        Assertions.assertThat(attempts.getExchanges()).singleElement().satisfies(exchange -> {
+        Assertions.assertThat(attemptMockEndpoint.getExchanges()).singleElement().satisfies(exchange -> {
             DeliveryAttempt deliveryAttempt = exchange.getMessage().getBody(DeliveryAttempt.class);
             Assertions.assertThat(deliveryAttempt.getAttemptNumber()).isEqualTo(priorAttempts + 1);
             Assertions.assertThat(deliveryAttempt.getRetryCount()).isEqualTo(retryCount);
             Assertions.assertThat(deliveryAttempt.getReplayCount()).isEqualTo(3);
             Assertions.assertThat(deliveryAttempt.getDeadLettered()).isFalse();
-            Assertions.assertThat(exchange.getMessage().getHeaders()).containsExactlyEntriesOf(
-                    Map.of(KafkaConstants.KEY, "event-1")
-            );
+            Assertions.assertThat(exchange.getMessage().getHeaders()).containsExactlyEntriesOf(Map.of(KafkaConstants.KEY, "event-1"));
         });
         if (expectedRetryTopic != null) {
-            Assertions.assertThat(retries.getExchanges()).singleElement().satisfies(exchange -> {
-                WebhookEvent retry = exchange.getMessage().getBody(WebhookEvent.class);
-                Assertions.assertThat(retry.getEventId()).isEqualTo("event-1");
-                Assertions.assertThat(retry.getDeliveryAttemptCount()).isEqualTo(priorAttempts + 1);
-                Assertions.assertThat(retry.getRetryCount()).isEqualTo(retryCount + 1);
-                Assertions.assertThat(exchange.getMessage().getHeaders()).containsExactlyInAnyOrderEntriesOf(
-                        Map.of(KafkaConstants.KEY, "endpoint-1", KafkaConstants.OVERRIDE_TOPIC, expectedRetryTopic)
-                );
+            Assertions.assertThat(retryMockEndpoint.getExchanges()).singleElement().satisfies(exchange -> {
+                WebhookEvent retryWebhookEvent = exchange.getMessage().getBody(WebhookEvent.class);
+                Assertions.assertThat(retryWebhookEvent.getEventId()).isEqualTo("event-1");
+                Assertions.assertThat(retryWebhookEvent.getDeliveryAttemptCount()).isEqualTo(priorAttempts + 1);
+                Assertions.assertThat(retryWebhookEvent.getRetryCount()).isEqualTo(retryCount + 1);
+                Assertions.assertThat(exchange.getMessage().getHeaders()).containsExactlyInAnyOrderEntriesOf(Map.of(KafkaConstants.KEY, "endpoint-1", KafkaConstants.OVERRIDE_TOPIC, expectedRetryTopic));
             });
         }
-        Assertions.assertThat(deadLetters.getReceivedCounter()).isZero();
+        Assertions.assertThat(deadLetterMockEndpoint.getReceivedCounter()).isZero();
         Mockito.verify(this.restComponent).sendWebhook(webhookEvent);
     }
 

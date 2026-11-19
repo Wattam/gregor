@@ -14,26 +14,25 @@ class KafkaConfigurationTests {
 
     @Test
     void appliesNondefaultTopicSettings() {
-        KafkaTopicProperties properties = new KafkaTopicProperties(7, 2, Duration.ofHours(2), Duration.ofDays(3));
-        Map<NewTopic, String> expectedRetentions = getExpectedRetentions(properties);
+        KafkaTopicProperties kafkaTopicProperties = new KafkaTopicProperties(7, 2, Duration.ofHours(2), Duration.ofDays(3));
+        Map<NewTopic, String> expectedRetentions = getExpectedRetentions(kafkaTopicProperties);
 
-        expectedRetentions.forEach((topic, retention) -> {
-            Assertions.assertThat(topic.numPartitions()).as("%s partitions", topic.name()).isEqualTo(7);
-            Assertions.assertThat(topic.replicationFactor()).as("%s replicas", topic.name()).isEqualTo((short) 2);
-            Assertions.assertThat(topic.configs()).as("%s retention", topic.name())
-                    .containsEntry(TopicConfig.RETENTION_MS_CONFIG, retention);
+        expectedRetentions.forEach((newTopic, retention) -> {
+            Assertions.assertThat(newTopic.numPartitions()).as("%s partitions", newTopic.name()).isEqualTo(7);
+            Assertions.assertThat(newTopic.replicationFactor()).as("%s replicas", newTopic.name()).isEqualTo((short) 2);
+            Assertions.assertThat(newTopic.configs()).as("%s retention", newTopic.name()).containsEntry(TopicConfig.RETENTION_MS_CONFIG, retention);
         });
     }
 
-    private static @NonNull Map<NewTopic, String> getExpectedRetentions(KafkaTopicProperties properties) {
-        KafkaConfiguration configuration = new KafkaConfiguration(properties);
+    private static @NonNull Map<NewTopic, String> getExpectedRetentions(KafkaTopicProperties kafkaTopicProperties) {
+        KafkaConfiguration kafkaConfiguration = new KafkaConfiguration(kafkaTopicProperties);
         return Map.of(
-                configuration.webhookEventsTopic(), "604800000",
-                configuration.persistDeliveryAttemptTopic(), "2592000000",
-                configuration.webhookEventsRetry1mTopic(), "7200000",
-                configuration.webhookEventsRetry10mTopic(), "7200000",
-                configuration.webhookEventsRetry1hTopic(), "7200000",
-                configuration.webhookEventsDeadLetterTopic(), "259200000"
+                kafkaConfiguration.webhookEventsTopic(), "604800000",
+                kafkaConfiguration.persistDeliveryAttemptTopic(), "2592000000",
+                kafkaConfiguration.webhookEventsRetry1mTopic(), "7200000",
+                kafkaConfiguration.webhookEventsRetry10mTopic(), "7200000",
+                kafkaConfiguration.webhookEventsRetry1hTopic(), "7200000",
+                kafkaConfiguration.webhookEventsDeadLetterTopic(), "259200000"
         );
     }
 }

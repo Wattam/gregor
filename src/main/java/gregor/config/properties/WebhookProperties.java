@@ -10,13 +10,4 @@ import java.time.Duration;
 
 @Validated
 @ConfigurationProperties("gregor.webhook")
-public record WebhookProperties(
-        String tenantId,
-        String endpointId,
-        URI receiverUrl,
-        String signingSecret,
-        Duration connectionTimeout,
-        Duration responseTimeout,
-        Duration receiverTimestampTolerance,
-        @Min(1) @Max(4) int maximumAttempts
-) {}
+public record WebhookProperties(String tenantId, String endpointId, URI receiverUrl, String signingSecret, Duration connectionTimeout, Duration responseTimeout, Duration receiverTimestampTolerance, @Min(1) @Max(4) int maximumAttempts) {}

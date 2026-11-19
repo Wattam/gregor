@@ -37,6 +37,7 @@ import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.Base64;
@@ -45,6 +46,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
@@ -59,17 +61,12 @@ import java.util.concurrent.TimeoutException;
 class RetryTierConsumerIntegrationTests {
 
     private static final Instant ELIGIBILITY_INSTANT = Instant.parse("2026-07-25T12:00:00Z");
+    private static final Duration SESSION_TIMEOUT = Duration.ofSeconds(6);
     private static final String TENANT_ID = "00000000-0000-0000-0000-000000000001";
     private static final String ENDPOINT_ID = "00000000-0000-0000-0000-000000000002";
-    private static final String SIGNING_SECRET = "whsec_" + Base64.getEncoder().encodeToString(
-            "01234567890123456789012345678901".getBytes(StandardCharsets.UTF_8)
-    );
-    private static final List<String> RETRY_TOPICS = List.of(
-            WebhookRoute.WEBHOOK_EVENT_RETRY_1M_TOPIC,
-            WebhookRoute.WEBHOOK_EVENT_RETRY_10M_TOPIC,
-            WebhookRoute.WEBHOOK_EVENT_RETRY_1H_TOPIC
-    );
-    private static final TestReceiver RECEIVER = TestReceiver.start();
+    private static final String SIGNING_SECRET = "whsec_" + Base64.getEncoder().encodeToString("01234567890123456789012345678901".getBytes(StandardCharsets.UTF_8));
+    private static final List<String> RETRY_TOPICS = List.of(WebhookRoute.WEBHOOK_EVENT_RETRY_1M_TOPIC, WebhookRoute.WEBHOOK_EVENT_RETRY_10M_TOPIC, WebhookRoute.WEBHOOK_EVENT_RETRY_1H_TOPIC);
+    private static final TestReceiver TEST_RECEIVER = TestReceiver.start();
 
     @Autowired
     private CamelContext camelContext;
@@ -83,92 +80,64 @@ class RetryTierConsumerIntegrationTests {
     private WebhookService webhookService;
 
     @DynamicPropertySource
-    static void configureInfrastructure(DynamicPropertyRegistry registry) {
+    static void configureInfrastructure(DynamicPropertyRegistry dynamicPropertyRegistry) {
         String postgresHost = System.getenv().getOrDefault("POSTGRES_HOST", "localhost");
         String postgresPort = System.getenv().getOrDefault("POSTGRES_PORT", "5432");
         String postgresDatabase = System.getenv().getOrDefault("POSTGRES_DB", "gregor");
         String kafkaPort = System.getenv().getOrDefault("KAFKA_PORT", "9092");
         String registryPort = System.getenv().getOrDefault("SCHEMA_REGISTRY_PORT", "8081");
 
-        registry.add(
-                "spring.datasource.url",
-                () -> "jdbc:postgresql://" + postgresHost + ":" + postgresPort + "/" + postgresDatabase
-        );
-        registry.add("spring.datasource.username", () -> System.getenv().getOrDefault("POSTGRES_USER", "gregor"));
-        registry.add(
-                "spring.datasource.password",
-                () -> System.getenv().getOrDefault("POSTGRES_PASSWORD", "gregor")
-        );
-        registry.add("spring.jpa.hibernate.ddl-auto", () -> "update");
-        registry.add("spring.kafka.bootstrap-servers", () -> "localhost:" + kafkaPort);
-        registry.add("spring.kafka.admin.auto-create", () -> "true");
-        registry.add("camel.component.kafka.brokers", () -> "localhost:" + kafkaPort);
-        registry.add("camel.component.kafka.consumers-count", () -> "2");
-        registry.add("camel.component.kafka.auto-commit-enable", () -> "false");
-        registry.add("camel.component.kafka.allow-manual-commit", () -> "true");
-        registry.add("camel.component.kafka.break-on-first-error", () -> "true");
-        registry.add("camel.component.kafka.auto-offset-reset", () -> "earliest");
-        registry.add("camel.component.kafka.max-poll-records", () -> "1");
-        registry.add("camel.component.kafka.max-poll-interval-ms", () -> "4500000");
-        registry.add("camel.component.kafka.additional-properties[session.timeout.ms]", () -> "6000");
-        registry.add("camel.component.kafka.additional-properties[heartbeat.interval.ms]", () -> "1000");
-        registry.add("camel.main.auto-startup", () -> "true");
-        registry.add("camel.component.kafka.request-required-acks", () -> "all");
-        registry.add(
-                "camel.component.kafka.key-serializer",
-                () -> "org.apache.kafka.common.serialization.StringSerializer"
-        );
-        registry.add(
-                "camel.component.kafka.value-serializer",
-                () -> "io.apicurio.registry.serde.avro.AvroKafkaSerializer"
-        );
-        registry.add(
-                "camel.component.kafka.key-deserializer",
-                () -> "org.apache.kafka.common.serialization.StringDeserializer"
-        );
-        registry.add(
-                "camel.component.kafka.value-deserializer",
-                () -> "io.apicurio.registry.serde.avro.AvroKafkaDeserializer"
-        );
-        registry.add(
-                "camel.component.kafka.additional-properties[apicurio.registry.url]",
-                () -> "http://localhost:" + registryPort + "/apis/registry/v3"
-        );
-        registry.add("camel.component.kafka.additional-properties[apicurio.registry.auto-register]", () -> "true");
-        registry.add(
-                "camel.component.kafka.additional-properties[apicurio.registry.use-specific-avro-reader]",
-                () -> "true"
-        );
-        registry.add("gregor.kafka.listener-concurrency", () -> "2");
-        registry.add("gregor.webhook.tenant-id", () -> TENANT_ID);
-        registry.add("gregor.webhook.endpoint-id", () -> ENDPOINT_ID);
-        registry.add("gregor.webhook.receiver-url", RECEIVER::uri);
-        registry.add("gregor.webhook.signing-secret", () -> SIGNING_SECRET);
-        registry.add("gregor.webhook.connection-timeout", () -> "2s");
-        registry.add("gregor.webhook.response-timeout", () -> "5s");
-        registry.add("gregor.webhook.receiver-timestamp-tolerance", () -> "5m");
+        dynamicPropertyRegistry.add("spring.datasource.url", () -> "jdbc:postgresql://" + postgresHost + ":" + postgresPort + "/" + postgresDatabase);
+        dynamicPropertyRegistry.add("spring.datasource.username", () -> System.getenv().getOrDefault("POSTGRES_USER", "gregor"));
+        dynamicPropertyRegistry.add("spring.datasource.password", () -> System.getenv().getOrDefault("POSTGRES_PASSWORD", "gregor"));
+        dynamicPropertyRegistry.add("spring.jpa.hibernate.ddl-auto", () -> "update");
+        dynamicPropertyRegistry.add("spring.kafka.bootstrap-servers", () -> "localhost:" + kafkaPort);
+        dynamicPropertyRegistry.add("spring.kafka.admin.auto-create", () -> "true");
+        dynamicPropertyRegistry.add("camel.component.kafka.brokers", () -> "localhost:" + kafkaPort);
+        dynamicPropertyRegistry.add("camel.component.kafka.consumers-count", () -> "2");
+        dynamicPropertyRegistry.add("camel.component.kafka.auto-commit-enable", () -> "false");
+        dynamicPropertyRegistry.add("camel.component.kafka.allow-manual-commit", () -> "true");
+        dynamicPropertyRegistry.add("camel.component.kafka.break-on-first-error", () -> "true");
+        dynamicPropertyRegistry.add("camel.component.kafka.auto-offset-reset", () -> "earliest");
+        dynamicPropertyRegistry.add("camel.component.kafka.max-poll-records", () -> "1");
+        dynamicPropertyRegistry.add("camel.component.kafka.max-poll-interval-ms", () -> "4500000");
+        dynamicPropertyRegistry.add("camel.component.kafka.additional-properties[session.timeout.ms]", () -> Long.toString(SESSION_TIMEOUT.toMillis()));
+        dynamicPropertyRegistry.add("camel.component.kafka.additional-properties[heartbeat.interval.ms]", () -> "1000");
+        dynamicPropertyRegistry.add("camel.main.auto-startup", () -> "true");
+        dynamicPropertyRegistry.add("camel.component.kafka.request-required-acks", () -> "all");
+        dynamicPropertyRegistry.add("camel.component.kafka.key-serializer", () -> "org.apache.kafka.common.serialization.StringSerializer");
+        dynamicPropertyRegistry.add("camel.component.kafka.value-serializer", () -> "io.apicurio.registry.serde.avro.AvroKafkaSerializer");
+        dynamicPropertyRegistry.add("camel.component.kafka.key-deserializer", () -> "org.apache.kafka.common.serialization.StringDeserializer");
+        dynamicPropertyRegistry.add("camel.component.kafka.value-deserializer", () -> "io.apicurio.registry.serde.avro.AvroKafkaDeserializer");
+        dynamicPropertyRegistry.add("camel.component.kafka.additional-properties[apicurio.registry.url]", () -> "http://localhost:" + registryPort + "/apis/registry/v3");
+        dynamicPropertyRegistry.add("camel.component.kafka.additional-properties[apicurio.registry.auto-register]", () -> "true");
+        dynamicPropertyRegistry.add("camel.component.kafka.additional-properties[apicurio.registry.use-specific-avro-reader]", () -> "true");
+        dynamicPropertyRegistry.add("gregor.kafka.listener-concurrency", () -> "2");
+        dynamicPropertyRegistry.add("gregor.webhook.tenant-id", () -> TENANT_ID);
+        dynamicPropertyRegistry.add("gregor.webhook.endpoint-id", () -> ENDPOINT_ID);
+        dynamicPropertyRegistry.add("gregor.webhook.receiver-url", TEST_RECEIVER::uri);
+        dynamicPropertyRegistry.add("gregor.webhook.signing-secret", () -> SIGNING_SECRET);
+        dynamicPropertyRegistry.add("gregor.webhook.connection-timeout", () -> "2s");
+        dynamicPropertyRegistry.add("gregor.webhook.response-timeout", () -> "5s");
+        dynamicPropertyRegistry.add("gregor.webhook.receiver-timestamp-tolerance", () -> "5m");
     }
 
     @BeforeEach
     void resetState() {
-        RECEIVER.reset();
+        TEST_RECEIVER.reset();
     }
 
     @AfterAll
     static void stopReceiver() {
-        RECEIVER.close();
+        TEST_RECEIVER.close();
     }
 
     @Test
     void registersOneSeparateActiveConsumerGroupForEveryRetryTier() throws Exception {
         try (AdminClient adminClient = KafkaTestRecords.adminClient()) {
             for (String retryTopic : RETRY_TOPICS) {
-                ConsumerGroupDescription description = this.awaitActiveConsumerGroup(adminClient, retryTopic);
-                Assertions.assertThat(description.members()).allSatisfy(member ->
-                        Assertions.assertThat(member.assignment().topicPartitions())
-                                .extracting(TopicPartition::topic)
-                                .containsOnly(retryTopic)
-                );
+                ConsumerGroupDescription consumerGroupDescription = this.awaitActiveConsumerGroup(adminClient, retryTopic);
+                Assertions.assertThat(consumerGroupDescription.members()).allSatisfy(memberDescription -> Assertions.assertThat(memberDescription.assignment().topicPartitions()).extracting(TopicPartition::topic).containsOnly(retryTopic));
             }
         }
     }
@@ -177,13 +146,8 @@ class RetryTierConsumerIntegrationTests {
     void acceptsARetryRecordExactlyAtTheEligibilityInstantWithoutAPositiveWait() throws Exception {
         WebhookEvent webhookEvent = event("exact-eligibility.test", 0, 7, 3, ELIGIBILITY_INSTANT);
         this.send(WebhookRoute.WEBHOOK_EVENT_RETRY_10M_TOPIC, webhookEvent);
-        Map<String, Object> row = this.awaitAttemptRow(webhookEvent.getEventId());
-        Assertions.assertThat(row)
-                .containsEntry("attempt_number", 1)
-                .containsEntry("outcome", "SUCCEEDED")
-                .containsEntry("retry_count", 7)
-                .containsEntry("replay_count", 3)
-                .containsEntry("dead_lettered", false);
+        Map<String, Object> attemptColumns = this.awaitAttemptRow(webhookEvent.getEventId());
+        Assertions.assertThat(attemptColumns).containsEntry("attempt_number", 1).containsEntry("outcome", "SUCCEEDED").containsEntry("retry_count", 7).containsEntry("replay_count", 3).containsEntry("dead_lettered", false);
     }
 
     @Test
@@ -196,17 +160,13 @@ class RetryTierConsumerIntegrationTests {
         this.camelContext.getRouteController().stopRoute(routeId);
         try {
             this.send(topic, webhookEvent);
-            Assertions.assertThat(RECEIVER.count(webhookEvent.getEventId())).isZero();
+            Assertions.assertThat(TEST_RECEIVER.count(webhookEvent.getEventId())).isZero();
             Assertions.assertThat(this.attemptRowCount(webhookEvent.getEventId())).isZero();
 
             this.camelContext.getRouteController().startRoute(routeId);
             routeRestarted = true;
-            RECEIVER.awaitRequest(webhookEvent.getEventId(), 1);
-            Assertions.assertThat(this.awaitAttemptRow(webhookEvent.getEventId()))
-                    .containsEntry("attempt_number", 3)
-                    .containsEntry("outcome", "SUCCEEDED")
-                    .containsEntry("retry_count", 2)
-                    .containsEntry("replay_count", 1);
+            TEST_RECEIVER.awaitRequest(webhookEvent.getEventId(), 1);
+            Assertions.assertThat(this.awaitAttemptRow(webhookEvent.getEventId())).containsEntry("attempt_number", 3).containsEntry("outcome", "SUCCEEDED").containsEntry("retry_count", 2).containsEntry("replay_count", 1);
         } finally {
             if (!routeRestarted) {
                 this.camelContext.getRouteController().startRoute(routeId);
@@ -217,42 +177,41 @@ class RetryTierConsumerIntegrationTests {
     @Test
     void eligibilityWaitBlocksOnlyThePartitionsAssignedToTheWaitingConsumer() throws Exception {
         String topic = WebhookRoute.WEBHOOK_EVENT_RETRY_1H_TOPIC;
-        RetryPartitionSelection partitions = this.retryPartitionSelection(topic);
-        WebhookEvent waiting = event("waiting-tier.test", 0, 1, 0, ELIGIBILITY_INSTANT.plusSeconds(1));
-        WebhookEvent sameConsumer = event("same-consumer.test", 0, 2, 0, ELIGIBILITY_INSTANT);
-        WebhookEvent otherConsumer = event("other-consumer.test", 1, 2, 0, ELIGIBILITY_INSTANT);
-        WebhookEvent otherTier = event("other-tier.test", 1, 1, 0, ELIGIBILITY_INSTANT);
-        WebhookEvent source = event("source-progress.test", 0, 0, 0, ELIGIBILITY_INSTANT.plusSeconds(3_600));
-        CountDownLatch waitingStarted = new CountDownLatch(1);
-        CountDownLatch releaseWait = new CountDownLatch(1);
+        RetryPartitionSelection retryPartitionSelection = this.retryPartitionSelection(topic);
+        WebhookEvent waitingWebhookEvent = event("waiting-tier.test", 0, 1, 0, ELIGIBILITY_INSTANT.plusSeconds(1));
+        WebhookEvent sameConsumerWebhookEvent = event("same-consumer.test", 0, 2, 0, ELIGIBILITY_INSTANT);
+        WebhookEvent otherConsumerWebhookEvent = event("other-consumer.test", 1, 2, 0, ELIGIBILITY_INSTANT);
+        WebhookEvent otherTierWebhookEvent = event("other-tier.test", 1, 1, 0, ELIGIBILITY_INSTANT);
+        WebhookEvent sourceWebhookEvent = event("source-progress.test", 0, 0, 0, ELIGIBILITY_INSTANT.plusSeconds(3_600));
+        CountDownLatch waitingStartedCountDownLatch = new CountDownLatch(1);
+        CountDownLatch releaseWaitCountDownLatch = new CountDownLatch(1);
         Mockito.doAnswer(_ -> {
-            waitingStarted.countDown();
-            if (!releaseWait.await(30, TimeUnit.SECONDS)) {
-                throw new AssertionError("Eligibility wait was not released");
-            }
-            return null;
-        }).when(this.webhookService).awaitEligibility(Mockito.argThat(
-                message -> waiting.getEventId().equals(message.webhookEvent().getEventId())
-        ));
+                    waitingStartedCountDownLatch.countDown();
+                    if (!releaseWaitCountDownLatch.await(30, TimeUnit.SECONDS)) {
+                        throw new AssertionError("Eligibility wait was not released");
+                    }
+                    return null;
+                })
+                .when(this.webhookService).awaitEligibility(Mockito.argThat(webhookRouteMessage -> waitingWebhookEvent.getEventId().equals(webhookRouteMessage.webhookEvent().getEventId())));
 
         try {
-            this.send(topic, waiting, partitions.waitingPartition());
-            Assertions.assertThat(waitingStarted.await(15, TimeUnit.SECONDS)).isTrue();
-            this.send(topic, sameConsumer, partitions.sameConsumerPartition());
-            this.send(topic, otherConsumer, partitions.otherConsumerPartition());
-            this.send(WebhookRoute.WEBHOOK_EVENT_RETRY_1M_TOPIC, otherTier);
-            this.send(WebhookRoute.WEBHOOK_EVENT_TOPIC, source);
+            this.send(topic, waitingWebhookEvent, retryPartitionSelection.waitingPartition());
+            Assertions.assertThat(waitingStartedCountDownLatch.await(15, TimeUnit.SECONDS)).isTrue();
+            this.send(topic, sameConsumerWebhookEvent, retryPartitionSelection.sameConsumerPartition());
+            this.send(topic, otherConsumerWebhookEvent, retryPartitionSelection.otherConsumerPartition());
+            this.send(WebhookRoute.WEBHOOK_EVENT_RETRY_1M_TOPIC, otherTierWebhookEvent);
+            this.send(WebhookRoute.WEBHOOK_EVENT_TOPIC, sourceWebhookEvent);
 
-            for (WebhookEvent independent : List.of(otherConsumer, otherTier, source)) {
-                RECEIVER.awaitRequest(independent.getEventId(), 1);
+            for (WebhookEvent independentWebhookEvent : List.of(otherConsumerWebhookEvent, otherTierWebhookEvent, sourceWebhookEvent)) {
+                TEST_RECEIVER.awaitRequest(independentWebhookEvent.getEventId(), 1);
             }
-            Assertions.assertThat(RECEIVER.count(waiting.getEventId())).isZero();
-            Assertions.assertThat(RECEIVER.count(sameConsumer.getEventId())).isZero();
+            Assertions.assertThat(TEST_RECEIVER.count(waitingWebhookEvent.getEventId())).isZero();
+            Assertions.assertThat(TEST_RECEIVER.count(sameConsumerWebhookEvent.getEventId())).isZero();
         } finally {
-            releaseWait.countDown();
+            releaseWaitCountDownLatch.countDown();
         }
 
-        for (WebhookEvent webhookEvent : List.of(waiting, sameConsumer, otherConsumer, otherTier, source)) {
+        for (WebhookEvent webhookEvent : List.of(waitingWebhookEvent, sameConsumerWebhookEvent, otherConsumerWebhookEvent, otherTierWebhookEvent, sourceWebhookEvent)) {
             this.awaitAttemptRows(webhookEvent.getEventId(), 1);
         }
     }
@@ -260,68 +219,59 @@ class RetryTierConsumerIntegrationTests {
     @Test
     void keepsHeartbeatingWhileEligibilityWaitExceedsTheSessionTimeout() throws Exception {
         String topic = WebhookRoute.WEBHOOK_EVENT_RETRY_1H_TOPIC;
-        RetryPartitionSelection partitions = this.retryPartitionSelection(topic);
-        TopicPartition waitingPartition = new TopicPartition(topic, partitions.waitingPartition());
+        RetryPartitionSelection retryPartitionSelection = this.retryPartitionSelection(topic);
+        TopicPartition waitingTopicPartition = new TopicPartition(topic, retryPartitionSelection.waitingPartition());
         String initialConsumerId;
         try (AdminClient adminClient = KafkaTestRecords.adminClient()) {
-            ConsumerGroupDescription description = this.awaitActiveConsumerGroup(adminClient, topic);
-            initialConsumerId = ownerId(description, waitingPartition);
+            ConsumerGroupDescription consumerGroupDescription = this.awaitActiveConsumerGroup(adminClient, topic);
+            initialConsumerId = ownerId(consumerGroupDescription, waitingTopicPartition);
         }
-        WebhookEvent waiting = event(
-                "heartbeat-wait.test",
-                0,
-                1,
-                0,
-                ELIGIBILITY_INSTANT.plusSeconds(10)
-        );
+        WebhookEvent waitingWebhookEvent = event("heartbeat-wait.test", 0, 1, 0, ELIGIBILITY_INSTANT.plusSeconds(10));
 
-        this.send(topic, waiting, waitingPartition.partition());
-        Mockito.verify(this.webhookService, Mockito.timeout(5_000)).awaitEligibility(Mockito.argThat(message ->
-                waiting.getEventId().equals(message.webhookEvent().getEventId())
-        ));
-        Thread.sleep(7_000L);
+        CompletableFuture<Duration> eligibilityWaitFuture = new CompletableFuture<>();
+        Mockito.doAnswer(invocationOnMock -> {
+                    long waitStartedAtNanos = System.nanoTime();
+                    invocationOnMock.callRealMethod();
+                    eligibilityWaitFuture.complete(Duration.ofNanos(System.nanoTime() - waitStartedAtNanos));
+                    return null;
+                })
+                .when(this.webhookService).awaitEligibility(Mockito.argThat(webhookRouteMessage -> waitingWebhookEvent.getEventId().equals(webhookRouteMessage.webhookEvent().getEventId())));
 
-        Assertions.assertThat(RECEIVER.count(waiting.getEventId())).isZero();
+        this.send(topic, waitingWebhookEvent, waitingTopicPartition.partition());
+        Assertions.assertThat(eligibilityWaitFuture.get(20, TimeUnit.SECONDS)).isGreaterThan(SESSION_TIMEOUT);
+        TEST_RECEIVER.awaitRequest(waitingWebhookEvent.getEventId(), 1);
         try (AdminClient adminClient = KafkaTestRecords.adminClient()) {
-            ConsumerGroupDescription description = this.awaitActiveConsumerGroup(adminClient, topic);
-            Assertions.assertThat(ownerId(description, waitingPartition)).isEqualTo(initialConsumerId);
+            ConsumerGroupDescription consumerGroupDescription = this.awaitActiveConsumerGroup(adminClient, topic);
+            Assertions.assertThat(ownerId(consumerGroupDescription, waitingTopicPartition)).isEqualTo(initialConsumerId);
         }
 
-        RECEIVER.awaitRequest(waiting.getEventId(), 1);
-        Assertions.assertThat(this.awaitAttemptRow(waiting.getEventId())).containsEntry("attempt_number", 1);
+        Assertions.assertThat(this.awaitAttemptRow(waitingWebhookEvent.getEventId())).containsEntry("attempt_number", 1);
     }
 
     @Test
     void auditsOneAttemptAndCommitsWithoutASuccessorWhenNoHigherTierExists() throws Exception {
-        WebhookEvent event = event("cumulative-retry.test", 1, 7, 3, ELIGIBILITY_INSTANT);
-        WebhookEvent unrelated = event("unrelated-retry.test", 1, 7, 3, ELIGIBILITY_INSTANT);
-        RECEIVER.failOnly(event.getEventId());
+        WebhookEvent webhookEvent = event("cumulative-retry.test", 1, 7, 3, ELIGIBILITY_INSTANT);
+        WebhookEvent unrelatedWebhookEvent = event("unrelated-retry.test", 1, 7, 3, ELIGIBILITY_INSTANT);
+        TEST_RECEIVER.failOnly(webhookEvent.getEventId());
         String inputTopic = WebhookRoute.WEBHOOK_EVENT_RETRY_1M_TOPIC;
-        String[] delayedTopics = {
-                inputTopic, WebhookRoute.WEBHOOK_EVENT_RETRY_10M_TOPIC, WebhookRoute.WEBHOOK_EVENT_RETRY_1H_TOPIC,
-                WebhookRoute.WEBHOOK_EVENT_DEAD_LETTER_TOPIC
-        };
+        String[] delayedTopics = {inputTopic, WebhookRoute.WEBHOOK_EVENT_RETRY_10M_TOPIC, WebhookRoute.WEBHOOK_EVENT_RETRY_1H_TOPIC, WebhookRoute.WEBHOOK_EVENT_DEAD_LETTER_TOPIC};
         try (AdminClient adminClient = KafkaTestRecords.adminClient()) {
             Map<TopicPartition, Long> offsets = KafkaTestRecords.endOffsets(adminClient, delayedTopics);
-            try (KafkaConsumer<String, Object> input = KafkaTestRecords.consumer(this.registryVertx, offsets)) {
-                for (WebhookEvent message : List.of(unrelated, event)) {
-                    this.send(inputTopic, message);
-                    KafkaTestRecords
-                            .awaitCommit(adminClient, KafkaTestRecords.awaitRecord(input, message.getEventId()));
+            try (KafkaConsumer<String, Object> inputKafkaConsumer = KafkaTestRecords.consumer(this.registryVertx, offsets)) {
+                for (WebhookEvent webhookEventToSend : List.of(unrelatedWebhookEvent, webhookEvent)) {
+                    this.send(inputTopic, webhookEventToSend);
+                    KafkaTestRecords.awaitCommit(adminClient, KafkaTestRecords.awaitRecord(inputKafkaConsumer, webhookEventToSend.getEventId()));
                 }
                 Map<TopicPartition, Long> expectedOffsets = new HashMap<>(offsets);
                 expectedOffsets.compute(new TopicPartition(inputTopic, 0), (_, offset) -> offset + 2);
-                Assertions.assertThat(KafkaTestRecords.endOffsets(adminClient, delayedTopics))
-                        .isEqualTo(expectedOffsets);
+                Assertions.assertThat(KafkaTestRecords.endOffsets(adminClient, delayedTopics)).isEqualTo(expectedOffsets);
             }
         } finally {
-            RECEIVER.clearRetryableFailure();
+            TEST_RECEIVER.clearRetryableFailure();
         }
-        Assertions.assertThat(this.awaitAttemptRow(unrelated.getEventId()))
-                .containsEntry("outcome", "SUCCEEDED")
-                .containsEntry("http_status", 204);
-        Assertions.assertThat(RECEIVER.count(event.getEventId())).isEqualTo(1);
-        Assertions.assertThat(this.awaitAttemptRow(event.getEventId()))
+        Assertions.assertThat(this.awaitAttemptRow(unrelatedWebhookEvent.getEventId())).containsEntry("outcome", "SUCCEEDED").containsEntry("http_status", 204);
+        Assertions.assertThat(TEST_RECEIVER.count(webhookEvent.getEventId())).isEqualTo(1);
+        Assertions.assertThat(this.awaitAttemptRow(webhookEvent.getEventId()))
                 .containsEntry("attempt_number", 2)
                 .containsEntry("outcome", "RETRYABLE_FAILURE")
                 .containsEntry("http_status", 503)
@@ -330,53 +280,40 @@ class RetryTierConsumerIntegrationTests {
                 .containsEntry("dead_lettered", false);
     }
 
-    private static String ownerId(
-            ConsumerGroupDescription description,
-            TopicPartition partition
-    ) {
-        return description.members().stream()
-                .filter(member -> member.assignment().topicPartitions().contains(partition))
+    private static String ownerId(ConsumerGroupDescription consumerGroupDescription, TopicPartition topicPartition) {
+        return consumerGroupDescription
+                .members()
+                .stream()
+                .filter(memberDescription -> memberDescription.assignment().topicPartitions().contains(topicPartition))
                 .map(MemberDescription::consumerId)
                 .findFirst()
-                .orElseThrow(() -> new AssertionError("No consumer owns " + partition));
+                .orElseThrow(() -> new AssertionError("No consumer owns " + topicPartition));
     }
 
     private RetryPartitionSelection retryPartitionSelection(String topic) throws Exception {
         try (AdminClient adminClient = KafkaTestRecords.adminClient()) {
-            ConsumerGroupDescription description = this.awaitActiveConsumerGroup(adminClient, topic);
-            List<List<TopicPartition>> memberAssignments = description.members().stream()
-                    .map(member -> member.assignment().topicPartitions().stream()
-                            .filter(partition -> topic.equals(partition.topic()))
-                            .sorted(Comparator.comparingInt(TopicPartition::partition))
-                            .toList())
+            ConsumerGroupDescription consumerGroupDescription = this.awaitActiveConsumerGroup(adminClient, topic);
+            List<List<TopicPartition>> memberAssignments = consumerGroupDescription
+                    .members()
+                    .stream()
+                    .map(memberDescription -> memberDescription.assignment().topicPartitions().stream().filter(topicPartition -> topic.equals(topicPartition.topic())).sorted(Comparator.comparingInt(TopicPartition::partition)).toList())
                     .filter(partitions -> !partitions.isEmpty())
                     .toList();
             Assertions.assertThat(memberAssignments).hasSize(2);
             Assertions.assertThat(memberAssignments.getFirst()).hasSizeGreaterThanOrEqualTo(2);
-            return new RetryPartitionSelection(
-                    memberAssignments.getFirst().getFirst().partition(),
-                    memberAssignments.getFirst().get(1).partition(),
-                    memberAssignments.get(1).getFirst().partition()
-            );
+            return new RetryPartitionSelection(memberAssignments.getFirst().getFirst().partition(), memberAssignments.getFirst().get(1).partition(), memberAssignments.get(1).getFirst().partition());
         }
     }
 
-    private ConsumerGroupDescription awaitActiveConsumerGroup(
-            AdminClient adminClient,
-            String groupId
-    ) throws InterruptedException {
+    private ConsumerGroupDescription awaitActiveConsumerGroup(AdminClient adminClient, String groupId) throws InterruptedException {
         Instant deadline = Instant.now().plusSeconds(15);
         while (Instant.now().isBefore(deadline)) {
             try {
-                ConsumerGroupDescription description = adminClient
-                        .describeConsumerGroups(List.of(groupId))
-                        .all()
-                        .get(2, TimeUnit.SECONDS)
-                        .get(groupId);
-                if (description.groupState() == GroupState.STABLE && description.members().size() == 2) {
-                    return description;
+                ConsumerGroupDescription consumerGroupDescription = adminClient.describeConsumerGroups(List.of(groupId)).all().get(2, TimeUnit.SECONDS).get(groupId);
+                if (consumerGroupDescription.groupState() == GroupState.STABLE && consumerGroupDescription.members().size() == 2) {
+                    return consumerGroupDescription;
                 }
-            } catch (ExecutionException | TimeoutException ignored) {
+            } catch (ExecutionException | TimeoutException exception) {
                 // The group can be absent or rebalancing while the application consumer starts.
             }
             Thread.sleep(50L);
@@ -384,16 +321,12 @@ class RetryTierConsumerIntegrationTests {
         throw new AssertionError("Expected active consumer group " + groupId);
     }
 
-    private void send(String topic, WebhookEvent event) {
-        this.send(topic, event, 0);
+    private void send(String topic, WebhookEvent webhookEvent) {
+        this.send(topic, webhookEvent, 0);
     }
 
-    private void send(String topic, WebhookEvent event, int partition) {
-        this.producerTemplate.sendBodyAndHeaders(
-                "kafka:" + topic,
-                event,
-                Map.of(KafkaConstants.KEY, event.getEndpointId(), KafkaConstants.PARTITION_KEY, partition)
-        );
+    private void send(String topic, WebhookEvent webhookEvent, int partition) {
+        this.producerTemplate.sendBodyAndHeaders("kafka:" + topic, webhookEvent, Map.of(KafkaConstants.KEY, webhookEvent.getEndpointId(), KafkaConstants.PARTITION_KEY, partition));
     }
 
     private Map<String, Object> awaitAttemptRow(String eventId) throws InterruptedException {
@@ -420,11 +353,7 @@ class RetryTierConsumerIntegrationTests {
     }
 
     private int attemptRowCount(String eventId) {
-        Integer count = this.jdbcTemplate.queryForObject(
-                "SELECT count(*) FROM delivery_attempt WHERE event_id = ?::uuid",
-                Integer.class,
-                eventId
-        );
+        Integer count = this.jdbcTemplate.queryForObject("SELECT count(*) FROM delivery_attempt WHERE event_id = ?::uuid", Integer.class, eventId);
         return count == null ? 0 : count;
     }
 
@@ -432,13 +361,7 @@ class RetryTierConsumerIntegrationTests {
         return "kafka:" + topic + "?groupId=" + topic;
     }
 
-    private static WebhookEvent event(
-            String eventType,
-            int deliveryAttemptCount,
-            int retryCount,
-            int replayCount,
-            Instant nextEligibleAt
-    ) {
+    private static WebhookEvent event(String eventType, int deliveryAttemptCount, int retryCount, int replayCount, Instant nextEligibleAt) {
         return new WebhookEvent(
                 UUID.randomUUID().toString(),
                 eventType,
@@ -463,11 +386,7 @@ class RetryTierConsumerIntegrationTests {
         }
     }
 
-    private record RetryPartitionSelection(
-            int waitingPartition,
-            int sameConsumerPartition,
-            int otherConsumerPartition
-    ) {
+    private record RetryPartitionSelection(int waitingPartition, int sameConsumerPartition, int otherConsumerPartition) {
     }
 
     private record CapturedRequest(String webhookId) {
@@ -477,7 +396,7 @@ class RetryTierConsumerIntegrationTests {
 
         private final HttpServer httpServer;
         private final ExecutorService executorService;
-        private final ConcurrentLinkedQueue<CapturedRequest> requests = new ConcurrentLinkedQueue<>();
+        private final ConcurrentLinkedQueue<CapturedRequest> capturedRequests = new ConcurrentLinkedQueue<>();
         private volatile String retryableEventId;
 
         private TestReceiver(HttpServer httpServer, ExecutorService executorService) {
@@ -487,13 +406,13 @@ class RetryTierConsumerIntegrationTests {
 
         static TestReceiver start() {
             try {
-                HttpServer server = HttpServer.create(new InetSocketAddress("localhost", 0), 0);
-                ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
-                TestReceiver receiver = new TestReceiver(server, executor);
-                server.createContext("/webhook", receiver::handle);
-                server.setExecutor(executor);
-                server.start();
-                return receiver;
+                HttpServer httpServer = HttpServer.create(new InetSocketAddress("localhost", 0), 0);
+                ExecutorService executorService = Executors.newVirtualThreadPerTaskExecutor();
+                TestReceiver testReceiver = new TestReceiver(httpServer, executorService);
+                httpServer.createContext("/webhook", testReceiver::handle);
+                httpServer.setExecutor(executorService);
+                httpServer.start();
+                return testReceiver;
             } catch (IOException exception) {
                 throw new IllegalStateException("Could not start retry-tier receiver", exception);
             }
@@ -512,14 +431,12 @@ class RetryTierConsumerIntegrationTests {
         }
 
         void reset() {
-            this.requests.clear();
+            this.capturedRequests.clear();
             this.clearRetryableFailure();
         }
 
         int count(String eventId) {
-            return (int) this.requests.stream()
-                    .filter(request -> eventId.equals(request.webhookId()))
-                    .count();
+            return (int) this.capturedRequests.stream().filter(capturedRequest -> eventId.equals(capturedRequest.webhookId())).count();
         }
 
         void awaitRequest(String eventId, int expectedCount) throws InterruptedException {
@@ -533,12 +450,12 @@ class RetryTierConsumerIntegrationTests {
             throw new AssertionError("Expected " + expectedCount + " requests for event " + eventId);
         }
 
-        private void handle(HttpExchange exchange) throws IOException {
-            exchange.getRequestBody().readAllBytes();
-            String eventId = exchange.getRequestHeaders().getFirst("webhook-id");
-            this.requests.add(new CapturedRequest(eventId));
-            try (exchange) {
-                exchange.sendResponseHeaders(eventId != null && eventId.equals(this.retryableEventId) ? 503 : 204, -1L);
+        private void handle(HttpExchange httpExchange) throws IOException {
+            httpExchange.getRequestBody().readAllBytes();
+            String eventId = httpExchange.getRequestHeaders().getFirst("webhook-id");
+            this.capturedRequests.add(new CapturedRequest(eventId));
+            try (httpExchange) {
+                httpExchange.sendResponseHeaders(eventId != null && eventId.equals(this.retryableEventId) ? 503 : 204, -1L);
             }
         }
 

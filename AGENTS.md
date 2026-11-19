@@ -8,7 +8,10 @@
 - Prefer newer finalized JDK features when they simplify the code. Never use preview or incubator features.
 - Name fields, parameters, and locals after their declared type (`ObjectMapper objectMapper`). If several variables share a type, prefix their roles (`receivedWebhookEvent`, `attemptedWebhookEvent`). Apply the same rule to constants in uppercase snake case (`TEST_RECEIVER`).
 - Use plural names for collections, maps, arrays, and similar containers (`List<WebhookEvent> webhookEvents`). Use descriptive names for primitives, boxed primitives, `String`, `Object`, and value types such as `UUID`, `Instant`, and `Duration`.
-- Limit lines to 240 columns. For calls and declarations, put all arguments or parameters on one line or exactly one per line. Never mix. Put `)` on its own line when wrapping inside the parentheses. Break chains before the dot.
+- Limit lines to 240 columns. Keep arguments and parameters on one line or put exactly one per line. Put `)` on its own line when wrapping the list, not when only a lambda body wraps.
+- Keep a method chain on one line or put each chained call on its own line, breaking before the leading dot. Keep the receiver or initial call on the first line (`Assertions.assertThat(...)`). Camel EIPs follow the rule below.
+- In wrapped map factory calls, keep each key and value together. Put exactly one pair per line.
+- Keep array initializers on one line or put exactly one element per line with `}` on its own line. For a wrapped `@ValueSource` array, keep `{` on the annotation line and close with `})`.
 - Qualify instance members with `this.` or `super.`. Qualify external statics with their declaring class; leave own statics unqualified. Never use static imports.
 - Use Lombok `@Slf4j` with bracketed fields: `log.info("Published event [id={}]", eventId)`.
 - Format Camel routes as EIP trees between `// @formatter:off` and `// @formatter:on`. Indent nested steps four spaces, align `.end()` with its opener, and keep each EIP's calls together (`.choice().when().method(...)`).

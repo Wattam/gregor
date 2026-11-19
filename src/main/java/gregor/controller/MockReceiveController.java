@@ -23,11 +23,7 @@ public class MockReceiveController {
     private final long timestampToleranceSeconds;
     private final Clock clock;
 
-    public MockReceiveController(
-            SignatureComponent signatureComponent,
-            WebhookProperties webhookProperties,
-            Clock clock
-    ) {
+    public MockReceiveController(SignatureComponent signatureComponent, WebhookProperties webhookProperties, Clock clock) {
         if (webhookProperties.receiverTimestampTolerance().isNegative()) {
             throw new IllegalArgumentException("Webhook timestamp tolerance must not be negative");
         }
@@ -38,51 +34,51 @@ public class MockReceiveController {
 
     @PostMapping
     public ResponseEntity<Void> receive(
-            @RequestBody byte[] body,
+            @RequestBody byte[] bodyBytes,
             @RequestHeader(name = "webhook-id", required = false) String webhookId,
-            @RequestHeader(name = "webhook-timestamp", required = false) String timestamp,
-            @RequestHeader(name = "webhook-signature", required = false) String signature
+            @RequestHeader(name = "webhook-timestamp", required = false) String timestampHeader,
+            @RequestHeader(name = "webhook-signature", required = false) String signatureHeader
     ) {
-        if (this.verify(webhookId, timestamp, signature, body)) {
+        if (this.verify(webhookId, timestampHeader, signatureHeader, bodyBytes)) {
             return ResponseEntity.noContent().build();
         }
         return ResponseEntity.status(401).build();
     }
 
-    private boolean verify(String webhookId, String timestamp, String signatures, byte[] body) {
-        if (webhookId == null || timestamp == null || signatures == null || body == null) {
+    private boolean verify(String webhookId, String timestampHeader, String signatureHeader, byte[] bodyBytes) {
+        if (webhookId == null || timestampHeader == null || signatureHeader == null || bodyBytes == null) {
             return false;
         }
 
-        long timestampValue;
+        long webhookTimestamp;
         try {
-            timestampValue = Long.parseLong(timestamp);
-        } catch (NumberFormatException exception) {
+            webhookTimestamp = Long.parseLong(timestampHeader);
+        } catch (NumberFormatException _) {
             return false;
         }
-        long now = this.clock.instant().getEpochSecond();
-        long difference;
+        long currentTimestamp = this.clock.instant().getEpochSecond();
+        long timestampDifference;
         try {
-            difference = Math.subtractExact(timestampValue, now);
-        } catch (ArithmeticException exception) {
+            timestampDifference = Math.subtractExact(webhookTimestamp, currentTimestamp);
+        } catch (ArithmeticException _) {
             return false;
         }
-        if (difference < -this.timestampToleranceSeconds || difference > this.timestampToleranceSeconds) {
+        if (timestampDifference < -this.timestampToleranceSeconds || timestampDifference > this.timestampToleranceSeconds) {
             return false;
         }
 
-        String expectedSignature = this.signatureComponent.sign(webhookId, timestampValue, body);
-        byte[] expected = Base64.getDecoder().decode(expectedSignature.substring(SIGNATURE_PREFIX.length()));
-        for (String signature : signatures.split(" +")) {
-            if (!signature.startsWith(SIGNATURE_PREFIX)) {
+        String expectedSignature = this.signatureComponent.sign(webhookId, webhookTimestamp, bodyBytes);
+        byte[] expectedSignatureBytes = Base64.getDecoder().decode(expectedSignature.substring(SIGNATURE_PREFIX.length()));
+        for (String candidateSignature : signatureHeader.split(" +")) {
+            if (!candidateSignature.startsWith(SIGNATURE_PREFIX)) {
                 continue;
             }
             try {
-                byte[] candidate = Base64.getDecoder().decode(signature.substring(SIGNATURE_PREFIX.length()));
-                if (MessageDigest.isEqual(expected, candidate)) {
+                byte[] candidateSignatureBytes = Base64.getDecoder().decode(candidateSignature.substring(SIGNATURE_PREFIX.length()));
+                if (MessageDigest.isEqual(expectedSignatureBytes, candidateSignatureBytes)) {
                     return true;
                 }
-            } catch (IllegalArgumentException exception) {
+            } catch (IllegalArgumentException _) {
                 // Inspect the remaining signatures.
             }
         }

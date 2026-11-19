@@ -40,7 +40,7 @@ public interface DeliveryAttemptRepository extends JpaRepository<DeliveryAttempt
             @Param("httpStatus") Integer httpStatus,
             @Param("latencyMs") long latencyMs,
             @Param("attemptedAt") Instant attemptedAt,
-            @Param("details") String details,
+            @Param("details") String detailsJson,
             @Param("retryCount") int retryCount,
             @Param("replayCount") int replayCount,
             @Param("deadLettered") boolean deadLettered

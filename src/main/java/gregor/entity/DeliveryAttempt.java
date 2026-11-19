@@ -22,10 +22,7 @@ import java.util.UUID;
 @Setter
 @Entity
 @NoArgsConstructor
-@Table(uniqueConstraints = @UniqueConstraint(
-        name = "uk_delivery_attempt_event_number",
-        columnNames = {"event_id", "attempt_number"}
-))
+@Table(uniqueConstraints = @UniqueConstraint(name = "uk_delivery_attempt_event_number", columnNames = {"event_id", "attempt_number"}))
 public class DeliveryAttempt {
 
     @Id

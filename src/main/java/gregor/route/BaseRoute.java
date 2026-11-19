@@ -13,29 +13,23 @@ public abstract class BaseRoute extends RouteBuilder {
 
     protected void configureErrorHandler() {
         super.errorHandler(super.defaultErrorHandler().disableRedelivery());
-        super.onException(Exception.class)
-                .maximumRedeliveries(0)
-                .logStackTrace(true)
-                .log(LoggingLevel.ERROR, "Route processing failed [routeId=${routeId}]");
+        super.onException(Exception.class).maximumRedeliveries(0).logStackTrace(true).log(LoggingLevel.ERROR, "Route processing failed [routeId=${routeId}]");
     }
 
     protected RouteDefinition routeDefinition(String uri, Class<?> inputType) {
         return super.from(uri).routeId(uri).inputType(inputType);
     }
 
-    protected String kafkaProducerUri(String topic) {
-        return "kafka:" + topic;
+    protected String kafkaProducerUri(String topicName) {
+        return "kafka:" + topicName;
     }
 
-    protected String kafkaConsumerUri(String topic) {
-        return this.kafkaProducerUri(topic) + "?groupId=" + topic;
+    protected String kafkaConsumerUri(String topicName) {
+        return this.kafkaProducerUri(topicName) + "?groupId=" + topicName;
     }
 
     protected void commitOffset(Exchange exchange) {
-        KafkaManualCommit kafkaManualCommit = exchange.getMessage().getHeader(
-                KafkaConstants.MANUAL_COMMIT,
-                KafkaManualCommit.class
-        );
+        KafkaManualCommit kafkaManualCommit = exchange.getMessage().getHeader(KafkaConstants.MANUAL_COMMIT, KafkaManualCommit.class);
         if (Objects.nonNull(kafkaManualCommit)) {
             kafkaManualCommit.commit();
         }

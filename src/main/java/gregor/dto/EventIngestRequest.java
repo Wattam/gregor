@@ -5,10 +5,7 @@ import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.NotNull;
 import tools.jackson.databind.JsonNode;
 
-public record EventIngestRequest(
-        @NotBlank String eventType,
-        @NotNull JsonNode payload
-) {
+public record EventIngestRequest(@NotBlank String eventType, @NotNull JsonNode payload) {
 
     @AssertTrue(message = "eventType must be safe for an HTTP header")
     public boolean isEventTypeHttpHeaderSafe() {

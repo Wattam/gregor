@@ -9,14 +9,7 @@ public class AvroClassSecurityInitializer implements ApplicationContextInitializ
 
     @Override
     public void initialize(@NonNull ConfigurableApplicationContext configurableApplicationContext) {
-        ClassSecurityValidator.setGlobal(ClassSecurityValidator.composite(
-                ClassSecurityValidator.DEFAULT,
-                ClassSecurityValidator
-                        .builder()
-                        .add(WebhookEvent.class)
-                        .add(DeliveryAttempt.class)
-                        .add(DeliveryOutcome.class)
-                        .build()
-        ));
+        ClassSecurityValidator.ClassSecurityPredicate avroClassSecurityPredicate = ClassSecurityValidator.builder().add(WebhookEvent.class).add(DeliveryAttempt.class).add(DeliveryOutcome.class).build();
+        ClassSecurityValidator.setGlobal(ClassSecurityValidator.composite(ClassSecurityValidator.DEFAULT, avroClassSecurityPredicate));
     }
 }
