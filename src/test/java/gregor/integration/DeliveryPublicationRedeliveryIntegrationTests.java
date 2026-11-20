@@ -8,6 +8,7 @@ import gregor.avro.WebhookEvent;
 import gregor.route.WebhookRoute;
 import io.vertx.core.Vertx;
 import org.apache.camel.CamelContext;
+import org.apache.camel.Exchange;
 import org.apache.camel.ProducerTemplate;
 import org.apache.camel.builder.AdviceWith;
 import org.apache.camel.component.kafka.DefaultKafkaClientFactory;
@@ -15,10 +16,13 @@ import org.apache.camel.component.kafka.KafkaComponent;
 import org.apache.camel.component.kafka.KafkaConstants;
 import org.apache.camel.component.kafka.consumer.KafkaManualCommit;
 import org.apache.camel.spi.RouteController;
+import org.apache.camel.spi.Synchronization;
 import org.apache.camel.test.spring.junit5.CamelSpringBootTest;
 import org.apache.camel.test.spring.junit5.UseAdviceWith;
 import org.apache.kafka.clients.admin.AdminClient;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.producer.Callback;
 import org.apache.kafka.clients.producer.KafkaProducer;
@@ -27,7 +31,9 @@ import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.clients.producer.RecordMetadata;
 import org.apache.kafka.common.TopicPartition;
 import org.assertj.core.api.Assertions;
+import org.jspecify.annotations.NonNull;
 import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.mockito.Mockito;
@@ -40,17 +46,19 @@ import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 
 import java.io.IOException;
+import java.io.PrintWriter;
+import java.io.StringWriter;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
-import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.CompletableFuture;
@@ -74,9 +82,12 @@ class DeliveryPublicationRedeliveryIntegrationTests {
 
     private static final Instant NOW = Instant.parse("2026-07-25T12:00:00.123456789Z");
     private static final String ATTEMPT_TOPIC = WebhookRoute.PERSIST_DELIVERY_ATTEMPT_TOPIC;
-    private static final String[] DELAYED_TOPICS = {WebhookRoute.WEBHOOK_EVENT_RETRY_1M_TOPIC, WebhookRoute.WEBHOOK_EVENT_RETRY_10M_TOPIC, WebhookRoute.WEBHOOK_EVENT_RETRY_1H_TOPIC, WebhookRoute.WEBHOOK_EVENT_DEAD_LETTER_TOPIC};
+    private static final String DEAD_LETTER_TOPIC = "webhook-events-dead-letter";
+    private static final String PAYLOAD_MARKER = "terminal-private-payload-marker";
+    private static final String[] DELAYED_TOPICS = {WebhookRoute.WEBHOOK_EVENT_RETRY_1M_TOPIC, WebhookRoute.WEBHOOK_EVENT_RETRY_10M_TOPIC, WebhookRoute.WEBHOOK_EVENT_RETRY_1H_TOPIC, DEAD_LETTER_TOPIC};
     private static final String SIGNING_SECRET = "whsec_MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE=";
     private static final TestReceiver TEST_RECEIVER = TestReceiver.start();
+    private static final ExpectedAudit SUCCESSFUL_AUDIT = new ExpectedAudit(DeliveryOutcome.SUCCEEDED, 204, false);
 
     @Autowired
     private CamelContext camelContext;
@@ -149,7 +160,7 @@ class DeliveryPublicationRedeliveryIntegrationTests {
                 fromSourceTopic ? 0 : 1,
                 replay
         );
-        PublicationAcknowledgements publicationAcknowledgements = new PublicationAcknowledgements(eventId, auditNumber, failedPublication);
+        PublicationAcknowledgements publicationAcknowledgements = new PublicationAcknowledgements(eventId, auditNumber, failedPublication, inputTopic, false, false, false);
         try (AdminClient adminClient = KafkaTestRecords.adminClient()) {
             this.camelContext.getComponent("kafka", KafkaComponent.class).setKafkaClientFactory(publicationAcknowledgements);
             this.observeDeliveryCommits(inputTopic, eventId, publicationAcknowledgements);
@@ -234,10 +245,221 @@ class DeliveryPublicationRedeliveryIntegrationTests {
 
                 routeController.startRoute(KafkaTestRecords.consumerRoute(ATTEMPT_TOPIC));
                 KafkaTestRecords.awaitCommit(adminClient, recoveredAttemptConsumerRecord);
-                Assertions.assertThat(this.attemptRows(eventId)).containsExactly(Map.of("attempt_number", auditNumber, "retry_count", auditRetry, "replay_count", replay, "outcome", "RETRYABLE_FAILURE"));
+                Assertions.assertThat(this.attemptRows(eventId)).containsExactly(expectedAttemptRow(auditNumber, auditRetry, replay, DeliveryOutcome.RETRYABLE_FAILURE, 503, false));
             }
             this.assertSignedRequests(eventId, payloadBytes, 3);
         }
+    }
+
+    @Test
+    void repeatsTerminalDeliveryAfterDeadLetterSendFailsBeforeStorage() throws Exception {
+        this.withTerminalDelivery(
+                TerminalInput.SOURCE,
+                FailedPublication.DEAD_LETTER,
+                Recovery.REPEAT_TERMINAL,
+                terminalDelivery -> {
+                    PendingAcknowledgement firstDeadLetterAcknowledgement = terminalDelivery.holdFirstDeadLetter();
+                    firstDeadLetterAcknowledgement.assertFailedBeforeStorage();
+                    terminalDelivery.assertDeadLetterOffsets();
+                    firstDeadLetterAcknowledgement.release();
+                    terminalDelivery.assertDeadLetterFailure();
+
+                    terminalDelivery.recoverDeadLetter();
+                    ConsumerRecord<String, Object> recoveredAttemptConsumerRecord = terminalDelivery.recoverAudit(terminalDelivery.terminalAudit);
+                    terminalDelivery.assertPersistedAudit(recoveredAttemptConsumerRecord, terminalDelivery.terminalAudit);
+                }
+        );
+    }
+
+    @Test
+    void succeedsWithoutADeadLetterAfterDeadLetterSendFailsBeforeStorage() throws Exception {
+        this.withTerminalDelivery(
+                TerminalInput.SOURCE,
+                FailedPublication.DEAD_LETTER,
+                Recovery.SUCCEED,
+                terminalDelivery -> {
+                    PendingAcknowledgement firstDeadLetterAcknowledgement = terminalDelivery.holdFirstDeadLetter();
+                    firstDeadLetterAcknowledgement.assertFailedBeforeStorage();
+                    terminalDelivery.assertDeadLetterOffsets();
+                    TEST_RECEIVER.succeed(terminalDelivery.eventId());
+                    firstDeadLetterAcknowledgement.release();
+                    terminalDelivery.assertDeadLetterFailure();
+
+                    ConsumerRecord<String, Object> recoveredAttemptConsumerRecord = terminalDelivery.recoverAudit(SUCCESSFUL_AUDIT);
+                    terminalDelivery.assertPersistedAudit(recoveredAttemptConsumerRecord, SUCCESSFUL_AUDIT);
+                }
+        );
+    }
+
+    @Test
+    void retainsTwoDeadLettersAfterLostDeadLetterAcknowledgementAndSourceRestart() throws Exception {
+        this.withTerminalDelivery(
+                TerminalInput.SOURCE,
+                FailedPublication.LOST_DEAD_LETTER_ACK,
+                Recovery.RESTART_AND_REPEAT_TERMINAL,
+                terminalDelivery -> {
+                    PendingAcknowledgement firstDeadLetterAcknowledgement = terminalDelivery.holdFirstDeadLetter();
+                    firstDeadLetterAcknowledgement.assertStoredButFailedOn(DEAD_LETTER_TOPIC);
+                    ConsumerRecord<String, Object> firstDeadLetterConsumerRecord = terminalDelivery.readDeadLetter();
+                    firstDeadLetterAcknowledgement.release();
+                    terminalDelivery.assertDeadLetterFailure();
+                    terminalDelivery.restartInputConsumer(0);
+
+                    assertLaterRecord(firstDeadLetterConsumerRecord, terminalDelivery.recoverDeadLetter());
+                    ConsumerRecord<String, Object> recoveredAttemptConsumerRecord = terminalDelivery.recoverAudit(terminalDelivery.terminalAudit);
+                    terminalDelivery.assertPersistedAudit(recoveredAttemptConsumerRecord, terminalDelivery.terminalAudit);
+                }
+        );
+    }
+
+    @Test
+    void retainsTwoDeadLettersAfterTerminalAuditSendFailsAndRetryConsumerRestarts() throws Exception {
+        this.withTerminalDelivery(
+                TerminalInput.LAST_RETRY,
+                FailedPublication.ATTEMPT,
+                Recovery.RESTART_AND_REPEAT_TERMINAL,
+                terminalDelivery -> {
+                    PendingAcknowledgement firstDeadLetterAcknowledgement = terminalDelivery.holdFirstDeadLetter();
+                    firstDeadLetterAcknowledgement.assertSucceededOn(DEAD_LETTER_TOPIC);
+                    ConsumerRecord<String, Object> firstDeadLetterConsumerRecord = terminalDelivery.readDeadLetter();
+                    firstDeadLetterAcknowledgement.release();
+
+                    PendingAcknowledgement firstAttemptAcknowledgement = terminalDelivery.holdAttempt();
+                    firstAttemptAcknowledgement.assertFailedBeforeStorage();
+                    terminalDelivery.assertNoStoredAttempts();
+                    firstAttemptAcknowledgement.release();
+                    terminalDelivery.assertAuditFailure();
+                    terminalDelivery.restartInputConsumer(1);
+
+                    assertLaterRecord(firstDeadLetterConsumerRecord, terminalDelivery.recoverDeadLetter());
+                    ConsumerRecord<String, Object> recoveredAttemptConsumerRecord = terminalDelivery.recoverAudit(terminalDelivery.terminalAudit);
+                    terminalDelivery.assertPersistedAudit(recoveredAttemptConsumerRecord, terminalDelivery.terminalAudit);
+                }
+        );
+    }
+
+    @Test
+    void succeedsButKeepsTheFirstDeadLetterAndAuditAfterLostAuditAcknowledgement() throws Exception {
+        this.withTerminalDelivery(
+                TerminalInput.LAST_RETRY,
+                FailedPublication.LOST_ATTEMPT_ACK,
+                Recovery.SUCCEED,
+                terminalDelivery -> {
+                    PendingAcknowledgement firstDeadLetterAcknowledgement = terminalDelivery.holdFirstDeadLetter();
+                    firstDeadLetterAcknowledgement.assertSucceededOn(DEAD_LETTER_TOPIC);
+                    ConsumerRecord<String, Object> firstDeadLetterConsumerRecord = terminalDelivery.readDeadLetter();
+                    firstDeadLetterAcknowledgement.release();
+
+                    PendingAcknowledgement firstAttemptAcknowledgement = terminalDelivery.holdAttempt();
+                    firstAttemptAcknowledgement.assertStoredButFailedOn(ATTEMPT_TOPIC);
+                    ConsumerRecord<String, Object> firstAttemptConsumerRecord = terminalDelivery.readAudit(terminalDelivery.terminalAudit);
+                    TEST_RECEIVER.succeed(terminalDelivery.eventId());
+                    firstAttemptAcknowledgement.release();
+                    terminalDelivery.assertAuditFailure();
+
+                    ConsumerRecord<String, Object> recoveredAttemptConsumerRecord = terminalDelivery.recoverAudit(SUCCESSFUL_AUDIT);
+                    terminalDelivery.assertDeadLetterStillRetained(firstDeadLetterConsumerRecord);
+                    assertLaterRecord(firstAttemptConsumerRecord, recoveredAttemptConsumerRecord);
+                    terminalDelivery.assertPersistedAudit(recoveredAttemptConsumerRecord, terminalDelivery.terminalAudit);
+                }
+        );
+    }
+
+    private void withTerminalDelivery(TerminalInput terminalInput, FailedPublication failedPublication, Recovery recovery, TerminalScenario terminalScenario) throws Exception {
+        AtomicReference<Instant> currentInstantReference = new AtomicReference<>(NOW);
+        Mockito.when(this.clock.instant()).thenAnswer(_ -> currentInstantReference.get());
+        WebhookEvent inputWebhookEvent = terminalInput.newEvent();
+        String eventId = inputWebhookEvent.getEventId();
+        String inputTopic = terminalInput.topic();
+        int attemptNumber = inputWebhookEvent.getDeliveryAttemptCount() + 1;
+        PublicationAcknowledgements publicationAcknowledgements = new PublicationAcknowledgements(eventId, attemptNumber, failedPublication, inputTopic, true, recovery == Recovery.SUCCEED, recovery == Recovery.RESTART_AND_REPEAT_TERMINAL);
+        this.camelContext.getComponent("kafka", KafkaComponent.class).setKafkaClientFactory(publicationAcknowledgements);
+        this.observeDeliveryCommits(inputTopic, eventId, publicationAcknowledgements);
+        this.startRoutes(inputTopic);
+        RouteController routeController = this.camelContext.getRouteController();
+        String inputRoute = KafkaTestRecords.consumerRoute(inputTopic);
+
+        try (AdminClient adminClient = KafkaTestRecords.adminClient()) {
+            TopicPartition inputTopicPartition = new TopicPartition(inputTopic, 0);
+            Map<TopicPartition, Long> inputOffsets = KafkaTestRecords.endOffsets(adminClient, inputTopic);
+            long inputOffset = inputOffsets.get(inputTopicPartition);
+            Map<TopicPartition, Long> retryOffsets = KafkaTestRecords.retryEndOffsets(adminClient);
+            TerminalOffsets terminalOffsets = new TerminalOffsets(KafkaTestRecords.endOffsets(adminClient, ATTEMPT_TOPIC), new HashMap<>(retryOffsets), new HashMap<>(KafkaTestRecords.endOffsets(adminClient, DEAD_LETTER_TOPIC)));
+            try (
+                    AutoCloseable _ = () -> {
+                        TEST_RECEIVER.succeed(eventId);
+                        publicationAcknowledgements.releaseAll();
+                        try {
+                            if (routeController.getRouteStatus(inputRoute).isStopped()) {
+                                routeController.startRoute(inputRoute);
+                            }
+                            if (KafkaTestRecords.endOffsets(adminClient, inputTopic).get(inputTopicPartition) > inputOffset) {
+                                KafkaTestRecords.awaitCommit(adminClient, inputTopicPartition, inputOffset);
+                            }
+                        } finally {
+                            KafkaTestRecords.drainRetries(adminClient, routeController, retryOffsets, currentInstantReference);
+                        }
+                    };
+                    KafkaConsumer<String, Object> inputKafkaConsumer = KafkaTestRecords.consumer(this.registryVertx, inputOffsets);
+                    KafkaConsumer<String, Object> attemptKafkaConsumer = KafkaTestRecords.consumer(this.registryVertx, terminalOffsets.attemptOffsets());
+                    KafkaConsumer<String, Object> deadLetterKafkaConsumer = KafkaTestRecords.consumer(this.registryVertx, terminalOffsets.deadLetterOffsets())
+            ) {
+                TEST_RECEIVER.fail(eventId, terminalInput.audit().httpStatus());
+                this.producerTemplate.sendBodyAndHeaders(
+                        "kafka:" + inputTopic,
+                        inputWebhookEvent,
+                        Map.of(KafkaConstants.KEY, "wrong-inbound-key", KafkaConstants.PARTITION_KEY, 0, "source-metadata", "discard", "webhook-signature", "discard", "signing-secret", "discard")
+                );
+                ConsumerRecord<String, Object> inputConsumerRecord = KafkaTestRecords.awaitRecord(inputKafkaConsumer, eventId);
+                Assertions.assertThat(inputConsumerRecord.key()).isEqualTo("wrong-inbound-key");
+                Assertions.assertThat(inputConsumerRecord.headers().lastHeader("source-metadata")).isNotNull();
+                if (terminalInput == TerminalInput.LAST_RETRY) {
+                    countRecord(terminalOffsets.retryOffsets(), inputConsumerRecord);
+                }
+
+                terminalScenario.run(new TerminalDelivery(
+                        adminClient,
+                        inputConsumerRecord,
+                        WebhookEvent.newBuilder(inputWebhookEvent).setDeliveryAttemptCount(attemptNumber).build(),
+                        terminalInput.audit(),
+                        publicationAcknowledgements,
+                        terminalOffsets,
+                        attemptKafkaConsumer,
+                        deadLetterKafkaConsumer
+                ));
+            }
+        }
+    }
+
+    private static void assertLaterRecord(ConsumerRecord<String, Object> firstConsumerRecord, ConsumerRecord<String, Object> laterConsumerRecord) {
+        Assertions.assertThat(laterConsumerRecord.partition()).isEqualTo(firstConsumerRecord.partition());
+        Assertions.assertThat(laterConsumerRecord.offset()).isGreaterThan(firstConsumerRecord.offset());
+    }
+
+    private static ConsumerRecord<String, Object> assertRetainedDeadLetter(KafkaConsumer<String, Object> deadLetterKafkaConsumer, WebhookEvent expectedWebhookEvent) {
+        ConsumerRecord<String, Object> consumerRecord = KafkaTestRecords.awaitRecord(deadLetterKafkaConsumer, expectedWebhookEvent.getEventId());
+        Assertions.assertThat(consumerRecord.topic()).isEqualTo(DEAD_LETTER_TOPIC);
+        Assertions.assertThat(consumerRecord.key()).isEqualTo(expectedWebhookEvent.getEndpointId());
+        Assertions.assertThat(consumerRecord.value()).isEqualTo(expectedWebhookEvent);
+        Assertions.assertThat(consumerRecord.headers()).allSatisfy(header -> Assertions.assertThat(header.key()).startsWith("apicurio."));
+        return consumerRecord;
+    }
+
+    private static void assertSanitizedDeadLetterFailure(Throwable throwable) {
+        Throwable cause = rootCause(throwable);
+        Assertions.assertThat(cause).isInstanceOf(IllegalStateException.class).hasMessage("Dead-letter publication failed [topic=webhook-events-dead-letter]");
+        Assertions.assertThat(cause.getSuppressed()).isEmpty();
+        StringWriter stringWriter = new StringWriter();
+        throwable.printStackTrace(new PrintWriter(stringWriter));
+        Assertions.assertThat(stringWriter.toString()).doesNotContain(PAYLOAD_MARKER, SIGNING_SECRET);
+    }
+
+    private static Throwable rootCause(Throwable throwable) {
+        Throwable cause = throwable;
+        while (cause.getCause() != null) {
+            cause = cause.getCause();
+        }
+        return cause;
     }
 
     private void observeDeliveryCommits(String topic, String eventId, PublicationAcknowledgements publicationAcknowledgements) throws Exception {
@@ -248,6 +470,19 @@ class DeliveryPublicationRedeliveryIntegrationTests {
                 adviceWithRouteBuilder -> adviceWithRouteBuilder.weaveAddFirst().process(exchange -> {
                     if (eventId.equals(exchange.getMessage().getBody(WebhookEvent.class).getEventId())) {
                         int delivery = deliveryCounter.incrementAndGet();
+                        if (delivery == 1 && publicationAcknowledgements.terminal) {
+                            exchange.getUnitOfWork().addSynchronization(new Synchronization() {
+                                @Override
+                                public void onComplete(@NonNull Exchange exchange) {
+                                    publicationAcknowledgements.firstFailureFuture.completeExceptionally(new AssertionError("The first delivery unexpectedly succeeded"));
+                                }
+
+                                @Override
+                                public void onFailure(@NonNull Exchange exchange) {
+                                    publicationAcknowledgements.firstFailureFuture.complete(exchange.getException());
+                                }
+                            });
+                        }
                         KafkaManualCommit originalKafkaManualCommit = exchange.getMessage().getHeader(KafkaConstants.MANUAL_COMMIT, KafkaManualCommit.class);
                         KafkaManualCommit observedKafkaManualCommit = () -> {
                             publicationAcknowledgements.observeCommit(delivery);
@@ -276,23 +511,31 @@ class DeliveryPublicationRedeliveryIntegrationTests {
     }
 
     private static void assertAudit(ConsumerRecord<String, Object> consumerRecord, String eventId, int number, int retries, int replay) {
+        assertAudit(consumerRecord, eventId, number, retries, replay, DeliveryOutcome.RETRYABLE_FAILURE, 503, false);
+    }
+
+    private static void assertAudit(ConsumerRecord<String, Object> consumerRecord, String eventId, int number, int retries, int replay, DeliveryOutcome deliveryOutcome, int httpStatus, boolean deadLettered) {
         Assertions.assertThat(consumerRecord.key()).isEqualTo(eventId);
         DeliveryAttempt deliveryAttempt = (DeliveryAttempt) consumerRecord.value();
         Assertions.assertThat(deliveryAttempt.getAttemptNumber()).isEqualTo(number);
-        Assertions.assertThat(deliveryAttempt.getOutcome()).isEqualTo(DeliveryOutcome.RETRYABLE_FAILURE);
-        Assertions.assertThat(deliveryAttempt.getHttpStatus()).isEqualTo(503);
+        Assertions.assertThat(deliveryAttempt.getOutcome()).isEqualTo(deliveryOutcome);
+        Assertions.assertThat(deliveryAttempt.getHttpStatus()).isEqualTo(httpStatus);
         Assertions.assertThat(deliveryAttempt.getRetryCount()).isEqualTo(retries);
         Assertions.assertThat(deliveryAttempt.getReplayCount()).isEqualTo(replay);
-        Assertions.assertThat(deliveryAttempt.getDeadLettered()).isFalse();
+        Assertions.assertThat(deliveryAttempt.getDeadLettered()).isEqualTo(deadLettered);
         Assertions.assertThat(deliveryAttempt.getSchema().getField("payload")).isNull();
         Assertions.assertThat(deliveryAttempt.getSchema().getField("signingSecret")).isNull();
-        Assertions.assertThat(StandardCharsets.UTF_8.decode(deliveryAttempt.getDetails().duplicate()).toString()).doesNotContain("private", SIGNING_SECRET);
+        Assertions.assertThat(StandardCharsets.UTF_8.decode(deliveryAttempt.getDetails().duplicate()).toString()).doesNotContain("private", PAYLOAD_MARKER, SIGNING_SECRET);
+    }
+
+    private static Map<String, Object> expectedAttemptRow(int number, int retries, int replay, DeliveryOutcome deliveryOutcome, int httpStatus, boolean deadLettered) {
+        return Map.of("attempt_number", number, "retry_count", retries, "replay_count", replay, "outcome", deliveryOutcome.name(), "http_status", httpStatus, "dead_lettered", deadLettered);
     }
 
     private List<Map<String, Object>> attemptRows(String eventId) {
         return this.jdbcTemplate.queryForList(
                 """
-                SELECT attempt_number, retry_count, replay_count, outcome
+                SELECT attempt_number, retry_count, replay_count, outcome, http_status, dead_lettered
                 FROM delivery_attempt WHERE event_id = ?::uuid
                 """,
                 eventId
@@ -307,8 +550,205 @@ class DeliveryPublicationRedeliveryIntegrationTests {
         });
     }
 
+    @FunctionalInterface
+    private interface TerminalScenario {
+
+        void run(TerminalDelivery terminalDelivery) throws Exception;
+    }
+
+    private enum Recovery {
+        REPEAT_TERMINAL, RESTART_AND_REPEAT_TERMINAL, SUCCEED
+    }
+
+    private record TerminalInput(String topic, int previousAttempts, int retryCount, int replayCount, Instant nextEligibleAt, ExpectedAudit audit) {
+
+        private static final TerminalInput SOURCE = new TerminalInput(WebhookRoute.WEBHOOK_EVENT_TOPIC, 0, 0, 0, null, new ExpectedAudit(DeliveryOutcome.PERMANENT_FAILURE, 400, true));
+        private static final TerminalInput LAST_RETRY = new TerminalInput(WebhookRoute.WEBHOOK_EVENT_RETRY_1H_TOPIC, 3, 3, 2, Instant.parse("2026-07-25T11:55:00Z"), new ExpectedAudit(DeliveryOutcome.RETRYABLE_FAILURE, 503, true));
+
+        WebhookEvent newEvent() {
+            byte[] payloadBytes = ("{ \"private\": \"" + PAYLOAD_MARKER + " é\" }").getBytes(StandardCharsets.UTF_8);
+            return new WebhookEvent(
+                    UUID.randomUUID().toString(),
+                    "terminal-publication.test",
+                    "00000000-0000-0000-0000-000000000001",
+                    "00000000-0000-0000-0000-000000000002",
+                    Instant.parse("2026-07-25T11:00:00Z"),
+                    ByteBuffer.wrap(payloadBytes),
+                    this.retryCount,
+                    this.nextEligibleAt,
+                    this.previousAttempts,
+                    this.replayCount
+            );
+        }
+    }
+
+    private record ExpectedAudit(DeliveryOutcome deliveryOutcome, int httpStatus, boolean deadLettered) {
+    }
+
+    private record TerminalOffsets(Map<TopicPartition, Long> attemptOffsets, Map<TopicPartition, Long> retryOffsets, Map<TopicPartition, Long> deadLetterOffsets) {
+    }
+
+    private final class TerminalDelivery {
+
+        private final AdminClient adminClient;
+        private final ConsumerRecord<String, Object> inputConsumerRecord;
+        private final WebhookEvent expectedDeadLetterWebhookEvent;
+        private final ExpectedAudit terminalAudit;
+        private final PublicationAcknowledgements publicationAcknowledgements;
+        private final TerminalOffsets terminalOffsets;
+        private final KafkaConsumer<String, Object> attemptKafkaConsumer;
+        private final KafkaConsumer<String, Object> deadLetterKafkaConsumer;
+
+        TerminalDelivery(
+                AdminClient adminClient,
+                ConsumerRecord<String, Object> inputConsumerRecord,
+                WebhookEvent expectedDeadLetterWebhookEvent,
+                ExpectedAudit terminalAudit,
+                PublicationAcknowledgements publicationAcknowledgements,
+                TerminalOffsets terminalOffsets,
+                KafkaConsumer<String, Object> attemptKafkaConsumer,
+                KafkaConsumer<String, Object> deadLetterKafkaConsumer
+        ) {
+            this.adminClient = adminClient;
+            this.inputConsumerRecord = inputConsumerRecord;
+            this.expectedDeadLetterWebhookEvent = expectedDeadLetterWebhookEvent;
+            this.terminalAudit = terminalAudit;
+            this.publicationAcknowledgements = publicationAcknowledgements;
+            this.terminalOffsets = terminalOffsets;
+            this.attemptKafkaConsumer = attemptKafkaConsumer;
+            this.deadLetterKafkaConsumer = deadLetterKafkaConsumer;
+        }
+
+        String eventId() {
+            return this.expectedDeadLetterWebhookEvent.getEventId();
+        }
+
+        PendingAcknowledgement holdFirstDeadLetter() throws Exception {
+            PendingAcknowledgement pendingAcknowledgement = this.publicationAcknowledgements.awaitDeadLetter();
+            this.assertRequests(1);
+            assertUncommitted(this.adminClient, this.inputConsumerRecord);
+            this.publicationAcknowledgements.assertAttemptSends(0);
+            this.assertNoStoredAttempts();
+            return pendingAcknowledgement;
+        }
+
+        ConsumerRecord<String, Object> readDeadLetter() throws Exception {
+            ConsumerRecord<String, Object> deadLetterConsumerRecord = assertRetainedDeadLetter(this.deadLetterKafkaConsumer, this.expectedDeadLetterWebhookEvent);
+            countRecord(this.terminalOffsets.deadLetterOffsets(), deadLetterConsumerRecord);
+            this.assertDeadLetterOffsets();
+            return deadLetterConsumerRecord;
+        }
+
+        void assertDeadLetterOffsets() throws Exception {
+            Assertions.assertThat(KafkaTestRecords.endOffsets(this.adminClient, DEAD_LETTER_TOPIC)).isEqualTo(this.terminalOffsets.deadLetterOffsets());
+        }
+
+        void assertDeadLetterFailure() throws Exception {
+            assertSanitizedDeadLetterFailure(this.publicationAcknowledgements.awaitFirstFailure());
+        }
+
+        PendingAcknowledgement holdAttempt() throws Exception {
+            PendingAcknowledgement pendingAcknowledgement = this.publicationAcknowledgements.awaitAttempt();
+            assertUncommitted(this.adminClient, this.inputConsumerRecord);
+            return pendingAcknowledgement;
+        }
+
+        ConsumerRecord<String, Object> readAudit(ExpectedAudit expectedAudit) {
+            ConsumerRecord<String, Object> attemptConsumerRecord = KafkaTestRecords.awaitRecord(this.attemptKafkaConsumer, this.eventId());
+            WebhookEvent webhookEvent = this.expectedDeadLetterWebhookEvent;
+            assertAudit(
+                    attemptConsumerRecord,
+                    this.eventId(),
+                    webhookEvent.getDeliveryAttemptCount(),
+                    webhookEvent.getRetryCount(),
+                    webhookEvent.getReplayCount(),
+                    expectedAudit.deliveryOutcome(),
+                    expectedAudit.httpStatus(),
+                    expectedAudit.deadLettered()
+            );
+            return attemptConsumerRecord;
+        }
+
+        void assertNoStoredAttempts() throws Exception {
+            Assertions.assertThat(KafkaTestRecords.endOffsets(this.adminClient, ATTEMPT_TOPIC)).isEqualTo(this.terminalOffsets.attemptOffsets());
+        }
+
+        void assertAuditFailure() throws Exception {
+            Assertions.assertThat(rootCause(this.publicationAcknowledgements.awaitFirstFailure())).hasMessage("Injected send failure on " + ATTEMPT_TOPIC);
+        }
+
+        void restartInputConsumer(int expectedAttemptSends) throws Exception {
+            this.publicationAcknowledgements.awaitPausedPoll();
+            assertUncommitted(this.adminClient, this.inputConsumerRecord);
+            this.publicationAcknowledgements.assertAttemptSends(expectedAttemptSends);
+            RouteController routeController = DeliveryPublicationRedeliveryIntegrationTests.this.camelContext.getRouteController();
+            String inputRoute = KafkaTestRecords.consumerRoute(this.inputConsumerRecord.topic());
+            Assertions.assertThat(routeController.stopRoute(inputRoute, 5, TimeUnit.SECONDS, false)).isTrue();
+            assertUncommitted(this.adminClient, this.inputConsumerRecord);
+            this.assertRequests(1);
+            routeController.startRoute(inputRoute);
+        }
+
+        ConsumerRecord<String, Object> recoverDeadLetter() throws Exception {
+            PendingAcknowledgement recoveredDeadLetterAcknowledgement = this.publicationAcknowledgements.awaitDeadLetter();
+            recoveredDeadLetterAcknowledgement.assertSucceededOn(DEAD_LETTER_TOPIC);
+            this.assertRequests(2);
+            assertUncommitted(this.adminClient, this.inputConsumerRecord);
+            ConsumerRecord<String, Object> recoveredDeadLetterConsumerRecord = this.readDeadLetter();
+            recoveredDeadLetterAcknowledgement.release();
+            return recoveredDeadLetterConsumerRecord;
+        }
+
+        ConsumerRecord<String, Object> recoverAudit(ExpectedAudit expectedAudit) throws Exception {
+            PendingAcknowledgement recoveredAttemptAcknowledgement = this.holdAttempt();
+            recoveredAttemptAcknowledgement.assertSucceededOn(ATTEMPT_TOPIC);
+            ConsumerRecord<String, Object> recoveredAttemptConsumerRecord = this.readAudit(expectedAudit);
+            Assertions.assertThat(DeliveryPublicationRedeliveryIntegrationTests.this.attemptRows(this.eventId())).isEmpty();
+            recoveredAttemptAcknowledgement.release();
+
+            KafkaTestRecords.awaitCommit(this.adminClient, this.inputConsumerRecord);
+            this.publicationAcknowledgements.assertPublicationOrder();
+            this.assertRequests(2);
+            this.assertDeadLetterOffsets();
+            Assertions.assertThat(KafkaTestRecords.retryEndOffsets(this.adminClient)).isEqualTo(this.terminalOffsets.retryOffsets());
+            Assertions.assertThat(DeliveryPublicationRedeliveryIntegrationTests.this.attemptRows(this.eventId())).isEmpty();
+            return recoveredAttemptConsumerRecord;
+        }
+
+        void assertDeadLetterStillRetained(ConsumerRecord<String, Object> deadLetterConsumerRecord) {
+            this.deadLetterKafkaConsumer.seek(new TopicPartition(DEAD_LETTER_TOPIC, deadLetterConsumerRecord.partition()), deadLetterConsumerRecord.offset());
+            Assertions.assertThat(assertRetainedDeadLetter(this.deadLetterKafkaConsumer, this.expectedDeadLetterWebhookEvent).offset()).isEqualTo(deadLetterConsumerRecord.offset());
+        }
+
+        void assertPersistedAudit(ConsumerRecord<String, Object> recoveredAttemptConsumerRecord, ExpectedAudit expectedAudit) throws Exception {
+            DeliveryPublicationRedeliveryIntegrationTests.this.camelContext.getRouteController().startRoute(KafkaTestRecords.consumerRoute(ATTEMPT_TOPIC));
+            KafkaTestRecords.awaitCommit(this.adminClient, recoveredAttemptConsumerRecord);
+            WebhookEvent webhookEvent = this.expectedDeadLetterWebhookEvent;
+            Assertions.assertThat(DeliveryPublicationRedeliveryIntegrationTests.this.attemptRows(this.eventId()))
+                    .containsExactly(expectedAttemptRow(
+                            webhookEvent.getDeliveryAttemptCount(),
+                            webhookEvent.getRetryCount(),
+                            webhookEvent.getReplayCount(),
+                            expectedAudit.deliveryOutcome(),
+                            expectedAudit.httpStatus(),
+                            expectedAudit.deadLettered()
+                    ));
+        }
+
+        private void assertRequests(int count) {
+            ByteBuffer payloadByteBuffer = this.expectedDeadLetterWebhookEvent.getPayload().duplicate();
+            byte[] payloadBytes = new byte[payloadByteBuffer.remaining()];
+            payloadByteBuffer.get(payloadBytes);
+            DeliveryPublicationRedeliveryIntegrationTests.this.assertSignedRequests(this.eventId(), payloadBytes, count);
+        }
+    }
+
     private enum FailedPublication {
-        ATTEMPT, RETRY
+        ATTEMPT, RETRY, DEAD_LETTER, LOST_DEAD_LETTER_ACK, LOST_ATTEMPT_ACK
+    }
+
+    private enum SendFailure {
+        NONE, BEFORE_STORAGE, AFTER_STORAGE
     }
 
     private static final class PublicationAcknowledgements extends DefaultKafkaClientFactory {
@@ -316,20 +756,59 @@ class DeliveryPublicationRedeliveryIntegrationTests {
         private final String eventId;
         private final int auditNumber;
         private final FailedPublication failedPublication;
+        private final String inputTopic;
+        private final boolean terminal;
+        private final boolean succeedsOnRedelivery;
         private final BlockingQueue<PendingAcknowledgement> attemptAcknowledgements = new LinkedBlockingQueue<>();
         private final BlockingQueue<PendingAcknowledgement> retryAcknowledgements = new LinkedBlockingQueue<>();
+        private final BlockingQueue<PendingAcknowledgement> deadLetterAcknowledgements = new LinkedBlockingQueue<>();
         private final CompletableFuture<Void> closedFuture = new CompletableFuture<>();
+        private final CompletableFuture<Throwable> firstFailureFuture = new CompletableFuture<>();
+        private final CompletableFuture<Void> pausedPollFuture = new CompletableFuture<>();
+        private final CompletableFuture<Void> resumePollFuture = new CompletableFuture<>();
+        private final AtomicBoolean restartPauseArmed;
         private final AtomicInteger attemptSends = new AtomicInteger();
         private final AtomicInteger retrySends = new AtomicInteger();
+        private final AtomicInteger deadLetterSends = new AtomicInteger();
         private final AtomicInteger attemptsAcknowledged = new AtomicInteger();
+        private final AtomicInteger deadLettersAcknowledged = new AtomicInteger();
         private final AtomicBoolean retryAcknowledged = new AtomicBoolean();
         private final AtomicBoolean retriedBeforeAttemptAcknowledgement = new AtomicBoolean();
-        private final AtomicBoolean committedBeforeRetryAcknowledgement = new AtomicBoolean();
+        private final AtomicBoolean attemptedBeforeDeadLetterAcknowledgement = new AtomicBoolean();
+        private final AtomicBoolean committedBeforeRequiredAcknowledgements = new AtomicBoolean();
 
-        PublicationAcknowledgements(String eventId, int auditNumber, FailedPublication failedPublication) {
+        PublicationAcknowledgements(String eventId, int auditNumber, FailedPublication failedPublication, String inputTopic, boolean terminal, boolean succeedsOnRedelivery, boolean restartBeforeRedelivery) {
             this.eventId = eventId;
             this.auditNumber = auditNumber;
             this.failedPublication = failedPublication;
+            this.inputTopic = inputTopic;
+            this.terminal = terminal;
+            this.succeedsOnRedelivery = succeedsOnRedelivery;
+            this.restartPauseArmed = new AtomicBoolean(restartBeforeRedelivery);
+        }
+
+        @Override
+        public KafkaConsumer<Object, Object> getConsumer(Properties properties) {
+            if (!this.restartPauseArmed.get() || !this.inputTopic.equals(properties.getProperty(ConsumerConfig.GROUP_ID_CONFIG))) {
+                return new KafkaConsumer<>(properties);
+            }
+            return new KafkaConsumer<>(properties) {
+                @Override
+                public ConsumerRecords<Object, Object> poll(Duration duration) {
+                    if (PublicationAcknowledgements.this.firstFailureFuture.isDone() && PublicationAcknowledgements.this.restartPauseArmed.compareAndSet(true, false)) {
+                        // Prevent this consumer from fetching the failed input again before the route restarts.
+                        PublicationAcknowledgements.this.pausedPollFuture.complete(null);
+                        PublicationAcknowledgements.this.resumePollFuture.orTimeout(30, TimeUnit.SECONDS).join();
+                    }
+                    return super.poll(duration);
+                }
+
+                @Override
+                public void wakeup() {
+                    super.wakeup();
+                    PublicationAcknowledgements.this.resumePollFuture.complete(null);
+                }
+            };
         }
 
         @Override
@@ -346,16 +825,33 @@ class DeliveryPublicationRedeliveryIntegrationTests {
             return switch (producerRecord.value()) {
                 case DeliveryAttempt deliveryAttempt when this.eventId.equals(deliveryAttempt.getEventId()) && deliveryAttempt.getAttemptNumber() == this.auditNumber -> {
                     int send = this.attemptSends.incrementAndGet();
-                    boolean fail = send == 1 && this.failedPublication == FailedPublication.ATTEMPT;
-                    yield this.holdReply(producerRecord, callback, sendFunction, this.attemptAcknowledgements, this.attemptsAcknowledged::incrementAndGet, fail);
+                    boolean recoveredSuccess = this.succeedsOnRedelivery && deliveryAttempt.getOutcome() == DeliveryOutcome.SUCCEEDED;
+                    if (this.terminal && !recoveredSuccess && this.deadLettersAcknowledged.get() != send) {
+                        this.attemptedBeforeDeadLetterAcknowledgement.set(true);
+                    }
+                    SendFailure sendFailure = send != 1 ? SendFailure.NONE : switch (this.failedPublication) {
+                        case ATTEMPT -> SendFailure.BEFORE_STORAGE;
+                        case LOST_ATTEMPT_ACK -> SendFailure.AFTER_STORAGE;
+                        default -> SendFailure.NONE;
+                    };
+                    yield this.holdReply(producerRecord, callback, sendFunction, this.attemptAcknowledgements, this.attemptsAcknowledged::incrementAndGet, sendFailure);
                 }
                 case WebhookEvent webhookEvent when this.eventId.equals(webhookEvent.getEventId()) && webhookEvent.getDeliveryAttemptCount() == this.auditNumber -> {
+                    if (DEAD_LETTER_TOPIC.equals(producerRecord.topic())) {
+                        int send = this.deadLetterSends.incrementAndGet();
+                        SendFailure sendFailure = send != 1 ? SendFailure.NONE : switch (this.failedPublication) {
+                            case DEAD_LETTER -> SendFailure.BEFORE_STORAGE;
+                            case LOST_DEAD_LETTER_ACK -> SendFailure.AFTER_STORAGE;
+                            default -> SendFailure.NONE;
+                        };
+                        yield this.holdReply(producerRecord, callback, sendFunction, this.deadLetterAcknowledgements, this.deadLettersAcknowledged::incrementAndGet, sendFailure);
+                    }
                     int send = this.retrySends.incrementAndGet();
                     if (this.attemptsAcknowledged.get() != send) {
                         this.retriedBeforeAttemptAcknowledgement.set(true);
                     }
-                    boolean fail = send == 1 && this.failedPublication == FailedPublication.RETRY;
-                    yield this.holdReply(producerRecord, callback, sendFunction, this.retryAcknowledgements, () -> this.retryAcknowledged.set(true), fail);
+                    SendFailure sendFailure = send == 1 && this.failedPublication == FailedPublication.RETRY ? SendFailure.BEFORE_STORAGE : SendFailure.NONE;
+                    yield this.holdReply(producerRecord, callback, sendFunction, this.retryAcknowledgements, () -> this.retryAcknowledged.set(true), sendFailure);
                 }
                 default -> sendFunction.apply(producerRecord, callback);
             };
@@ -367,13 +863,18 @@ class DeliveryPublicationRedeliveryIntegrationTests {
                 BiFunction<ProducerRecord<Object, Object>, Callback, Future<RecordMetadata>> sendFunction,
                 BlockingQueue<PendingAcknowledgement> pendingAcknowledgements,
                 Runnable onAcknowledged,
-                boolean fail
+                SendFailure sendFailure
         ) {
             PendingAcknowledgement pendingAcknowledgement = new PendingAcknowledgement(callback, onAcknowledged, this.closedFuture);
-            if (fail) {
-                pendingAcknowledgement.receive(null, new IllegalStateException("Injected send failure on " + producerRecord.topic()));
-            } else {
-                sendFunction.apply(producerRecord, pendingAcknowledgement::receive);
+            String message = "Injected send failure on " + producerRecord.topic();
+            if (DEAD_LETTER_TOPIC.equals(producerRecord.topic())) {
+                message += " [payload=" + PAYLOAD_MARKER + "] [secret=" + SIGNING_SECRET + "]";
+            }
+            IllegalStateException injectedException = sendFailure == SendFailure.NONE ? null : new IllegalStateException(message);
+            switch (sendFailure) {
+                case BEFORE_STORAGE -> pendingAcknowledgement.receive(null, injectedException);
+                case AFTER_STORAGE -> sendFunction.apply(producerRecord, (recordMetadata, exception) -> pendingAcknowledgement.receive(recordMetadata, exception == null ? injectedException : exception));
+                case NONE -> sendFunction.apply(producerRecord, pendingAcknowledgement::receive);
             }
             pendingAcknowledgements.add(pendingAcknowledgement);
             return pendingAcknowledgement.clientResultFuture;
@@ -387,6 +888,22 @@ class DeliveryPublicationRedeliveryIntegrationTests {
             return awaitReply(this.retryAcknowledgements, "retry");
         }
 
+        PendingAcknowledgement awaitDeadLetter() throws Exception {
+            return awaitReply(this.deadLetterAcknowledgements, "dead letter");
+        }
+
+        Throwable awaitFirstFailure() throws Exception {
+            return this.firstFailureFuture.get(20, TimeUnit.SECONDS);
+        }
+
+        void awaitPausedPoll() throws Exception {
+            this.pausedPollFuture.get(20, TimeUnit.SECONDS);
+        }
+
+        void assertAttemptSends(int expectedSends) {
+            Assertions.assertThat(this.attemptSends).hasValue(expectedSends);
+        }
+
         private static PendingAcknowledgement awaitReply(BlockingQueue<PendingAcknowledgement> pendingAcknowledgements, String name) throws Exception {
             PendingAcknowledgement pendingAcknowledgement = pendingAcknowledgements.poll(20, TimeUnit.SECONDS);
             if (pendingAcknowledgement == null) {
@@ -397,18 +914,26 @@ class DeliveryPublicationRedeliveryIntegrationTests {
         }
 
         void observeCommit(int delivery) {
-            if (delivery != 2 || !this.retryAcknowledged.get()) {
-                this.committedBeforeRetryAcknowledgement.set(true);
+            int expectedDeadLetterAcknowledgements = switch (this.failedPublication) {
+                case ATTEMPT -> 2;
+                case DEAD_LETTER -> this.succeedsOnRedelivery ? 0 : 1;
+                default -> 1;
+            };
+            boolean acknowledged = this.terminal ? this.attemptsAcknowledged.get() == 1 && this.deadLettersAcknowledged.get() == expectedDeadLetterAcknowledgements : this.retryAcknowledged.get();
+            if (delivery != 2 || !acknowledged) {
+                this.committedBeforeRequiredAcknowledgements.set(true);
             }
         }
 
         void assertPublicationOrder() {
             Assertions.assertThat(this.retriedBeforeAttemptAcknowledgement).as("retry started before the attempt acknowledgement").isFalse();
-            Assertions.assertThat(this.committedBeforeRetryAcknowledgement).as("only recovered delivery may commit, and only after the retry acknowledgement").isFalse();
+            Assertions.assertThat(this.attemptedBeforeDeadLetterAcknowledgement).as("terminal audit started before the dead-letter acknowledgement").isFalse();
+            Assertions.assertThat(this.committedBeforeRequiredAcknowledgements).as("only recovered delivery may commit, and only after required acknowledgements").isFalse();
         }
 
         void releaseAll() {
             this.closedFuture.complete(null);
+            this.resumePollFuture.complete(null);
         }
     }
 
@@ -455,6 +980,16 @@ class DeliveryPublicationRedeliveryIntegrationTests {
             Assertions.assertThat(this.brokerReplyFuture.join().exception()).isInstanceOf(IllegalStateException.class);
         }
 
+        void assertFailedBeforeStorage() {
+            this.assertFailed();
+            Assertions.assertThat(this.brokerReplyFuture.join().recordMetadata()).isNull();
+        }
+
+        void assertStoredButFailedOn(String topic) {
+            this.assertFailed();
+            Assertions.assertThat(this.brokerReplyFuture.join().recordMetadata().topic()).isEqualTo(topic);
+        }
+
         void release() {
             this.releaseFuture.complete(null);
         }
@@ -470,7 +1005,7 @@ class DeliveryPublicationRedeliveryIntegrationTests {
 
         private final HttpServer httpServer;
         private final ExecutorService executorService;
-        private final Set<String> failingEventIds = ConcurrentHashMap.newKeySet();
+        private final Map<String, Integer> failureStatusesByEventId = new ConcurrentHashMap<>();
         private final Map<String, ConcurrentLinkedQueue<CapturedRequest>> capturedRequestsByEventId = new ConcurrentHashMap<>();
 
         private TestReceiver(HttpServer httpServer, ExecutorService executorService) {
@@ -497,11 +1032,15 @@ class DeliveryPublicationRedeliveryIntegrationTests {
         }
 
         void fail(String eventId) {
-            this.failingEventIds.add(eventId);
+            this.fail(eventId, 503);
+        }
+
+        void fail(String eventId, int httpStatus) {
+            this.failureStatusesByEventId.put(eventId, httpStatus);
         }
 
         void succeed(String eventId) {
-            this.failingEventIds.remove(eventId);
+            this.failureStatusesByEventId.remove(eventId);
         }
 
         List<CapturedRequest> requests(String eventId) {
@@ -516,12 +1055,12 @@ class DeliveryPublicationRedeliveryIntegrationTests {
                 this.capturedRequestsByEventId
                         .computeIfAbsent(eventId, _ -> new ConcurrentLinkedQueue<>())
                         .add(new CapturedRequest(eventId, httpExchange.getRequestHeaders().getFirst("webhook-timestamp"), httpExchange.getRequestHeaders().getFirst("webhook-signature"), bodyBytes));
-                if (!this.failingEventIds.contains(eventId)) {
+                Integer failureStatus = this.failureStatusesByEventId.get(eventId);
+                if (failureStatus == null) {
                     httpExchange.sendResponseHeaders(204, -1L);
                 } else {
-                    byte[] echoedBytes = (new String(bodyBytes, StandardCharsets.UTF_8) + SIGNING_SECRET).getBytes(StandardCharsets.UTF_8);
-                    httpExchange.sendResponseHeaders(503, echoedBytes.length);
-                    httpExchange.getResponseBody().write(echoedBytes);
+                    httpExchange.sendResponseHeaders(failureStatus, bodyBytes.length);
+                    httpExchange.getResponseBody().write(bodyBytes);
                 }
             }
         }

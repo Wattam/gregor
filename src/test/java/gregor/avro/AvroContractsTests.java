@@ -94,8 +94,27 @@ class AvroContractsTests {
 
     @Test
     void excludesSensitiveFieldsFromTheWireSchemas() {
-        Assertions.assertThat(WebhookEvent.getClassSchema().getField("signingSecret")).isNull();
-        Assertions.assertThat(DeliveryAttempt.getClassSchema().getFields()).extracting(Schema.Field::name).doesNotContain("payload", "signingSecret");
+        Assertions.assertThat(WebhookEvent.getClassSchema().getFields())
+                .extracting(Schema.Field::name)
+                .containsExactly("eventId", "eventType", "tenantId", "endpointId", "createdAt", "payload", "retryCount", "nextEligibleAt", "deliveryAttemptCount", "replayCount");
+        Assertions.assertThat(DeliveryAttempt.getClassSchema().getFields())
+                .extracting(Schema.Field::name)
+                .containsExactly(
+                        "attemptId",
+                        "eventId",
+                        "tenantId",
+                        "endpointId",
+                        "eventType",
+                        "attemptNumber",
+                        "outcome",
+                        "httpStatus",
+                        "latencyMs",
+                        "attemptedAt",
+                        "details",
+                        "retryCount",
+                        "replayCount",
+                        "deadLettered"
+                );
     }
 
     @Test

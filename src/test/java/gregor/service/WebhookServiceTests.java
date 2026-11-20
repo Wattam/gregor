@@ -15,6 +15,7 @@ import gregor.exception.EligibilityWaitInterruptedException;
 import gregor.exception.EventPublicationException;
 import gregor.repository.DeliveryAttemptRepository;
 import org.apache.camel.ProducerTemplate;
+import org.apache.camel.component.kafka.KafkaConstants;
 import org.assertj.core.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -75,7 +76,7 @@ class WebhookServiceTests {
                 37L,
                 Instant.parse("2026-07-10T12:00:00Z"),
                 Instant.parse("2026-07-10T12:00:02Z"),
-                Map.of("type", "HTTP_FAILURE", "responseBody", "unavailable")
+                Map.of("type", "HTTP_FAILURE")
         );
 
         WebhookRouteMessage inputWebhookRouteMessage = new WebhookRouteMessage(webhookEvent, deliveryAttemptResult);
@@ -93,12 +94,9 @@ class WebhookServiceTests {
         Assertions.assertThat(deliveryAttempt.getAttemptedAt()).isEqualTo(Instant.parse("2026-07-10T12:00:00Z"));
         Assertions.assertThat(deliveryAttempt.getRetryCount()).isEqualTo(5);
         Assertions.assertThat(deliveryAttempt.getReplayCount()).isEqualTo(3);
-        Assertions.assertThat(deliveryAttempt.getDeadLettered()).isFalse();
-        byte[] detailsBytes = bytes(deliveryAttempt.getDetails());
-        JsonNode detailsJsonNode = objectMapper.readTree(detailsBytes);
-        Assertions.assertThat(detailsJsonNode.get("type").asString()).isEqualTo("HTTP_FAILURE");
-        Assertions.assertThat(detailsJsonNode.get("responseBody").asString()).isEqualTo("unavailable");
-        Assertions.assertThat(new String(detailsBytes, StandardCharsets.UTF_8)).doesNotContain("payload-marker", "signing-secret");
+        Assertions.assertThat(deliveryAttempt.getDeadLettered()).isTrue();
+        JsonNode detailsJsonNode = objectMapper.readTree(bytes(deliveryAttempt.getDetails()));
+        Assertions.assertThat(detailsJsonNode).isEqualTo(objectMapper.readTree("{\"type\":\"HTTP_FAILURE\"}"));
     }
 
     @Test
@@ -161,11 +159,15 @@ class WebhookServiceTests {
 
     @ParameterizedTest
     @CsvSource({
-            "TIMEOUT",
-            "CONNECTION_FAILURE"
+            "TIMEOUT, 2, false",
+            "CONNECTION_FAILURE, 2, false",
+            "INVALID_RESPONSE, 2, false",
+            "TIMEOUT, 1, true",
+            "CONNECTION_FAILURE, 1, true",
+            "INVALID_RESPONSE, 1, true"
     })
-    void plansARetryForTransportFailuresWithoutAnHttpStatus(String failureType) {
-        WebhookService webhookService = service(new ObjectMapper(), WebhookPropertiesFixtures.create(2));
+    void appliesTheAttemptBudgetToTransportFailuresWithoutAnHttpStatus(String failureType, int maximumAttempts, boolean terminal) {
+        WebhookService webhookService = service(new ObjectMapper(), WebhookPropertiesFixtures.create(maximumAttempts));
         WebhookEvent inputWebhookEvent = event(1);
         DeliveryAttemptResult deliveryAttemptResult = new DeliveryAttemptResult(
                 DeliveryOutcome.RETRYABLE_FAILURE,
@@ -177,35 +179,60 @@ class WebhookServiceTests {
         );
         WebhookEvent expectedWebhookEvent = webhookEvent(1, 1, 0, Instant.parse("2026-07-10T12:01:02.123Z"));
 
-        Assertions.assertThat(webhookService.planRetry(new WebhookRouteMessage(inputWebhookEvent, deliveryAttemptResult))).contains(new RetryPublication("webhook-events-retry-1m", expectedWebhookEvent));
+        WebhookRouteMessage webhookRouteMessage = new WebhookRouteMessage(inputWebhookEvent, deliveryAttemptResult);
+        Assertions.assertThat(webhookService.requiresDeadLetter(webhookRouteMessage)).isEqualTo(terminal);
+        if (terminal) {
+            Assertions.assertThat(webhookService.planRetry(webhookRouteMessage)).isEmpty();
+        } else {
+            Assertions.assertThat(webhookService.planRetry(webhookRouteMessage)).contains(new RetryPublication("webhook-events-retry-1m", expectedWebhookEvent));
+        }
+        DeliveryAttempt deliveryAttempt = webhookService.createAttempt(webhookRouteMessage);
+        Assertions.assertThat(deliveryAttempt.getDeadLettered()).isEqualTo(terminal);
+        Assertions.assertThat(deliveryAttempt.getOutcome()).isEqualTo(gregor.avro.DeliveryOutcome.RETRYABLE_FAILURE);
+        Assertions.assertThat(deliveryAttempt.getHttpStatus()).isNull();
     }
 
     @ParameterizedTest
     @CsvSource({
-            "RETRYABLE_FAILURE, 3, 0",
-            "RETRYABLE_FAILURE, 4, 0",
-            "SUCCEEDED, 2, 0",
-            "PERMANENT_FAILURE, 2, 0",
-            "RETRYABLE_FAILURE, 2, -1",
-            "RETRYABLE_FAILURE, 2, 3",
-            "RETRYABLE_FAILURE, 2, 7",
-            "RETRYABLE_FAILURE, 2, 2147483647"
+            "3, RETRYABLE_FAILURE, 503, 3, 0, true",
+            "4, SUCCEEDED, 204, 2, 0, false",
+            "4, SUCCEEDED, 204, 4, 3, false",
+            "4, PERMANENT_FAILURE, 400, 1, 0, true",
+            "4, PERMANENT_FAILURE, 400, 2, 1, true",
+            "4, PERMANENT_FAILURE, 400, 3, 2, true",
+            "4, PERMANENT_FAILURE, 400, 4, 3, true",
+            "4, RETRYABLE_FAILURE, 503, 2, 3, true",
+            "4, RETRYABLE_FAILURE, 503, 2, 7, true",
+            "4, RETRYABLE_FAILURE, 503, 2, 2147483647, true"
     })
-    void doesNotPlanASuccessorForTerminalOrUnsupportedState(DeliveryOutcome deliveryOutcome, int attempt, int retries) {
+    void distinguishesSuccessFromFailuresWithoutASuccessor(int maximumAttempts, DeliveryOutcome deliveryOutcome, int httpStatus, int attempt, int retries, boolean terminal) {
+        WebhookService webhookService = service(new ObjectMapper(), WebhookPropertiesFixtures.create(maximumAttempts));
+        WebhookRouteMessage webhookRouteMessage = new WebhookRouteMessage(event(attempt, retries, 0), new DeliveryAttemptResult(deliveryOutcome, httpStatus, 1L, Instant.EPOCH, Instant.EPOCH, Map.of()));
+
+        Assertions.assertThat(webhookService.planRetry(webhookRouteMessage)).isEmpty();
+        Assertions.assertThat(webhookService.requiresDeadLetter(webhookRouteMessage)).isEqualTo(terminal);
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "4, 0",
+            "2, -1"
+    })
+    void plansNoRetryWithACountBeyondTheBudgetOrANegativeRetryCount(int attempt, int retries) {
         WebhookService webhookService = service(new ObjectMapper(), WebhookPropertiesFixtures.create(3));
-        WebhookRouteMessage webhookRouteMessage = new WebhookRouteMessage(event(attempt, retries, 0), new DeliveryAttemptResult(deliveryOutcome, null, 1L, Instant.EPOCH, Instant.EPOCH, Map.of()));
+        WebhookRouteMessage webhookRouteMessage = new WebhookRouteMessage(event(attempt, retries, 0), retryableResult());
 
         Assertions.assertThat(webhookService.planRetry(webhookRouteMessage)).isEmpty();
     }
 
     @ParameterizedTest
     @CsvSource({
-            "1, 1, 0, ''",
-            "2, 1/2, 0/1, webhook-events-retry-1m",
-            "3, 1/2/3, 0/1/2, webhook-events-retry-1m/webhook-events-retry-10m",
-            "4, 1/2/3/4, 0/1/2/3, webhook-events-retry-1m/webhook-events-retry-10m/webhook-events-retry-1h"
+            "1, 1, 0, '', true",
+            "2, 1/2, 0/1, webhook-events-retry-1m, false/true",
+            "3, 1/2/3, 0/1/2, webhook-events-retry-1m/webhook-events-retry-10m, false/false/true",
+            "4, 1/2/3/4, 0/1/2/3, webhook-events-retry-1m/webhook-events-retry-10m/webhook-events-retry-1h, false/false/false/true"
     })
-    void advancesOneCumulativeAttemptAndAuditCountPerEnvelope(int maximum, String attemptNumbers, String retryCounts, String tiers) {
+    void flagsOnlyTheLastAttemptInEachConfiguredRetryChain(int maximum, String attemptNumbers, String retryCounts, String tiers, String deadLetterFlags) {
         RestComponent restComponent = Mockito.mock(RestComponent.class);
         Mockito.when(restComponent.sendWebhook(Mockito.any())).thenReturn(retryableResult());
         ObjectMapper objectMapper = new ObjectMapper();
@@ -225,12 +252,14 @@ class WebhookServiceTests {
         WebhookEvent nextWebhookEvent = ingestedWebhookEventCaptor.getValue();
         List<Integer> recordedAttemptNumbers = new ArrayList<>();
         List<Integer> recordedRetryCounts = new ArrayList<>();
+        List<Boolean> recordedDeadLetterFlags = new ArrayList<>();
         List<String> retryTopics = new ArrayList<>();
         for (int delivery = 0; delivery < 4 && nextWebhookEvent != null; delivery++) {
             WebhookRouteMessage deliveredWebhookRouteMessage = webhookService.sendWebhookEvent(webhookService.createWebhookRouteMessage(nextWebhookEvent));
             DeliveryAttempt deliveryAttempt = webhookService.createAttempt(deliveredWebhookRouteMessage);
             recordedAttemptNumbers.add(deliveryAttempt.getAttemptNumber());
             recordedRetryCounts.add(deliveryAttempt.getRetryCount());
+            recordedDeadLetterFlags.add(deliveryAttempt.getDeadLettered());
             RetryPublication retryPublication = webhookService.planRetry(deliveredWebhookRouteMessage).orElse(null);
             nextWebhookEvent = retryPublication == null ? null : retryPublication.webhookEvent();
             if (retryPublication != null) {
@@ -240,6 +269,7 @@ class WebhookServiceTests {
 
         Assertions.assertThat(recordedAttemptNumbers).containsExactlyElementsOf(numbers(attemptNumbers));
         Assertions.assertThat(recordedRetryCounts).containsExactlyElementsOf(numbers(retryCounts));
+        Assertions.assertThat(recordedDeadLetterFlags).containsExactlyElementsOf(Arrays.stream(deadLetterFlags.split("/")).map(Boolean::valueOf).toList());
         Assertions.assertThat(String.join("/", retryTopics)).isEqualTo(tiers);
         Assertions.assertThat(nextWebhookEvent).isNull();
         Mockito.verify(restComponent, Mockito.times(maximum)).sendWebhook(Mockito.any());
@@ -353,6 +383,26 @@ class WebhookServiceTests {
 
         try {
             Assertions.assertThatThrownBy(() -> webhookService.ingestEvent(eventIngestRequest)).isInstanceOf(EventPublicationException.class);
+            Assertions.assertThat(Thread.currentThread().isInterrupted()).isTrue();
+        } finally {
+            Thread.interrupted();
+        }
+    }
+
+    @Test
+    void restoresInterruptionAndDropsSensitiveCausesFromDeadLetterPublicationFailure() {
+        ProducerTemplate producerTemplate = Mockito.mock(ProducerTemplate.class);
+        WebhookService webhookService = webhookService(new ObjectMapper(), WebhookPropertiesFixtures.create(1), producerTemplate, Clock.systemUTC());
+        WebhookEvent completedWebhookEvent = event(1);
+        WebhookRouteMessage webhookRouteMessage = new WebhookRouteMessage(completedWebhookEvent, retryableResult());
+        RuntimeException rawException = new RuntimeException("payload-marker", new InterruptedException("signing-secret"));
+        rawException.addSuppressed(new IllegalStateException("suppressed payload-marker"));
+        Mockito.doThrow(rawException).when(producerTemplate).sendBodyAndHeader("kafka:webhook-events-dead-letter", completedWebhookEvent, KafkaConstants.KEY, completedWebhookEvent.getEndpointId());
+
+        try {
+            Throwable throwable = Assertions.catchThrowable(() -> webhookService.publishDeadLetter(webhookRouteMessage));
+            Assertions.assertThat(throwable).isInstanceOf(IllegalStateException.class).hasMessage("Dead-letter publication failed [topic=webhook-events-dead-letter]").hasNoCause();
+            Assertions.assertThat(throwable.getSuppressed()).isEmpty();
             Assertions.assertThat(Thread.currentThread().isInterrupted()).isTrue();
         } finally {
             Thread.interrupted();

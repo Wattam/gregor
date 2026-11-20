@@ -15,6 +15,7 @@ import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.boot.validation.autoconfigure.ValidationAutoConfiguration;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.env.EnumerablePropertySource;
+import org.springframework.core.env.Environment;
 import org.springframework.core.io.FileSystemResource;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
@@ -47,6 +48,17 @@ class ConfigurationPropertiesTests {
             KafkaTopicProperties kafkaTopicProperties = assertableApplicationContext.getBean(KafkaTopicProperties.class);
             Assertions.assertThat(kafkaTopicProperties.retryRetention()).isEqualTo(Duration.ofDays(7));
             Assertions.assertThat(kafkaTopicProperties.deadLetterRetention()).isEqualTo(Duration.ofDays(30));
+        });
+    }
+
+    @Test
+    void requiresAllKafkaAcknowledgementsAndManualOffsetCommitsInProduction() {
+        this.applicationContextRunner.run(assertableApplicationContext -> {
+            Environment environment = assertableApplicationContext.getEnvironment();
+            Assertions.assertThat(environment.getRequiredProperty("camel.component.kafka.request-required-acks")).isEqualTo("all");
+            Assertions.assertThat(environment.getRequiredProperty("camel.component.kafka.auto-commit-enable", Boolean.class)).isFalse();
+            Assertions.assertThat(environment.getRequiredProperty("camel.component.kafka.allow-manual-commit", Boolean.class)).isTrue();
+            Assertions.assertThat(environment.getRequiredProperty("camel.component.kafka.break-on-first-error", Boolean.class)).isTrue();
         });
     }
 

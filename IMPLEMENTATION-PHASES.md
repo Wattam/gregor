@@ -1,6 +1,6 @@
 # Webhook Delivery Service: Build Phases
 
-This document is the complete implementation roadmap for the webhook delivery service. Phase 1 and Phases 2A through 2D are implemented and are kept
+This document is the complete implementation roadmap for the webhook delivery service. Phase 1 and Phases 2A through 2E are implemented and are kept
 whole. Every remaining phase is broken into the smallest dependency-ordered increment that still has a useful, independently testable
 boundary and its own completion gate. Phase 6 stays one release unit because splitting it would advertise an ordering guarantee that does
 not hold yet. Completing groundwork or an isolated test suite does not mark an increment as implemented.
@@ -14,7 +14,8 @@ not hold yet. Completing groundwork or an isolated test suite does not mark an i
 | Phase 2B            | Implemented                        | Phase 2A                                                            |
 | Phase 2C            | Implemented                        | Phase 2B                                                            |
 | Phase 2D            | Implemented                        | Phase 2C                                                            |
-| Phase 2E through 2J | Planned                            | Phase 2D, in listed order                                           |
+| Phase 2E            | Implemented                        | Phase 2D                                                            |
+| Phase 2F through 2J | Planned                            | Phase 2E, in listed order                                           |
 | Phase 3A through 3J | Planned                            | Phase 2; subphases in listed order                                  |
 | Phase 4A through 4F | Planned                            | Stable Phase 2 event contract; can proceed in parallel with Phase 3 |
 | Phase 5A through 5R | Planned                            | Phases 2 through 4; subphases in listed order                       |
@@ -76,7 +77,7 @@ signed webhook delivery and durable logical-attempt history.
 - There is no retry topic, dead-letter queue, replay, endpoint management, production security, tenant isolation, or strict FIFO mode.
 - Endpoint configuration and tenant identity are single configured values rather than managed or authenticated runtime state.
 
-## Phase 2: Retry Topology, Dead-Letter Queue, and Replay (PHASES 2A THROUGH 2D IMPLEMENTED, REST PLANNED)
+## Phase 2: Retry Topology, Dead-Letter Queue, and Replay (PHASES 2A THROUGH 2E IMPLEMENTED, REST PLANNED)
 
 Phase 2 is split because contracts, retry consumption, retry publication, terminal retention, dead-letter persistence, and replay each have
 a separate testable boundary. The subphases must be implemented in order. Retry attempts are sequential within a single non-redelivered
@@ -212,24 +213,25 @@ delivery behavior is unchanged.
 Automatic delivery uses one immediate attempt followed by the configured subset of the fixed 1-minute, 10-minute, and 1-hour tiers. An
 exhausted event stops after its final tier and produces no dead-letter record yet.
 
-### Phase 2E: Dead-letter publication for terminal events
+### Phase 2E: Dead-letter publication for terminal events (IMPLEMENTED)
 
 **Goal:** Retain every terminal delivery generation durably in Kafka.
 
 #### Tasks
 
-- [ ] Publish exhausted retryable events to the dead-letter topic with the same identity, payload, cumulative counters, and endpoint Kafka
+- [x] Publish exhausted retryable events to the dead-letter topic with the same identity, payload, cumulative counters, and endpoint Kafka
   key.
-- [ ] Publish permanently failed events to the dead-letter topic without a further retry publication.
-- [ ] Mark the terminal attempt record as dead-lettered and leave every earlier attempt record unchanged.
-- [ ] Ensure dead-letter and attempt publication are acknowledged before the consumed offset commits.
-- [ ] Define behavior when dead-letter publication fails, and never drop a terminal event silently.
-- [ ] Test exhaustion from each tier, permanent failure on the first attempt, publication failure and redelivery, duplicate dead-letter
+- [x] Publish permanently failed events to the dead-letter topic without a further retry publication.
+- [x] Mark the terminal attempt record as dead-lettered and leave every earlier attempt record unchanged.
+- [x] Keep payloads opaque to delivery workers. Use only Gregor-generated failure details in attempt records.
+- [x] Ensure dead-letter and attempt publication are acknowledged before the consumed offset commits.
+- [x] Define behavior when dead-letter publication fails, and never drop a terminal event silently.
+- [x] Test exhaustion from each tier, permanent failure on the first attempt, publication failure and redelivery, duplicate dead-letter
   records, and terminal attempt flags.
 
 #### Completion gate
 
-Every terminal delivery generation is durably represented by a dead-letter Kafka record, and no consumer reads that topic yet.
+A committed terminal result has an acknowledged dead letter and terminal attempt. There is no Gregor dead-letter consumer.
 
 ### Phase 2F: Dead-letter occurrence model and envelope codec
 

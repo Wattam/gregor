@@ -175,22 +175,48 @@ public class WebhookService {
                 ByteBuffer.wrap(detailsBytes),
                 webhookEvent.getRetryCount(),
                 webhookEvent.getReplayCount(),
-                false
+                this.requiresDeadLetter(webhookRouteMessage)
         );
+    }
+
+    public boolean requiresDeadLetter(@Body WebhookRouteMessage webhookRouteMessage) {
+        return switch (webhookRouteMessage.deliveryAttemptResult().outcome()) {
+            case SUCCEEDED -> false;
+            case PERMANENT_FAILURE -> true;
+            case RETRYABLE_FAILURE -> this.findNextRetryTier(webhookRouteMessage.webhookEvent()).isEmpty();
+        };
     }
 
     public Optional<RetryPublication> planRetry(@Body WebhookRouteMessage webhookRouteMessage) {
         WebhookEvent attemptedWebhookEvent = webhookRouteMessage.webhookEvent();
         DeliveryAttemptResult deliveryAttemptResult = webhookRouteMessage.deliveryAttemptResult();
-        int retryCount = attemptedWebhookEvent.getRetryCount();
-        if (deliveryAttemptResult.outcome() != DeliveryOutcome.RETRYABLE_FAILURE || attemptedWebhookEvent.getDeliveryAttemptCount() >= this.webhookProperties.maximumAttempts() || retryCount < 0 || retryCount >= RETRY_TIERS.size()) {
+        if (deliveryAttemptResult.outcome() != DeliveryOutcome.RETRYABLE_FAILURE) {
             return Optional.empty();
         }
 
-        RetryTier retryTier = RETRY_TIERS.get(retryCount);
-        Instant nextEligibleAt = deliveryAttemptResult.completedAt().plus(retryTier.retryDelay()).truncatedTo(ChronoUnit.MILLIS);
-        WebhookEvent successorWebhookEvent = WebhookEvent.newBuilder(attemptedWebhookEvent).setRetryCount(retryCount + 1).setNextEligibleAt(nextEligibleAt).build();
-        return Optional.of(new RetryPublication(retryTier.topic(), successorWebhookEvent));
+        return this.findNextRetryTier(attemptedWebhookEvent).map(retryTier -> {
+            Instant nextEligibleAt = deliveryAttemptResult.completedAt().plus(retryTier.retryDelay()).truncatedTo(ChronoUnit.MILLIS);
+            WebhookEvent successorWebhookEvent = WebhookEvent.newBuilder(attemptedWebhookEvent).setRetryCount(attemptedWebhookEvent.getRetryCount() + 1).setNextEligibleAt(nextEligibleAt).build();
+            return new RetryPublication(retryTier.topic(), successorWebhookEvent);
+        });
+    }
+
+    public void publishDeadLetter(@Body WebhookRouteMessage webhookRouteMessage) {
+        WebhookEvent webhookEvent = webhookRouteMessage.webhookEvent();
+        try {
+            this.producerTemplate.sendBodyAndHeader("kafka:" + WebhookRoute.WEBHOOK_EVENT_DEAD_LETTER_TOPIC, webhookEvent, KafkaConstants.KEY, webhookEvent.getEndpointId());
+        } catch (Exception exception) {
+            restoreInterruptIfNeeded(exception);
+            throw new IllegalStateException("Dead-letter publication failed [topic=webhook-events-dead-letter]");
+        }
+    }
+
+    private Optional<RetryTier> findNextRetryTier(WebhookEvent attemptedWebhookEvent) {
+        int retryCount = attemptedWebhookEvent.getRetryCount();
+        if (attemptedWebhookEvent.getDeliveryAttemptCount() >= this.webhookProperties.maximumAttempts() || retryCount < 0 || retryCount >= RETRY_TIERS.size()) {
+            return Optional.empty();
+        }
+        return Optional.of(RETRY_TIERS.get(retryCount));
     }
 
     @Transactional

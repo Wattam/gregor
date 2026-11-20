@@ -12,6 +12,7 @@ import org.apache.camel.component.kafka.KafkaConstants;
 import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.admin.ConsumerGroupDescription;
 import org.apache.kafka.clients.admin.MemberDescription;
+import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.common.GroupState;
 import org.apache.kafka.common.TopicPartition;
@@ -249,27 +250,34 @@ class RetryTierConsumerIntegrationTests {
     }
 
     @Test
-    void auditsOneAttemptAndCommitsWithoutASuccessorWhenNoHigherTierExists() throws Exception {
+    void deadLettersBelowTheMaximumWhenNoHigherTierExists() throws Exception {
         WebhookEvent webhookEvent = event("cumulative-retry.test", 1, 7, 3, ELIGIBILITY_INSTANT);
         WebhookEvent unrelatedWebhookEvent = event("unrelated-retry.test", 1, 7, 3, ELIGIBILITY_INSTANT);
         TEST_RECEIVER.failOnly(webhookEvent.getEventId());
         String inputTopic = WebhookRoute.WEBHOOK_EVENT_RETRY_1M_TOPIC;
-        String[] delayedTopics = {inputTopic, WebhookRoute.WEBHOOK_EVENT_RETRY_10M_TOPIC, WebhookRoute.WEBHOOK_EVENT_RETRY_1H_TOPIC, WebhookRoute.WEBHOOK_EVENT_DEAD_LETTER_TOPIC};
         try (AdminClient adminClient = KafkaTestRecords.adminClient()) {
-            Map<TopicPartition, Long> offsets = KafkaTestRecords.endOffsets(adminClient, delayedTopics);
-            try (KafkaConsumer<String, Object> inputKafkaConsumer = KafkaTestRecords.consumer(this.registryVertx, offsets)) {
+            Map<TopicPartition, Long> expectedRetryOffsets = new HashMap<>(KafkaTestRecords.retryEndOffsets(adminClient));
+            Map<TopicPartition, Long> expectedDeadLetterOffsets = new HashMap<>(KafkaTestRecords.endOffsets(adminClient, "webhook-events-dead-letter"));
+            try (
+                    KafkaConsumer<String, Object> inputKafkaConsumer = KafkaTestRecords.consumer(this.registryVertx, KafkaTestRecords.endOffsets(adminClient, inputTopic));
+                    KafkaConsumer<String, Object> deadLetterKafkaConsumer = KafkaTestRecords.consumer(this.registryVertx, expectedDeadLetterOffsets)
+            ) {
                 for (WebhookEvent webhookEventToSend : List.of(unrelatedWebhookEvent, webhookEvent)) {
                     this.send(inputTopic, webhookEventToSend);
                     KafkaTestRecords.awaitCommit(adminClient, KafkaTestRecords.awaitRecord(inputKafkaConsumer, webhookEventToSend.getEventId()));
                 }
-                Map<TopicPartition, Long> expectedOffsets = new HashMap<>(offsets);
-                expectedOffsets.compute(new TopicPartition(inputTopic, 0), (_, offset) -> offset + 2);
-                Assertions.assertThat(KafkaTestRecords.endOffsets(adminClient, delayedTopics)).isEqualTo(expectedOffsets);
+                ConsumerRecord<String, Object> deadLetterConsumerRecord = KafkaTestRecords.awaitRecord(deadLetterKafkaConsumer, webhookEvent.getEventId());
+                Assertions.assertThat(deadLetterConsumerRecord.key()).isEqualTo(webhookEvent.getEndpointId());
+                Assertions.assertThat(deadLetterConsumerRecord.value()).isEqualTo(WebhookEvent.newBuilder(webhookEvent).setDeliveryAttemptCount(2).build());
+                expectedRetryOffsets.compute(new TopicPartition(inputTopic, 0), (_, offset) -> offset + 2);
+                expectedDeadLetterOffsets.compute(new TopicPartition("webhook-events-dead-letter", deadLetterConsumerRecord.partition()), (_, offset) -> offset + 1);
+                Assertions.assertThat(KafkaTestRecords.retryEndOffsets(adminClient)).isEqualTo(expectedRetryOffsets);
+                Assertions.assertThat(KafkaTestRecords.endOffsets(adminClient, "webhook-events-dead-letter")).isEqualTo(expectedDeadLetterOffsets);
             }
         } finally {
             TEST_RECEIVER.clearRetryableFailure();
         }
-        Assertions.assertThat(this.awaitAttemptRow(unrelatedWebhookEvent.getEventId())).containsEntry("outcome", "SUCCEEDED").containsEntry("http_status", 204);
+        Assertions.assertThat(this.awaitAttemptRow(unrelatedWebhookEvent.getEventId())).containsEntry("outcome", "SUCCEEDED").containsEntry("http_status", 204).containsEntry("dead_lettered", false);
         Assertions.assertThat(TEST_RECEIVER.count(webhookEvent.getEventId())).isEqualTo(1);
         Assertions.assertThat(this.awaitAttemptRow(webhookEvent.getEventId()))
                 .containsEntry("attempt_number", 2)
@@ -277,7 +285,7 @@ class RetryTierConsumerIntegrationTests {
                 .containsEntry("http_status", 503)
                 .containsEntry("retry_count", 7)
                 .containsEntry("replay_count", 3)
-                .containsEntry("dead_lettered", false);
+                .containsEntry("dead_lettered", true);
     }
 
     private static String ownerId(ConsumerGroupDescription consumerGroupDescription, TopicPartition topicPartition) {

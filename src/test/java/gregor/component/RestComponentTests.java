@@ -5,20 +5,26 @@ import gregor.config.WebhookPropertiesFixtures;
 import gregor.dto.DeliveryAttemptResult;
 import gregor.dto.DeliveryOutcome;
 import org.assertj.core.api.Assertions;
+import org.jspecify.annotations.NonNull;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.AdditionalMatchers;
 import org.mockito.Mockito;
 import org.springframework.http.HttpMethod;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
+import org.springframework.http.client.ClientHttpResponse;
 import org.springframework.mock.http.client.MockClientHttpRequest;
 import org.springframework.test.web.client.MockRestServiceServer;
 import org.springframework.test.web.client.match.MockRestRequestMatchers;
 import org.springframework.test.web.client.response.MockRestResponseCreators;
 import org.springframework.web.client.RestClient;
 
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.ProtocolException;
 import java.net.URI;
 import java.net.http.HttpTimeoutException;
@@ -33,7 +39,6 @@ import java.util.concurrent.atomic.AtomicReference;
 class RestComponentTests {
 
     private static final URI TEST_RECEIVER_URI = URI.create("https://receiver.example.test/hooks");
-    private static final String SIGNING_SECRET = "whsec_test-signing-secret";
 
     @Test
     void sendsAndSignsOnlyTheRemainingPayloadBytes() {
@@ -73,6 +78,7 @@ class RestComponentTests {
 
     @ParameterizedTest
     @CsvSource({
+            "101, RETRYABLE_FAILURE",
             "200, SUCCEEDED",
             "299, SUCCEEDED",
             "301, PERMANENT_FAILURE",
@@ -91,7 +97,7 @@ class RestComponentTests {
 
         Assertions.assertThat(deliveryAttemptResult.outcome()).isEqualTo(expectedDeliveryOutcome);
         Assertions.assertThat(deliveryAttemptResult.httpStatus()).isEqualTo(status);
-        Map<String, String> details = expectedDeliveryOutcome == DeliveryOutcome.SUCCEEDED ? Map.of() : Map.of("type", "HTTP_FAILURE", "responseBody", "failure");
+        Map<String, String> details = expectedDeliveryOutcome == DeliveryOutcome.SUCCEEDED ? Map.of() : Map.of("type", "HTTP_FAILURE");
         Assertions.assertThat(deliveryAttemptResult.details()).isEqualTo(details);
     }
 
@@ -122,28 +128,70 @@ class RestComponentTests {
         });
     }
 
-    @Test
-    void truncatesResponseDetailsAtTheLastCompleteUtf8CodePoint() {
+    @ParameterizedTest
+    @ValueSource(ints = {
+            4_095,
+            4_096
+    })
+    void onlyReadFailuresWithinTheResponseLimitChangeTheHttpOutcome(int bytesBeforeFailure) throws IOException {
         Fixture fixture = fixture();
-        String responseBody = "a" + "🙂".repeat(1_100);
-        fixture.mockRestServiceServer().expect(MockRestRequestMatchers.requestTo(TEST_RECEIVER_URI)).andRespond(MockRestResponseCreators.withRawStatus(503).body(responseBody));
+        byte[] responseBodyBytes = "x".repeat(bytesBeforeFailure).getBytes(StandardCharsets.UTF_8);
+        ClientHttpResponse clientHttpResponse = Mockito.mock(ClientHttpResponse.class);
+        Mockito.when(clientHttpResponse.getStatusCode()).thenReturn(HttpStatus.BAD_REQUEST);
+        Mockito.when(clientHttpResponse.getBody()).thenReturn(new InputStream() {
+            private final ByteArrayInputStream byteArrayInputStream = new ByteArrayInputStream(responseBodyBytes);
+
+            @Override
+            public int read() throws IOException {
+                return requireByte(this.byteArrayInputStream.read());
+            }
+
+            @Override
+            public int read(byte @NonNull [] bytes, int offset, int length) throws IOException {
+                return length == 0 ? 0 : requireByte(this.byteArrayInputStream.read(bytes, offset, length));
+            }
+
+            private static int requireByte(int result) throws IOException {
+                if (result < 0) {
+                    throw new IOException("Receiver stopped sending the body");
+                }
+                return result;
+            }
+        });
+        fixture.mockRestServiceServer().expect(MockRestRequestMatchers.requestTo(TEST_RECEIVER_URI)).andRespond(_ -> clientHttpResponse);
 
         DeliveryAttemptResult deliveryAttemptResult = fixture.restComponent().sendWebhook(event("{}"));
 
-        Assertions.assertThat(deliveryAttemptResult.details()).containsEntry("responseBody", "a" + "🙂".repeat(1_023));
+        if (bytesBeforeFailure == 4_096) {
+            Assertions.assertThat(deliveryAttemptResult.outcome()).isEqualTo(DeliveryOutcome.PERMANENT_FAILURE);
+            Assertions.assertThat(deliveryAttemptResult.httpStatus()).isEqualTo(400);
+            Assertions.assertThat(deliveryAttemptResult.details()).isEqualTo(Map.of("type", "HTTP_FAILURE"));
+        } else {
+            Assertions.assertThat(deliveryAttemptResult.outcome()).isEqualTo(DeliveryOutcome.RETRYABLE_FAILURE);
+            Assertions.assertThat(deliveryAttemptResult.httpStatus()).isNull();
+            Assertions.assertThat(deliveryAttemptResult.details()).containsEntry("type", "CONNECTION_FAILURE");
+        }
     }
 
-    @Test
-    void omitsResponseDetailsContainingEitherTheRequestPayloadOrSigningSecret() {
-        String payload = "{\"private\":\"payload-marker\"}";
-        for (String sensitiveValue : new String[]{payload, SIGNING_SECRET}) {
-            Fixture fixture = fixture();
-            fixture.mockRestServiceServer().expect(MockRestRequestMatchers.requestTo(TEST_RECEIVER_URI)).andRespond(MockRestResponseCreators.withRawStatus(503).body("Receiver echoed: " + sensitiveValue));
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "Unknown user: 42",
+            "Rejected: {\"error\":\"\\u0077hsec_test-signing-secret\"}"
+    })
+    void sendsOpaquePayloadBytesAndOmitsReceiverContentOnHttpFailure(String receiverText) {
+        Fixture fixture = fixture();
+        byte[] payloadBytes = {'i', 'd', '=', '4', '2', (byte) 0xFF};
+        fixture.mockRestServiceServer()
+                .expect(MockRestRequestMatchers.requestTo(TEST_RECEIVER_URI))
+                .andExpect(MockRestRequestMatchers.content().bytes(payloadBytes))
+                .andRespond(MockRestResponseCreators.withRawStatus(400).body(receiverText));
 
-            DeliveryAttemptResult deliveryAttemptResult = fixture.restComponent().sendWebhook(event(payload));
+        DeliveryAttemptResult deliveryAttemptResult = fixture.restComponent().sendWebhook(event(ByteBuffer.wrap(payloadBytes)));
 
-            Assertions.assertThat(deliveryAttemptResult.details()).isEqualTo(Map.of("type", "HTTP_FAILURE"));
-        }
+        fixture.mockRestServiceServer().verify();
+        Assertions.assertThat(deliveryAttemptResult.outcome()).isEqualTo(DeliveryOutcome.PERMANENT_FAILURE);
+        Assertions.assertThat(deliveryAttemptResult.httpStatus()).isEqualTo(400);
+        Assertions.assertThat(deliveryAttemptResult.details()).isEqualTo(Map.of("type", "HTTP_FAILURE"));
     }
 
     private static Fixture fixture() {
@@ -155,7 +203,8 @@ class RestComponentTests {
         MockRestServiceServer mockRestServiceServer = MockRestServiceServer.bindTo(restClientBuilder).build();
         SignatureComponent signatureComponent = Mockito.mock(SignatureComponent.class);
         Mockito.when(signatureComponent.sign(Mockito.anyString(), Mockito.anyLong(), Mockito.any())).thenReturn("v1,digest");
-        return new Fixture(mockRestServiceServer, signatureComponent, new RestComponent(restClientBuilder.build(), signatureComponent, clock, WebhookPropertiesFixtures.create()));
+        RestComponent restComponent = new RestComponent(restClientBuilder.build(), signatureComponent, clock, WebhookPropertiesFixtures.create());
+        return new Fixture(mockRestServiceServer, signatureComponent, restComponent);
     }
 
     private static Clock clock(AtomicReference<Instant> currentInstantReference) {

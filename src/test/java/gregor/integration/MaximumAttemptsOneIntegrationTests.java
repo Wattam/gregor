@@ -2,6 +2,7 @@ package gregor.integration;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
+import gregor.avro.WebhookEvent;
 import gregor.route.WebhookRoute;
 import io.vertx.core.Vertx;
 import org.apache.kafka.clients.admin.AdminClient;
@@ -28,6 +29,7 @@ import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.util.HashMap;
 import java.util.Map;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
@@ -37,6 +39,7 @@ import java.util.concurrent.Executors;
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "gregor.webhook.maximum-attempts=1")
 class MaximumAttemptsOneIntegrationTests {
 
+    private static final String DEAD_LETTER_TOPIC = "webhook-events-dead-letter";
     private static final TestReceiver TEST_RECEIVER = TestReceiver.start();
 
     @LocalServerPort
@@ -94,29 +97,41 @@ class MaximumAttemptsOneIntegrationTests {
     }
 
     @Test
-    void configuredMaximumOfOnePermitsOnlyTheInitialAttempt() throws Exception {
-        String[] delayedTopics = {WebhookRoute.WEBHOOK_EVENT_RETRY_1M_TOPIC, WebhookRoute.WEBHOOK_EVENT_RETRY_10M_TOPIC, WebhookRoute.WEBHOOK_EVENT_RETRY_1H_TOPIC, WebhookRoute.WEBHOOK_EVENT_DEAD_LETTER_TOPIC};
+    void configuredMaximumOfOneDeadLettersTheInitialRetryableFailure() throws Exception {
         try (AdminClient adminClient = KafkaTestRecords.adminClient()) {
-            Map<TopicPartition, Long> delayedOffsetsBefore = KafkaTestRecords.endOffsets(adminClient, delayedTopics);
-            try (KafkaConsumer<String, Object> sourceKafkaConsumer = KafkaTestRecords.consumer(this.registryVertx, KafkaTestRecords.endOffsets(adminClient, WebhookRoute.WEBHOOK_EVENT_TOPIC))) {
+            Map<TopicPartition, Long> retryOffsets = KafkaTestRecords.retryEndOffsets(adminClient);
+            Map<TopicPartition, Long> expectedDeadLetterOffsets = new HashMap<>(KafkaTestRecords.endOffsets(adminClient, DEAD_LETTER_TOPIC));
+            try (
+                    KafkaConsumer<String, Object> sourceKafkaConsumer = KafkaTestRecords.consumer(this.registryVertx, KafkaTestRecords.endOffsets(adminClient, WebhookRoute.WEBHOOK_EVENT_TOPIC));
+                    KafkaConsumer<String, Object> deadLetterKafkaConsumer = KafkaTestRecords.consumer(this.registryVertx, expectedDeadLetterOffsets)
+            ) {
                 String eventId = this.postEvent();
                 ConsumerRecord<String, Object> inputConsumerRecord = KafkaTestRecords.awaitRecord(sourceKafkaConsumer, eventId);
                 KafkaTestRecords.awaitCommit(adminClient, inputConsumerRecord);
                 Assertions.assertThat(TEST_RECEIVER.count(eventId)).isEqualTo(1);
+                WebhookEvent inputWebhookEvent = (WebhookEvent) inputConsumerRecord.value();
+                ConsumerRecord<String, Object> deadLetterConsumerRecord = KafkaTestRecords.awaitRecord(deadLetterKafkaConsumer, eventId);
+                Assertions.assertThat(deadLetterConsumerRecord.topic()).isEqualTo(DEAD_LETTER_TOPIC);
+                Assertions.assertThat(deadLetterConsumerRecord.key()).isEqualTo(inputWebhookEvent.getEndpointId());
+                Assertions.assertThat(deadLetterConsumerRecord.value()).isEqualTo(WebhookEvent.newBuilder(inputWebhookEvent).setDeliveryAttemptCount(1).build());
+                Assertions.assertThat(((WebhookEvent) deadLetterConsumerRecord.value()).getNextEligibleAt()).isNull();
+                expectedDeadLetterOffsets.compute(new TopicPartition(DEAD_LETTER_TOPIC, deadLetterConsumerRecord.partition()), (_, offset) -> offset + 1);
+                Assertions.assertThat(KafkaTestRecords.endOffsets(adminClient, DEAD_LETTER_TOPIC)).isEqualTo(expectedDeadLetterOffsets);
                 Assertions.assertThat(this.awaitAttemptRow(eventId))
                         .containsEntry("attempt_number", 1)
                         .containsEntry("outcome", "RETRYABLE_FAILURE")
                         .containsEntry("http_status", 503)
                         .containsEntry("retry_count", 0)
                         .containsEntry("replay_count", 0)
-                        .containsEntry("dead_lettered", false);
-                Assertions.assertThat(KafkaTestRecords.endOffsets(adminClient, delayedTopics)).isEqualTo(delayedOffsetsBefore);
+                        .containsEntry("dead_lettered", true);
+                Assertions.assertThat(KafkaTestRecords.retryEndOffsets(adminClient)).isEqualTo(retryOffsets);
             }
         }
     }
 
     private String postEvent() throws Exception {
-        HttpRequest httpRequest = HttpRequest.newBuilder()
+        HttpRequest httpRequest = HttpRequest
+                .newBuilder()
                 .uri(URI.create("http://localhost:" + this.serverPort + "/api/events"))
                 .header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString("{\"eventType\":\"single-attempt.test\",\"payload\":{}}", StandardCharsets.UTF_8))
