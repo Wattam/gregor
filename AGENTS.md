@@ -2,6 +2,7 @@
 
 - Document only current behavior in `README.md`. Omit roadmap references and future work.
 - Always treat formatting-only changes as intentional.
+- Never use deprecated APIs, dependencies, commands, or configuration options. Use supported replacements.
 
 ## Java
 

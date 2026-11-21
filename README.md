@@ -34,7 +34,7 @@ The runtime supports these environment overrides:
 | `KAFKA_RETRY_TOPIC_RETENTION`          | `7d`                                                |
 | `KAFKA_DEAD_LETTER_TOPIC_RETENTION`    | `30d`                                               |
 
-`WEBHOOK_MAXIMUM_ATTEMPTS` must be from `1` through `4`. `KAFKA_MAX_POLL_INTERVAL_MS` must exceed `3900000`. The maximum permitted eligibility wait is this poll interval minus five minutes. The default poll interval is 75 minutes, and the default maximum permitted wait is 70 minutes. `KAFKA_RETRY_TOPIC_RETENTION` must exceed `1h`, and `KAFKA_DEAD_LETTER_TOPIC_RETENTION` must be positive.
+`WEBHOOK_MAXIMUM_ATTEMPTS` must be from `1` through `4`. `KAFKA_MAX_POLL_INTERVAL_MS` must exceed `3900000`. The maximum permitted eligibility wait is this poll interval minus five minutes. The default poll interval is 75 minutes, and the default maximum permitted wait is 70 minutes. Camel's Kafka client idle connection timeout follows the poll interval so the client does not close an idle connection before that interval expires. `KAFKA_RETRY_TOPIC_RETENTION` must exceed `1h`, and `KAFKA_DEAD_LETTER_TOPIC_RETENTION` must be positive.
 
 ## Ingest an event
 

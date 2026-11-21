@@ -33,6 +33,7 @@ camel:
             brokers: localhost:1
             lazy-start-producer: true
             max-poll-interval-ms: ${KAFKA_MAX_POLL_INTERVAL_MS:4500000}
+            connection-max-idle-ms: ${camel.component.kafka.max-poll-interval-ms}
             key-serializer: org.apache.kafka.common.serialization.StringSerializer
             value-serializer: io.apicurio.registry.serde.avro.AvroKafkaSerializer
             key-deserializer: org.apache.kafka.common.serialization.StringDeserializer

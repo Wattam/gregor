@@ -3,7 +3,7 @@ package gregor.config;
 import gregor.config.properties.KafkaConsumerProperties;
 import gregor.config.properties.KafkaTopicProperties;
 import gregor.config.properties.WebhookProperties;
-import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.Strings;
 import org.assertj.core.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.autoconfigure.AutoConfigurations;
@@ -49,6 +49,7 @@ class ConfigurationPropertiesTests {
             KafkaConsumerProperties kafkaConsumerProperties = assertableApplicationContext.getBean(KafkaConsumerProperties.class);
             Assertions.assertThat(kafkaConsumerProperties.maxPollIntervalMs()).isEqualTo(4_500_000);
             Assertions.assertThat(kafkaConsumerProperties.maximumPermittedWait()).isEqualTo(Duration.ofMinutes(70));
+            Assertions.assertThat(assertableApplicationContext.getEnvironment().getRequiredProperty("camel.component.kafka.connection-max-idle-ms", Integer.class)).isEqualTo(4_500_000);
             KafkaTopicProperties kafkaTopicProperties = assertableApplicationContext.getBean(KafkaTopicProperties.class);
             Assertions.assertThat(kafkaTopicProperties.retryRetention()).isEqualTo(Duration.ofDays(7));
             Assertions.assertThat(kafkaTopicProperties.deadLetterRetention()).isEqualTo(Duration.ofDays(30));
@@ -87,6 +88,7 @@ class ConfigurationPropertiesTests {
                     KafkaConsumerProperties kafkaConsumerProperties = assertableApplicationContext.getBean(KafkaConsumerProperties.class);
                     Assertions.assertThat(kafkaConsumerProperties.maxPollIntervalMs()).isEqualTo(4_200_000);
                     Assertions.assertThat(kafkaConsumerProperties.maximumPermittedWait()).isEqualTo(Duration.ofMinutes(65));
+                    Assertions.assertThat(assertableApplicationContext.getEnvironment().getRequiredProperty("camel.component.kafka.connection-max-idle-ms", Integer.class)).isEqualTo(4_200_000);
                     KafkaTopicProperties kafkaTopicProperties = assertableApplicationContext.getBean(KafkaTopicProperties.class);
                     Assertions.assertThat(kafkaTopicProperties.retryRetention()).isEqualTo(Duration.ofHours(2));
                     Assertions.assertThat(kafkaTopicProperties.deadLetterRetention()).isEqualTo(Duration.ofDays(3));
@@ -124,7 +126,7 @@ class ConfigurationPropertiesTests {
                 .load("production", new FileSystemResource("src/main/resources/application.yaml"))
                 .stream()
                 .flatMap(propertySource -> Arrays.stream(((EnumerablePropertySource<?>) propertySource).getPropertyNames()))
-                .filter(name -> StringUtils.startsWith(name, "camel."))
+                .filter(name -> Strings.CS.startsWith(name, "camel."))
                 .map(name -> name.replaceFirst("\\.?\\[.*", ""))
                 .distinct()
                 .toList();

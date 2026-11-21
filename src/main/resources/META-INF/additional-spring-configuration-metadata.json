@@ -61,6 +61,12 @@
             "description": "The maximum delay between invocations of poll() when using consumer group management."
         },
         {
+            "name": "camel.component.kafka.connection-max-idle-ms",
+            "type": "java.lang.Integer",
+            "sourceType": "org.apache.camel.component.kafka.springboot.KafkaComponentConfiguration",
+            "description": "The Kafka client idle connection timeout. Defaults to the configured maximum poll interval to avoid client-side disconnects during long rebalances."
+        },
+        {
             "name": "camel.component.kafka.key-serializer",
             "type": "java.lang.String",
             "sourceType": "org.apache.camel.component.kafka.springboot.KafkaComponentConfiguration",
