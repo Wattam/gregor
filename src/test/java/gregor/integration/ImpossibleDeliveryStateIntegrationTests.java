@@ -4,6 +4,8 @@ import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import gregor.avro.WebhookEvent;
 import gregor.route.WebhookRoute;
+import lombok.AccessLevel;
+import lombok.RequiredArgsConstructor;
 import org.apache.camel.ProducerTemplate;
 import org.apache.camel.component.kafka.KafkaConstants;
 import org.apache.kafka.clients.admin.AdminClient;
@@ -29,6 +31,7 @@ import java.util.Base64;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
@@ -201,7 +204,7 @@ class ImpossibleDeliveryStateIntegrationTests {
 
     private int attemptRowCount(String eventId) {
         Integer count = this.jdbcTemplate.queryForObject("SELECT count(*) FROM delivery_attempt WHERE event_id = ?::uuid", Integer.class, eventId);
-        return count == null ? 0 : count;
+        return Objects.isNull(count) ? 0 : count;
     }
 
     private static WebhookEvent event(String eventType, int deliveryAttemptCount, int retryCount, int replayCount, Instant nextEligibleAt) {
@@ -225,16 +228,12 @@ class ImpossibleDeliveryStateIntegrationTests {
     private record CapturedRequest(String webhookId) {
     }
 
+    @RequiredArgsConstructor(access = AccessLevel.PRIVATE)
     private static final class TestReceiver implements AutoCloseable {
 
         private final HttpServer httpServer;
         private final ExecutorService executorService;
         private final ConcurrentLinkedQueue<CapturedRequest> capturedRequests = new ConcurrentLinkedQueue<>();
-
-        private TestReceiver(HttpServer httpServer, ExecutorService executorService) {
-            this.httpServer = httpServer;
-            this.executorService = executorService;
-        }
 
         static TestReceiver start() {
             try {
@@ -255,7 +254,7 @@ class ImpossibleDeliveryStateIntegrationTests {
         }
 
         int count(String eventId) {
-            return (int) this.capturedRequests.stream().filter(capturedRequest -> eventId.equals(capturedRequest.webhookId())).count();
+            return (int) this.capturedRequests.stream().filter(capturedRequest -> Objects.equals(eventId, capturedRequest.webhookId())).count();
         }
 
         void awaitRequest(String eventId) throws InterruptedException {

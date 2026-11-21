@@ -5,6 +5,8 @@ import com.sun.net.httpserver.HttpServer;
 import gregor.avro.WebhookEvent;
 import gregor.dto.WebhookRouteMessage;
 import gregor.route.WebhookRoute;
+import lombok.AccessLevel;
+import lombok.RequiredArgsConstructor;
 import org.apache.camel.CamelContext;
 import org.apache.camel.ProducerTemplate;
 import org.apache.camel.builder.AdviceWith;
@@ -36,6 +38,7 @@ import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.Base64;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
@@ -121,7 +124,7 @@ class RetryEligibilityWaitInterruptionIntegrationTests {
                 WebhookRoute.WEBHOOK_RETRY_ELIGIBILITY_DIRECT,
                 adviceWithRouteBuilder -> adviceWithRouteBuilder.weaveAddFirst().process(exchange -> {
                     WebhookRouteMessage webhookRouteMessage = exchange.getMessage().getBody(WebhookRouteMessage.class);
-                    if (eventId.equals(webhookRouteMessage.webhookEvent().getEventId())) {
+                    if (Objects.equals(eventId, webhookRouteMessage.webhookEvent().getEventId())) {
                         eligibilityStartedCountDownLatch.countDown();
                     }
                 })
@@ -166,7 +169,7 @@ class RetryEligibilityWaitInterruptionIntegrationTests {
         try (AdminClient adminClient = this.adminClient()) {
             Map<TopicPartition, OffsetAndMetadata> offsets = adminClient.listConsumerGroupOffsets(WebhookRoute.WEBHOOK_EVENT_RETRY_1M_TOPIC).partitionsToOffsetAndMetadata().get(5, TimeUnit.SECONDS);
             OffsetAndMetadata committedOffsetAndMetadata = offsets.get(topicPartition);
-            Assertions.assertThat(committedOffsetAndMetadata == null || committedOffsetAndMetadata.offset() < expectedOffset).isTrue();
+            Assertions.assertThat(Objects.isNull(committedOffsetAndMetadata) || committedOffsetAndMetadata.offset() < expectedOffset).isTrue();
         }
     }
 
@@ -176,7 +179,7 @@ class RetryEligibilityWaitInterruptionIntegrationTests {
             while (Instant.now().isBefore(deadline)) {
                 Map<TopicPartition, OffsetAndMetadata> offsets = adminClient.listConsumerGroupOffsets(WebhookRoute.WEBHOOK_EVENT_RETRY_1M_TOPIC).partitionsToOffsetAndMetadata().get(5, TimeUnit.SECONDS);
                 OffsetAndMetadata committedOffsetAndMetadata = offsets.get(topicPartition);
-                if (committedOffsetAndMetadata != null && committedOffsetAndMetadata.offset() >= expectedOffset) {
+                if (Objects.nonNull(committedOffsetAndMetadata) && committedOffsetAndMetadata.offset() >= expectedOffset) {
                     return;
                 }
                 Thread.sleep(50L);
@@ -192,6 +195,7 @@ class RetryEligibilityWaitInterruptionIntegrationTests {
     private record CapturedRequest(String webhookId) {
     }
 
+    @RequiredArgsConstructor(access = AccessLevel.PRIVATE)
     private static final class TestReceiver implements AutoCloseable {
 
         private final HttpServer httpServer;
@@ -200,11 +204,6 @@ class RetryEligibilityWaitInterruptionIntegrationTests {
         private volatile CountDownLatch responseCountDownLatch;
         private volatile CountDownLatch responseBlockedCountDownLatch;
         private volatile String blockedEventId;
-
-        private TestReceiver(HttpServer httpServer, ExecutorService executorService) {
-            this.httpServer = httpServer;
-            this.executorService = executorService;
-        }
 
         static TestReceiver start() {
             try {
@@ -232,20 +231,20 @@ class RetryEligibilityWaitInterruptionIntegrationTests {
 
         void awaitBlockedResponse() throws InterruptedException {
             CountDownLatch responseBlockedCountDownLatch = this.responseBlockedCountDownLatch;
-            if (responseBlockedCountDownLatch == null || !responseBlockedCountDownLatch.await(15, TimeUnit.SECONDS)) {
+            if (Objects.isNull(responseBlockedCountDownLatch) || !responseBlockedCountDownLatch.await(15, TimeUnit.SECONDS)) {
                 throw new AssertionError("Expected a webhook response to remain blocked");
             }
         }
 
         void releaseResponses() {
             CountDownLatch responseCountDownLatch = this.responseCountDownLatch;
-            if (responseCountDownLatch != null) {
+            if (Objects.nonNull(responseCountDownLatch)) {
                 responseCountDownLatch.countDown();
             }
         }
 
         int count(String eventId) {
-            return (int) this.capturedRequests.stream().filter(capturedRequest -> eventId.equals(capturedRequest.webhookId())).count();
+            return (int) this.capturedRequests.stream().filter(capturedRequest -> Objects.equals(eventId, capturedRequest.webhookId())).count();
         }
 
         private void handle(HttpExchange httpExchange) throws IOException {
@@ -253,7 +252,7 @@ class RetryEligibilityWaitInterruptionIntegrationTests {
             String eventId = httpExchange.getRequestHeaders().getFirst("webhook-id");
             this.capturedRequests.add(new CapturedRequest(eventId));
             try (httpExchange) {
-                if (eventId != null && eventId.equals(this.blockedEventId)) {
+                if (Objects.nonNull(eventId) && Objects.equals(eventId, this.blockedEventId)) {
                     this.responseBlockedCountDownLatch.countDown();
                     this.responseCountDownLatch.await(10, TimeUnit.SECONDS);
                 }

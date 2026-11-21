@@ -14,6 +14,7 @@ import org.apache.camel.component.kafka.consumer.KafkaManualCommit;
 import org.apache.camel.component.mock.MockEndpoint;
 import org.apache.camel.test.spring.junit5.CamelSpringBootTest;
 import org.apache.camel.test.spring.junit5.UseAdviceWith;
+import org.apache.commons.lang3.StringUtils;
 import org.assertj.core.api.Assertions;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
@@ -30,6 +31,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 
 @UseAdviceWith
 @CamelSpringBootTest
@@ -95,13 +97,13 @@ class WebhookRouteTests {
         String consumerRoute = this.adviseDeliveryRoutes(topic);
 
         List<String> operations = new ArrayList<>();
-        int replayCount = topic.equals("webhook-events") ? 0 : 2;
+        int replayCount = Objects.equals(topic, "webhook-events") ? 0 : 2;
         Instant createdAt = Instant.EPOCH;
         ByteBuffer payloadByteBuffer = ByteBuffer.wrap(new byte[]{9, 0, -1, 10, 32, 9}, 1, 4);
         WebhookEvent webhookEvent = new WebhookEvent("event-1", "order.created", "tenant-1", "endpoint-1", createdAt, payloadByteBuffer, retryCount, nextEligibleAt, priorAttempts, replayCount);
-        Map<String, String> details = deliveryOutcome == DeliveryOutcome.SUCCEEDED ? Map.of() : Map.of("type", "HTTP_FAILURE");
+        Map<String, String> details = Objects.equals(deliveryOutcome, DeliveryOutcome.SUCCEEDED) ? Map.of() : Map.of("type", "HTTP_FAILURE");
         IllegalStateException publicationException = new IllegalStateException("publication failed at " + failedPublication);
-        if (failedPublication == FailedPublication.ATTEMPT_DETAILS) {
+        if (Objects.equals(failedPublication, FailedPublication.ATTEMPT_DETAILS)) {
             Mockito.doThrow(publicationException).when(this.jsonMapper).writeValueAsBytes(details);
         }
         Mockito.when(this.restComponent.sendWebhook(webhookEvent)).thenAnswer(_ -> {
@@ -119,21 +121,21 @@ class WebhookRouteTests {
         MockEndpoint attemptMockEndpoint = this.camelContext.getEndpoint(ATTEMPT_OUTPUT, MockEndpoint.class);
         attemptMockEndpoint.whenAnyExchangeReceived(_ -> {
             operations.add("attempt");
-            if (failedPublication == FailedPublication.ATTEMPT) {
+            if (Objects.equals(failedPublication, FailedPublication.ATTEMPT)) {
                 throw publicationException;
             }
         });
         MockEndpoint retryMockEndpoint = this.camelContext.getEndpoint(RETRY_OUTPUT, MockEndpoint.class);
         retryMockEndpoint.whenAnyExchangeReceived(_ -> {
             operations.add("retry");
-            if (failedPublication == FailedPublication.RETRY) {
+            if (Objects.equals(failedPublication, FailedPublication.RETRY)) {
                 throw publicationException;
             }
         });
         MockEndpoint deadLetterMockEndpoint = this.camelContext.getEndpoint(DEAD_LETTER_OUTPUT, MockEndpoint.class);
         deadLetterMockEndpoint.whenAnyExchangeReceived(_ -> {
             operations.add("dead-letter");
-            if (failedPublication == FailedPublication.DEAD_LETTER) {
+            if (Objects.equals(failedPublication, FailedPublication.DEAD_LETTER)) {
                 throw publicationException;
             }
         });
@@ -154,15 +156,15 @@ class WebhookRouteTests {
                 )
         );
 
-        if (failedPublication == FailedPublication.NONE) {
+        if (Objects.equals(failedPublication, FailedPublication.NONE)) {
             Assertions.assertThat(publicationFailure).isNull();
-        } else if (failedPublication == FailedPublication.DEAD_LETTER) {
+        } else if (Objects.equals(failedPublication, FailedPublication.DEAD_LETTER)) {
             Assertions.assertThat(publicationFailure).hasRootCauseMessage("Dead-letter publication failed [topic=webhook-events-dead-letter]");
         } else {
             Assertions.assertThat(publicationFailure).hasRootCause(publicationException);
         }
         Assertions.assertThat(operations).containsExactly(expectedOperations.split("/"));
-        boolean terminal = expectedOperations.contains("/dead-letter");
+        boolean terminal = StringUtils.contains(expectedOperations, "/dead-letter");
         if (terminal) {
             WebhookEvent expectedWebhookEvent = new WebhookEvent(
                     "event-1",
@@ -183,7 +185,7 @@ class WebhookRouteTests {
         } else {
             Assertions.assertThat(deadLetterMockEndpoint.getExchanges()).isEmpty();
         }
-        if (failedPublication == FailedPublication.DEAD_LETTER || failedPublication == FailedPublication.ATTEMPT_DETAILS) {
+        if (Objects.equals(failedPublication, FailedPublication.DEAD_LETTER) || Objects.equals(failedPublication, FailedPublication.ATTEMPT_DETAILS)) {
             Assertions.assertThat(attemptMockEndpoint.getExchanges()).isEmpty();
         } else {
             Assertions.assertThat(attemptMockEndpoint.getExchanges()).singleElement().satisfies(exchange -> {
@@ -197,7 +199,7 @@ class WebhookRouteTests {
                 Assertions.assertThat(exchange.getMessage().getHeaders()).containsExactlyEntriesOf(Map.of(KafkaConstants.KEY, "event-1"));
             });
         }
-        if (expectedRetryTopic != null) {
+        if (Objects.nonNull(expectedRetryTopic)) {
             Assertions.assertThat(retryMockEndpoint.getExchanges()).singleElement().satisfies(exchange -> {
                 WebhookEvent retryWebhookEvent = exchange.getMessage().getBody(WebhookEvent.class);
                 Assertions.assertThat(retryWebhookEvent.getEventId()).isEqualTo("event-1");

@@ -5,6 +5,9 @@ import com.sun.net.httpserver.HttpServer;
 import gregor.avro.WebhookEvent;
 import gregor.route.WebhookRoute;
 import io.vertx.core.Vertx;
+import lombok.AccessLevel;
+import lombok.RequiredArgsConstructor;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
@@ -35,6 +38,7 @@ import java.time.Instant;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
@@ -143,7 +147,7 @@ class MaximumAttemptsOneIntegrationTests {
                 .getHandlerMethods()
                 .entrySet()
                 .stream()
-                .filter(entry -> entry.getValue().getBeanType().getPackageName().startsWith("gregor."))
+                .filter(entry -> StringUtils.startsWith(entry.getValue().getBeanType().getPackageName(), "gregor."))
                 .map(Map.Entry::getKey)
                 .toList();
         Assertions.assertThat(requestMappingInfos)
@@ -188,22 +192,18 @@ class MaximumAttemptsOneIntegrationTests {
 
     private int attemptRowCount(String eventId) {
         Integer count = this.jdbcTemplate.queryForObject("SELECT count(*) FROM delivery_attempt WHERE event_id = ?::uuid", Integer.class, eventId);
-        return count == null ? 0 : count;
+        return Objects.isNull(count) ? 0 : count;
     }
 
     private record CapturedRequest(String webhookId) {
     }
 
+    @RequiredArgsConstructor(access = AccessLevel.PRIVATE)
     private static final class TestReceiver implements AutoCloseable {
 
         private final HttpServer httpServer;
         private final ExecutorService executorService;
         private final ConcurrentLinkedQueue<CapturedRequest> capturedRequests = new ConcurrentLinkedQueue<>();
-
-        private TestReceiver(HttpServer httpServer, ExecutorService executorService) {
-            this.httpServer = httpServer;
-            this.executorService = executorService;
-        }
 
         static TestReceiver start() {
             try {
@@ -224,7 +224,7 @@ class MaximumAttemptsOneIntegrationTests {
         }
 
         int count(String eventId) {
-            return (int) this.capturedRequests.stream().filter(capturedRequest -> eventId.equals(capturedRequest.webhookId())).count();
+            return (int) this.capturedRequests.stream().filter(capturedRequest -> Objects.equals(eventId, capturedRequest.webhookId())).count();
         }
 
         private void handle(HttpExchange httpExchange) throws IOException {

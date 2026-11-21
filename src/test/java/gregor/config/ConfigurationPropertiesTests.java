@@ -3,6 +3,7 @@ package gregor.config;
 import gregor.config.properties.KafkaConsumerProperties;
 import gregor.config.properties.KafkaTopicProperties;
 import gregor.config.properties.WebhookProperties;
+import org.apache.commons.lang3.StringUtils;
 import org.assertj.core.api.Assertions;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.autoconfigure.AutoConfigurations;
@@ -123,7 +124,7 @@ class ConfigurationPropertiesTests {
                 .load("production", new FileSystemResource("src/main/resources/application.yaml"))
                 .stream()
                 .flatMap(propertySource -> Arrays.stream(((EnumerablePropertySource<?>) propertySource).getPropertyNames()))
-                .filter(name -> name.startsWith("camel."))
+                .filter(name -> StringUtils.startsWith(name, "camel."))
                 .map(name -> name.replaceFirst("\\.?\\[.*", ""))
                 .distinct()
                 .toList();

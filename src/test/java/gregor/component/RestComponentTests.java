@@ -34,6 +34,7 @@ import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.atomic.AtomicReference;
 
 class RestComponentTests {
@@ -97,7 +98,7 @@ class RestComponentTests {
 
         Assertions.assertThat(deliveryAttemptResult.outcome()).isEqualTo(expectedDeliveryOutcome);
         Assertions.assertThat(deliveryAttemptResult.httpStatus()).isEqualTo(status);
-        Map<String, String> details = expectedDeliveryOutcome == DeliveryOutcome.SUCCEEDED ? Map.of() : Map.of("type", "HTTP_FAILURE");
+        Map<String, String> details = Objects.equals(expectedDeliveryOutcome, DeliveryOutcome.SUCCEEDED) ? Map.of() : Map.of("type", "HTTP_FAILURE");
         Assertions.assertThat(deliveryAttemptResult.details()).isEqualTo(details);
     }
 

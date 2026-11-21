@@ -27,6 +27,7 @@ import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.Base64;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -115,7 +116,7 @@ class DeliveryAttemptRedeliveryIntegrationTests {
                     return null;
                 })
                 .when(this.webhookService)
-                .persistDeliveryAttempt(Mockito.argThat(candidateDeliveryAttempt -> eventId.equals(candidateDeliveryAttempt.getEventId())));
+                .persistDeliveryAttempt(Mockito.argThat(candidateDeliveryAttempt -> Objects.equals(eventId, candidateDeliveryAttempt.getEventId())));
 
         TopicPartition topicPartition = new TopicPartition(WebhookRoute.PERSIST_DELIVERY_ATTEMPT_TOPIC, 0);
         String route = "kafka:" + topicPartition.topic() + "?groupId=" + topicPartition.topic();
@@ -136,7 +137,7 @@ class DeliveryAttemptRedeliveryIntegrationTests {
 
     private static long committedOffset(AdminClient adminClient, TopicPartition topicPartition) throws Exception {
         OffsetAndMetadata committedOffsetAndMetadata = adminClient.listConsumerGroupOffsets(WebhookRoute.PERSIST_DELIVERY_ATTEMPT_TOPIC).partitionsToOffsetAndMetadata().get(5, TimeUnit.SECONDS).get(topicPartition);
-        return committedOffsetAndMetadata == null ? -1 : committedOffsetAndMetadata.offset();
+        return Objects.isNull(committedOffsetAndMetadata) ? -1 : committedOffsetAndMetadata.offset();
     }
 
     private static void awaitCommittedOffset(AdminClient adminClient, TopicPartition topicPartition, long offset) throws Exception {

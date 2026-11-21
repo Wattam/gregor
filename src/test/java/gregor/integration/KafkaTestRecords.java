@@ -23,6 +23,7 @@ import java.time.Instant;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Properties;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
@@ -144,13 +145,13 @@ final class KafkaTestRecords {
 
     private static long committedOffset(AdminClient adminClient, TopicPartition topicPartition) throws Exception {
         OffsetAndMetadata committedOffsetAndMetadata = adminClient.listConsumerGroupOffsets(topicPartition.topic()).partitionsToOffsetAndMetadata().get(5, TimeUnit.SECONDS).get(topicPartition);
-        return committedOffsetAndMetadata == null ? -1L : committedOffsetAndMetadata.offset();
+        return Objects.isNull(committedOffsetAndMetadata) ? -1L : committedOffsetAndMetadata.offset();
     }
 
     private static boolean matchesEvent(Object recordValue, String eventId) {
         return switch (recordValue) {
-            case WebhookEvent webhookEvent -> eventId.equals(webhookEvent.getEventId());
-            case DeliveryAttempt deliveryAttempt -> eventId.equals(deliveryAttempt.getEventId());
+            case WebhookEvent webhookEvent -> Objects.equals(eventId, webhookEvent.getEventId());
+            case DeliveryAttempt deliveryAttempt -> Objects.equals(eventId, deliveryAttempt.getEventId());
             default -> false;
         };
     }

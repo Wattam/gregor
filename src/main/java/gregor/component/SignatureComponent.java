@@ -1,6 +1,7 @@
 package gregor.component;
 
 import gregor.config.properties.WebhookProperties;
+import org.apache.commons.lang3.StringUtils;
 import org.springframework.stereotype.Component;
 
 import javax.crypto.Mac;
@@ -43,7 +44,7 @@ public class SignatureComponent {
     }
 
     private static byte[] decodeSecret(String configuredSecret) {
-        if (configuredSecret == null || !configuredSecret.startsWith(SECRET_PREFIX)) {
+        if (!StringUtils.startsWith(configuredSecret, SECRET_PREFIX)) {
             throw new IllegalArgumentException("Webhook signing secret must use the whsec_ prefix");
         }
 

@@ -6,6 +6,8 @@ import gregor.avro.WebhookEvent;
 import gregor.route.WebhookRoute;
 import gregor.service.WebhookService;
 import io.vertx.core.Vertx;
+import lombok.AccessLevel;
+import lombok.RequiredArgsConstructor;
 import org.apache.camel.CamelContext;
 import org.apache.camel.ProducerTemplate;
 import org.apache.camel.component.kafka.KafkaConstants;
@@ -46,6 +48,7 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -193,7 +196,8 @@ class RetryTierConsumerIntegrationTests {
                     }
                     return null;
                 })
-                .when(this.webhookService).awaitEligibility(Mockito.argThat(webhookRouteMessage -> waitingWebhookEvent.getEventId().equals(webhookRouteMessage.webhookEvent().getEventId())));
+                .when(this.webhookService)
+                .awaitEligibility(Mockito.argThat(webhookRouteMessage -> Objects.equals(waitingWebhookEvent.getEventId(), webhookRouteMessage.webhookEvent().getEventId())));
 
         try {
             this.send(topic, waitingWebhookEvent, retryPartitionSelection.waitingPartition());
@@ -236,7 +240,8 @@ class RetryTierConsumerIntegrationTests {
                     eligibilityWaitFuture.complete(Duration.ofNanos(System.nanoTime() - waitStartedAtNanos));
                     return null;
                 })
-                .when(this.webhookService).awaitEligibility(Mockito.argThat(webhookRouteMessage -> waitingWebhookEvent.getEventId().equals(webhookRouteMessage.webhookEvent().getEventId())));
+                .when(this.webhookService)
+                .awaitEligibility(Mockito.argThat(webhookRouteMessage -> Objects.equals(waitingWebhookEvent.getEventId(), webhookRouteMessage.webhookEvent().getEventId())));
 
         this.send(topic, waitingWebhookEvent, waitingTopicPartition.partition());
         Assertions.assertThat(eligibilityWaitFuture.get(20, TimeUnit.SECONDS)).isGreaterThan(SESSION_TIMEOUT);
@@ -304,7 +309,12 @@ class RetryTierConsumerIntegrationTests {
             List<List<TopicPartition>> memberAssignments = consumerGroupDescription
                     .members()
                     .stream()
-                    .map(memberDescription -> memberDescription.assignment().topicPartitions().stream().filter(topicPartition -> topic.equals(topicPartition.topic())).sorted(Comparator.comparingInt(TopicPartition::partition)).toList())
+                    .map(memberDescription -> memberDescription.assignment()
+                            .topicPartitions()
+                            .stream()
+                            .filter(topicPartition -> Objects.equals(topic, topicPartition.topic()))
+                            .sorted(Comparator.comparingInt(TopicPartition::partition))
+                            .toList())
                     .filter(partitions -> !partitions.isEmpty())
                     .toList();
             Assertions.assertThat(memberAssignments).hasSize(2);
@@ -318,7 +328,7 @@ class RetryTierConsumerIntegrationTests {
         while (Instant.now().isBefore(deadline)) {
             try {
                 ConsumerGroupDescription consumerGroupDescription = adminClient.describeConsumerGroups(List.of(groupId)).all().get(2, TimeUnit.SECONDS).get(groupId);
-                if (consumerGroupDescription.groupState() == GroupState.STABLE && consumerGroupDescription.members().size() == 2) {
+                if (Objects.equals(consumerGroupDescription.groupState(), GroupState.STABLE) && consumerGroupDescription.members().size() == 2) {
                     return consumerGroupDescription;
                 }
             } catch (ExecutionException | TimeoutException exception) {
@@ -362,7 +372,7 @@ class RetryTierConsumerIntegrationTests {
 
     private int attemptRowCount(String eventId) {
         Integer count = this.jdbcTemplate.queryForObject("SELECT count(*) FROM delivery_attempt WHERE event_id = ?::uuid", Integer.class, eventId);
-        return count == null ? 0 : count;
+        return Objects.isNull(count) ? 0 : count;
     }
 
     private static String retryConsumerUri(String topic) {
@@ -400,17 +410,13 @@ class RetryTierConsumerIntegrationTests {
     private record CapturedRequest(String webhookId) {
     }
 
+    @RequiredArgsConstructor(access = AccessLevel.PRIVATE)
     private static final class TestReceiver implements AutoCloseable {
 
         private final HttpServer httpServer;
         private final ExecutorService executorService;
         private final ConcurrentLinkedQueue<CapturedRequest> capturedRequests = new ConcurrentLinkedQueue<>();
         private volatile String retryableEventId;
-
-        private TestReceiver(HttpServer httpServer, ExecutorService executorService) {
-            this.httpServer = httpServer;
-            this.executorService = executorService;
-        }
 
         static TestReceiver start() {
             try {
@@ -444,7 +450,7 @@ class RetryTierConsumerIntegrationTests {
         }
 
         int count(String eventId) {
-            return (int) this.capturedRequests.stream().filter(capturedRequest -> eventId.equals(capturedRequest.webhookId())).count();
+            return (int) this.capturedRequests.stream().filter(capturedRequest -> Objects.equals(eventId, capturedRequest.webhookId())).count();
         }
 
         void awaitRequest(String eventId, int expectedCount) throws InterruptedException {
@@ -463,7 +469,7 @@ class RetryTierConsumerIntegrationTests {
             String eventId = httpExchange.getRequestHeaders().getFirst("webhook-id");
             this.capturedRequests.add(new CapturedRequest(eventId));
             try (httpExchange) {
-                httpExchange.sendResponseHeaders(eventId != null && eventId.equals(this.retryableEventId) ? 503 : 204, -1L);
+                httpExchange.sendResponseHeaders(Objects.nonNull(eventId) && Objects.equals(eventId, this.retryableEventId) ? 503 : 204, -1L);
             }
         }
 

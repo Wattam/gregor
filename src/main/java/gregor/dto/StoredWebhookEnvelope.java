@@ -1,17 +1,19 @@
 package gregor.dto;
 
 import gregor.exception.InvalidWebhookEnvelopeException;
+import org.apache.commons.lang3.StringUtils;
 import org.jspecify.annotations.NonNull;
 
 import java.util.Arrays;
+import java.util.Objects;
 
 public record StoredWebhookEnvelope(String writerSchemaJson, byte[] datumBytes) {
 
     public StoredWebhookEnvelope {
-        if (writerSchemaJson == null || writerSchemaJson.isBlank()) {
+        if (StringUtils.isBlank(writerSchemaJson)) {
             throw new InvalidWebhookEnvelopeException("Webhook envelope writer schema is missing");
         }
-        if (datumBytes == null || datumBytes.length == 0) {
+        if (Objects.isNull(datumBytes) || datumBytes.length == 0) {
             throw new InvalidWebhookEnvelopeException("Webhook envelope datum is malformed");
         }
         datumBytes = datumBytes.clone();
@@ -24,7 +26,7 @@ public record StoredWebhookEnvelope(String writerSchemaJson, byte[] datumBytes) 
 
     @Override
     public boolean equals(Object other) {
-        return other instanceof StoredWebhookEnvelope storedWebhookEnvelope && this.writerSchemaJson.equals(storedWebhookEnvelope.writerSchemaJson) && Arrays.equals(this.datumBytes, storedWebhookEnvelope.datumBytes);
+        return other instanceof StoredWebhookEnvelope storedWebhookEnvelope && Objects.equals(this.writerSchemaJson, storedWebhookEnvelope.writerSchemaJson) && Arrays.equals(this.datumBytes, storedWebhookEnvelope.datumBytes);
     }
 
     @Override

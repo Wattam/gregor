@@ -21,8 +21,11 @@ import io.vertx.core.AbstractVerticle;
 import io.vertx.core.DeploymentOptions;
 import io.vertx.core.ThreadingModel;
 import io.vertx.core.Vertx;
+import lombok.AccessLevel;
+import lombok.RequiredArgsConstructor;
 import org.apache.avro.Schema;
 import org.apache.avro.SchemaParseException;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.kafka.common.header.Headers;
 
 import java.nio.ByteBuffer;
@@ -73,13 +76,13 @@ public class ApicurioWebhookEnvelopeReader implements AutoCloseable {
     }
 
     public StoredWebhookEnvelope read(String topicName, Headers headers, byte[] valueBytes) {
-        if (valueBytes == null || valueBytes.length == 0) {
+        if (Objects.isNull(valueBytes) || valueBytes.length == 0) {
             throw new InvalidWebhookEnvelopeException(MALFORMED_FRAMING);
         }
         try {
-            String encodingHeader = headers == null ? null : this.avroSerdeHeaders.getEncoding(headers);
-            AvroEncoding avroEncoding = encodingHeader == null ? this.defaultAvroEncoding : AvroEncoding.valueOf(encodingHeader);
-            if (avroEncoding != AvroEncoding.BINARY) {
+            String encodingHeader = Objects.isNull(headers) ? null : this.avroSerdeHeaders.getEncoding(headers);
+            AvroEncoding avroEncoding = Objects.isNull(encodingHeader) ? this.defaultAvroEncoding : AvroEncoding.valueOf(encodingHeader);
+            if (!Objects.equals(avroEncoding, AvroEncoding.BINARY)) {
                 throw new InvalidWebhookEnvelopeException("Apicurio webhook envelope must use binary Avro");
             }
             return Objects.requireNonNull(this.envelopeKafkaDeserializer.deserialize(topicName, headers, valueBytes));
@@ -98,18 +101,18 @@ public class ApicurioWebhookEnvelopeReader implements AutoCloseable {
     }
 
     private static boolean hasContentHash(ArtifactReference artifactReference) {
-        return artifactReference != null && artifactReference.getContentHash() != null && !artifactReference.getContentHash().isBlank();
+        return Objects.nonNull(artifactReference) && StringUtils.isNotBlank(artifactReference.getContentHash());
     }
 
     private static ArtifactReference selectExactIdentifier(ArtifactReference artifactReference) {
-        if (artifactReference != null) {
-            if (artifactReference.getContentId() != null) {
+        if (Objects.nonNull(artifactReference)) {
+            if (Objects.nonNull(artifactReference.getContentId())) {
                 return ArtifactReference.builder().contentId(artifactReference.getContentId()).build();
             }
             if (hasContentHash(artifactReference)) {
                 return ArtifactReference.builder().contentHash(artifactReference.getContentHash()).build();
             }
-            if (artifactReference.getGlobalId() != null) {
+            if (Objects.nonNull(artifactReference.getGlobalId())) {
                 return ArtifactReference.builder().globalId(artifactReference.getGlobalId()).build();
             }
         }
@@ -124,7 +127,7 @@ public class ApicurioWebhookEnvelopeReader implements AutoCloseable {
 
         @Override
         public StoredWebhookEnvelope deserialize(String topicName, Headers headers, byte[] valueBytes) {
-            if (super.headersHandler == null || headers == null) {
+            if (Objects.isNull(super.headersHandler) || Objects.isNull(headers)) {
                 return super.deserialize(topicName, valueBytes);
             }
             ArtifactReference artifactReference = super.headersHandler.readHeaders(headers);
@@ -157,8 +160,8 @@ public class ApicurioWebhookEnvelopeReader implements AutoCloseable {
 
         @Override
         protected StoredWebhookEnvelope readData(ParsedSchema<Schema> parsedSchema, ByteBuffer byteBuffer, int start, int length) {
-            Schema writerSchema = parsedSchema == null ? null : parsedSchema.getParsedSchema();
-            if (writerSchema == null) {
+            Schema writerSchema = Objects.isNull(parsedSchema) ? null : parsedSchema.getParsedSchema();
+            if (Objects.isNull(writerSchema)) {
                 throw new InvalidWebhookEnvelopeException(MISSING_SCHEMA);
             }
             Objects.checkFromIndexSize(start - byteBuffer.arrayOffset(), length, byteBuffer.limit());
@@ -175,12 +178,12 @@ public class ApicurioWebhookEnvelopeReader implements AutoCloseable {
             SchemaLookupResult.SchemaLookupResultBuilder<Schema> schemaLookupResultBuilder = SchemaLookupResult.builder();
             String writerSchemaJson;
             List<RegistryArtifactReference> registryArtifactReferences;
-            if (artifactReference.getContentId() != null) {
+            if (Objects.nonNull(artifactReference.getContentId())) {
                 long contentId = artifactReference.getContentId();
                 writerSchemaJson = registryClientFacade.getSchemaByContentId(contentId);
                 registryArtifactReferences = registryClientFacade.getReferencesByContentId(contentId);
                 schemaLookupResultBuilder.contentId(contentId);
-            } else if (artifactReference.getContentHash() != null) {
+            } else if (Objects.nonNull(artifactReference.getContentHash())) {
                 String contentHash = artifactReference.getContentHash();
                 writerSchemaJson = registryClientFacade.getSchemaByContentHash(contentHash);
                 registryArtifactReferences = registryClientFacade.getReferencesByContentHash(contentHash);
@@ -196,15 +199,12 @@ public class ApicurioWebhookEnvelopeReader implements AutoCloseable {
         }
     }
 
+    @RequiredArgsConstructor(access = AccessLevel.PRIVATE)
     private static final class EnvelopeReferenceResolver {
 
         private final RegistryClientFacade registryClientFacade;
         private final Map<ReferenceVersion, Map<String, Schema>> resolvedReferences = new HashMap<>();
         private final Set<ReferenceVersion> activeReferences = new HashSet<>();
-
-        private EnvelopeReferenceResolver(RegistryClientFacade registryClientFacade) {
-            this.registryClientFacade = registryClientFacade;
-        }
 
         private ResolvedSchema parse(String schemaJson, List<RegistryArtifactReference> registryArtifactReferences) {
             WebhookEnvelopeSchemas.requireSchemaJson(schemaJson);
@@ -223,12 +223,12 @@ public class ApicurioWebhookEnvelopeReader implements AutoCloseable {
             String groupId = Objects.requireNonNullElse(registryArtifactReference.getGroupId(), "default");
             String artifactId = registryArtifactReference.getArtifactId();
             String version = registryArtifactReference.getVersion();
-            if (artifactId == null || artifactId.isBlank() || version == null || version.isBlank()) {
+            if (StringUtils.isBlank(artifactId) || StringUtils.isBlank(version)) {
                 throw new SchemaParseException("Avro named reference has no artifact version");
             }
             ReferenceVersion referenceVersion = new ReferenceVersion(groupId, artifactId, version);
             Map<String, Schema> namedSchemas = this.resolvedReferences.get(referenceVersion);
-            if (namedSchemas != null) {
+            if (Objects.nonNull(namedSchemas)) {
                 return namedSchemas;
             }
             if (!this.activeReferences.add(referenceVersion)) {

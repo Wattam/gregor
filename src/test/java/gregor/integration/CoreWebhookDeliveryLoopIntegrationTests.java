@@ -8,6 +8,8 @@ import gregor.avro.WebhookEvent;
 import gregor.route.WebhookRoute;
 import gregor.service.WebhookService;
 import io.vertx.core.Vertx;
+import lombok.AccessLevel;
+import lombok.RequiredArgsConstructor;
 import org.apache.camel.CamelContext;
 import org.apache.camel.ProducerTemplate;
 import org.apache.camel.Route;
@@ -57,6 +59,7 @@ import java.time.Instant;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
@@ -268,7 +271,7 @@ class CoreWebhookDeliveryLoopIntegrationTests {
                     return invocationOnMock.callRealMethod();
                 })
                 .when(this.webhookService)
-                .awaitEligibility(Mockito.argThat(webhookRouteMessage -> eventId.equals(webhookRouteMessage.webhookEvent().getEventId())));
+                .awaitEligibility(Mockito.argThat(webhookRouteMessage -> Objects.equals(eventId, webhookRouteMessage.webhookEvent().getEventId())));
         String retryRoute = KafkaTestRecords.consumerRoute(RETRY_TOPIC);
         RouteController routeController = this.camelContext.getRouteController();
         String sourceTopic = WebhookRoute.WEBHOOK_EVENT_TOPIC;
@@ -683,11 +686,11 @@ class CoreWebhookDeliveryLoopIntegrationTests {
                     ConsumerGroupDescription consumerGroupDescription = adminClient.describeConsumerGroups(List.of(groupId)).all().get(2, TimeUnit.SECONDS).get(groupId);
                     MemberDescription firstMemberDescription = ownerOf(consumerGroupDescription, firstTopicPartition);
                     MemberDescription secondMemberDescription = ownerOf(consumerGroupDescription, secondTopicPartition);
-                    if (consumerGroupDescription.groupState() == GroupState.STABLE
+                    if (Objects.equals(consumerGroupDescription.groupState(), GroupState.STABLE)
                             && consumerGroupDescription.members().size() == 12
-                            && firstMemberDescription != null
-                            && secondMemberDescription != null
-                            && !firstMemberDescription.consumerId().equals(secondMemberDescription.consumerId())) {
+                            && Objects.nonNull(firstMemberDescription)
+                            && Objects.nonNull(secondMemberDescription)
+                            && !Objects.equals(firstMemberDescription.consumerId(), secondMemberDescription.consumerId())) {
                         return;
                     }
                 } catch (ExecutionException | TimeoutException exception) {
@@ -716,7 +719,7 @@ class CoreWebhookDeliveryLoopIntegrationTests {
 
     private int attemptRowCount(String eventId) {
         Integer count = this.jdbcTemplate.queryForObject("SELECT count(*) FROM delivery_attempt WHERE event_id = ?::uuid", Integer.class, eventId);
-        return count == null ? 0 : count;
+        return Objects.isNull(count) ? 0 : count;
     }
 
     private static void assertPhaseOneAuditFields(Map<String, Object> attemptColumns) {
@@ -747,12 +750,13 @@ class CoreWebhookDeliveryLoopIntegrationTests {
 
     private static String configValue(Config config, String key) {
         ConfigEntry configEntry = config.get(key);
-        return configEntry == null ? null : configEntry.value();
+        return Objects.isNull(configEntry) ? null : configEntry.value();
     }
 
     private record CapturedRequest(byte[] bodyBytes, String eventType, String webhookId, String timestamp, String signature, String contentType) {
     }
 
+    @RequiredArgsConstructor(access = AccessLevel.PRIVATE)
     private static final class TestReceiver implements AutoCloseable {
 
         private final HttpServer httpServer;
@@ -763,11 +767,6 @@ class CoreWebhookDeliveryLoopIntegrationTests {
         private volatile TransportFailure transportFailure;
         private volatile byte[] responseBodyBytes = new byte[0];
         private volatile CountDownLatch responseCountDownLatch;
-
-        private TestReceiver(HttpServer httpServer, ExecutorService executorService) {
-            this.httpServer = httpServer;
-            this.executorService = executorService;
-        }
 
         static TestReceiver start() {
             try {
@@ -810,7 +809,7 @@ class CoreWebhookDeliveryLoopIntegrationTests {
 
         void clearTransportFailure() {
             TransportFailure transportFailure = this.transportFailure;
-            if (transportFailure != null) {
+            if (Objects.nonNull(transportFailure)) {
                 transportFailure.responseCountDownLatch().countDown();
             }
             this.transportFailure = null;
@@ -822,7 +821,7 @@ class CoreWebhookDeliveryLoopIntegrationTests {
 
         void releaseResponses() {
             CountDownLatch responseCountDownLatch = this.responseCountDownLatch;
-            if (responseCountDownLatch != null) {
+            if (Objects.nonNull(responseCountDownLatch)) {
                 responseCountDownLatch.countDown();
             }
         }
@@ -838,13 +837,13 @@ class CoreWebhookDeliveryLoopIntegrationTests {
         }
 
         int count(String eventId) {
-            return (int) this.capturedRequests.stream().filter(capturedRequest -> eventId.equals(capturedRequest.webhookId())).count();
+            return (int) this.capturedRequests.stream().filter(capturedRequest -> Objects.equals(eventId, capturedRequest.webhookId())).count();
         }
 
         CapturedRequest awaitRequest(String eventId, int expectedCount) throws InterruptedException {
             Instant deadline = Instant.now().plusSeconds(30);
             while (Instant.now().isBefore(deadline)) {
-                List<CapturedRequest> matchingCapturedRequests = this.capturedRequests.stream().filter(capturedRequest -> eventId.equals(capturedRequest.webhookId())).toList();
+                List<CapturedRequest> matchingCapturedRequests = this.capturedRequests.stream().filter(capturedRequest -> Objects.equals(eventId, capturedRequest.webhookId())).toList();
                 if (matchingCapturedRequests.size() >= expectedCount) {
                     return matchingCapturedRequests.get(expectedCount - 1);
                 }
@@ -878,17 +877,17 @@ class CoreWebhookDeliveryLoopIntegrationTests {
             ));
             try (httpExchange) {
                 TransportFailure transportFailure = this.transportFailure;
-                if (transportFailure != null && transportFailure.eventId().equals(eventId)) {
+                if (Objects.nonNull(transportFailure) && Objects.equals(transportFailure.eventId(), eventId)) {
                     if (transportFailure.timeout()) {
                         transportFailure.responseCountDownLatch().await(30, TimeUnit.SECONDS);
                     }
                     return;
                 }
                 CountDownLatch responseCountDownLatch = this.responseCountDownLatch;
-                if (responseCountDownLatch != null) {
+                if (Objects.nonNull(responseCountDownLatch)) {
                     responseCountDownLatch.await(10, TimeUnit.SECONDS);
                 }
-                int responseStatus = eventId != null && eventId.equals(this.retryableEventId) ? 503 : this.responseStatusCounter.get();
+                int responseStatus = Objects.nonNull(eventId) && Objects.equals(eventId, this.retryableEventId) ? 503 : this.responseStatusCounter.get();
                 if (responseStatus == 302) {
                     httpExchange.getResponseHeaders().add("Location", "/redirect-target");
                 }

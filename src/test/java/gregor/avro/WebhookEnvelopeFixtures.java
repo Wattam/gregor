@@ -1,12 +1,15 @@
 package gregor.avro;
 
 import gregor.dto.StoredWebhookEnvelope;
+import lombok.AccessLevel;
+import lombok.NoArgsConstructor;
 import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericData;
 import org.apache.avro.generic.GenericDatumWriter;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.avro.io.BinaryEncoder;
 import org.apache.avro.io.EncoderFactory;
+import org.apache.commons.lang3.StringUtils;
 import org.assertj.core.api.Assertions;
 
 import java.io.ByteArrayOutputStream;
@@ -15,6 +18,7 @@ import java.nio.ByteBuffer;
 import java.time.Instant;
 import java.util.Arrays;
 
+@NoArgsConstructor(access = AccessLevel.PRIVATE)
 public final class WebhookEnvelopeFixtures {
 
     public static final String EVENT_ID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
@@ -42,9 +46,6 @@ public final class WebhookEnvelopeFixtures {
             """
     );
 
-    private WebhookEnvelopeFixtures() {
-    }
-
     public static WebhookEvent currentEvent(String eventId, int replayCount, Instant nextEligibleAt) {
         return WebhookEvent
                 .newBuilder()
@@ -71,7 +72,7 @@ public final class WebhookEnvelopeFixtures {
 
     public static String phaseOneSchemaJsonWith(String writerOnlyFieldsJson) {
         String phaseOneSchemaJson = PHASE_ONE_WEBHOOK_EVENT_SCHEMA.toString();
-        int fieldsEnd = phaseOneSchemaJson.lastIndexOf(']');
+        int fieldsEnd = StringUtils.lastIndexOf(phaseOneSchemaJson, ']');
         return phaseOneSchemaJson.substring(0, fieldsEnd) + "," + writerOnlyFieldsJson + phaseOneSchemaJson.substring(fieldsEnd);
     }
 

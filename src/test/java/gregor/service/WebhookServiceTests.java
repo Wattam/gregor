@@ -36,6 +36,7 @@ import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 
 class WebhookServiceTests {
 
@@ -254,15 +255,15 @@ class WebhookServiceTests {
         List<Integer> recordedRetryCounts = new ArrayList<>();
         List<Boolean> recordedDeadLetterFlags = new ArrayList<>();
         List<String> retryTopics = new ArrayList<>();
-        for (int delivery = 0; delivery < 4 && nextWebhookEvent != null; delivery++) {
+        for (int delivery = 0; delivery < 4 && Objects.nonNull(nextWebhookEvent); delivery++) {
             WebhookRouteMessage deliveredWebhookRouteMessage = webhookService.sendWebhookEvent(webhookService.createWebhookRouteMessage(nextWebhookEvent));
             DeliveryAttempt deliveryAttempt = webhookService.createAttempt(deliveredWebhookRouteMessage);
             recordedAttemptNumbers.add(deliveryAttempt.getAttemptNumber());
             recordedRetryCounts.add(deliveryAttempt.getRetryCount());
             recordedDeadLetterFlags.add(deliveryAttempt.getDeadLettered());
             RetryPublication retryPublication = webhookService.planRetry(deliveredWebhookRouteMessage).orElse(null);
-            nextWebhookEvent = retryPublication == null ? null : retryPublication.webhookEvent();
-            if (retryPublication != null) {
+            nextWebhookEvent = Objects.isNull(retryPublication) ? null : retryPublication.webhookEvent();
+            if (Objects.nonNull(retryPublication)) {
                 retryTopics.add(retryPublication.topic());
             }
         }

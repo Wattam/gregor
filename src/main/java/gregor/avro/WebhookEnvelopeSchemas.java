@@ -1,9 +1,12 @@
 package gregor.avro;
 
+import lombok.AccessLevel;
 import lombok.NoArgsConstructor;
+import lombok.RequiredArgsConstructor;
 import org.apache.avro.ParseContext;
 import org.apache.avro.Schema;
 import org.apache.avro.SchemaParseException;
+import org.apache.commons.lang3.StringUtils;
 import tools.jackson.core.JsonGenerator;
 import tools.jackson.core.JsonParser;
 import tools.jackson.core.JsonToken;
@@ -39,7 +42,7 @@ final class WebhookEnvelopeSchemas {
     static void requireSchemaJson(String schemaJson) {
         // Avro allows comments and trims non-JSON whitespace after the root value.
         try (JsonParser jsonParser = JSON_FACTORY.createParser(ObjectReadContext.empty(), schemaJson)) {
-            if (jsonParser.nextToken() == null || jsonParser.skipChildren().nextToken() != null) {
+            if (Objects.isNull(jsonParser.nextToken()) || Objects.nonNull(jsonParser.skipChildren().nextToken())) {
                 throw new SchemaParseException("Expected one Avro JSON schema");
             }
         }
@@ -50,15 +53,15 @@ final class WebhookEnvelopeSchemas {
         Map<String, Schema> namedSchemas = new HashMap<>();
         mergeNamedDefinitions(namedSchemas, List.of(writerSchema));
         String schemaJson = writerSchema.toString();
-        if (namedSchemas.values().stream().anyMatch(schema -> schema.getNamespace() == null || schema.getAliases().stream().anyMatch(alias -> alias.startsWith(".")))) {
+        if (namedSchemas.values().stream().anyMatch(schema -> Objects.isNull(schema.getNamespace()) || schema.getAliases().stream().anyMatch(alias -> StringUtils.startsWith(alias, ".")))) {
             schemaJson = writeExplicitEmptyNamespaceNames(writerSchema, schemaJson);
         }
 
         Schema snapshotSchema = parseSnapshot(schemaJson);
         Map<String, Schema> snapshotNamedSchemas = new HashMap<>();
         mergeNamedDefinitions(snapshotNamedSchemas, List.of(snapshotSchema));
-        if (!snapshotSchema.equals(writerSchema)
-                || !snapshotNamedSchemas.keySet().equals(namedSchemas.keySet())
+        if (!Objects.equals(snapshotSchema, writerSchema)
+                || !Objects.equals(snapshotNamedSchemas.keySet(), namedSchemas.keySet())
                 || namedSchemas.entrySet().stream().anyMatch(entry -> hasMetadataMismatch(entry.getValue(), snapshotNamedSchemas.get(entry.getKey())))) {
             throw new SchemaParseException("Avro writer schema snapshot differs from its source");
         }
@@ -91,20 +94,20 @@ final class WebhookEnvelopeSchemas {
 
     static void mergeDefinition(Map<String, Schema> namedSchemas, Schema schema) {
         Schema existingSchema = namedSchemas.putIfAbsent(schema.getFullName(), schema);
-        if (existingSchema != null) {
+        if (Objects.nonNull(existingSchema)) {
             requireSameDefinition(existingSchema, schema);
         }
     }
 
     private static void requireSameDefinition(Schema firstSchema, Schema secondSchema) {
-        if (firstSchema != secondSchema && (!firstSchema.equals(secondSchema) || hasMetadataMismatch(firstSchema, secondSchema))) {
+        if (!Objects.equals(firstSchema, secondSchema) || hasMetadataMismatch(firstSchema, secondSchema)) {
             throw new SchemaParseException("Conflicting Avro named definitions");
         }
     }
 
     private static boolean hasMetadataMismatch(Schema firstSchema, Schema secondSchema) {
         // Avro compares JSON properties without depending on member order, but omits some named definition metadata.
-        if (!Objects.equals(firstSchema.getDoc(), secondSchema.getDoc()) || !firstSchema.getAliases().equals(secondSchema.getAliases())) {
+        if (!Objects.equals(firstSchema.getDoc(), secondSchema.getDoc()) || !Objects.equals(firstSchema.getAliases(), secondSchema.getAliases())) {
             return true;
         }
         return switch (firstSchema.getType()) {
@@ -118,7 +121,7 @@ final class WebhookEnvelopeSchemas {
         for (int index = 0; index < firstFields.size(); index++) {
             Schema.Field firstField = firstFields.get(index);
             Schema.Field secondField = secondFields.get(index);
-            if (!Objects.equals(firstField.doc(), secondField.doc()) || !firstField.aliases().equals(secondField.aliases())) {
+            if (!Objects.equals(firstField.doc(), secondField.doc()) || !Objects.equals(firstField.aliases(), secondField.aliases())) {
                 return true;
             }
         }
@@ -152,7 +155,7 @@ final class WebhookEnvelopeSchemas {
         private void writeType(Schema schema, String namespace) {
             switch (this.jsonParser.currentToken()) {
                 case VALUE_STRING -> {
-                    if (namespace != null && isNamed(schema) && schema.getNamespace() == null) {
+                    if (Objects.nonNull(namespace) && isNamed(schema) && Objects.isNull(schema.getNamespace())) {
                         // A short name could bind in the enclosing namespace. Use Avro's empty-namespace alias spelling for references too.
                         this.jsonGenerator.writeString("." + schema.getName());
                     } else {
@@ -175,7 +178,7 @@ final class WebhookEnvelopeSchemas {
 
         private void writeTypeObject(Schema schema, String namespace) {
             this.jsonGenerator.writeStartObject();
-            while (this.jsonParser.nextToken() == JsonToken.PROPERTY_NAME) {
+            while (Objects.equals(this.jsonParser.nextToken(), JsonToken.PROPERTY_NAME)) {
                 String propertyName = this.jsonParser.currentName();
                 this.jsonGenerator.writeName(propertyName);
                 this.jsonParser.nextToken();
@@ -200,11 +203,11 @@ final class WebhookEnvelopeSchemas {
             for (Schema.Field field : schema.getFields()) {
                 this.jsonParser.nextToken();
                 this.jsonGenerator.writeStartObject();
-                while (this.jsonParser.nextToken() == JsonToken.PROPERTY_NAME) {
+                while (Objects.equals(this.jsonParser.nextToken(), JsonToken.PROPERTY_NAME)) {
                     String propertyName = this.jsonParser.currentName();
                     this.jsonGenerator.writeName(propertyName);
                     this.jsonParser.nextToken();
-                    if ("type".equals(propertyName)) {
+                    if (Objects.equals("type", propertyName)) {
                         this.writeType(field.schema(), schema.getNamespace());
                     } else {
                         this.jsonGenerator.copyCurrentStructure(this.jsonParser);
@@ -217,17 +220,14 @@ final class WebhookEnvelopeSchemas {
         }
     }
 
+    @RequiredArgsConstructor(access = AccessLevel.PRIVATE)
     private static final class EnvelopeParseContext extends ParseContext {
 
         private final Map<String, Schema> referencedSchemas;
 
-        private EnvelopeParseContext(Map<String, Schema> referencedSchemas) {
-            this.referencedSchemas = referencedSchemas;
-        }
-
         @Override
         public Schema find(String name, String namespace) {
-            if (name.startsWith(".") && name.indexOf('.', 1) < 0) {
+            if (StringUtils.startsWith(name, ".") && StringUtils.indexOf(name, '.', 1) < 0) {
                 Schema schema = super.find(name.substring(1), null);
                 if (!isNamed(schema)) {
                     throw new SchemaParseException("Expected an empty-namespace Avro named type");
@@ -240,14 +240,14 @@ final class WebhookEnvelopeSchemas {
         @Override
         public Schema getNamedSchema(String fullName) {
             Schema schema = super.getNamedSchema(fullName);
-            return schema == null ? this.referencedSchemas.get(fullName) : schema;
+            return Objects.isNull(schema) ? this.referencedSchemas.get(fullName) : schema;
         }
 
         @Override
         public void put(Schema schema) {
             // Check every declaration before Avro keeps only the first definition of a name.
             Schema existingSchema = super.getNamedSchema(schema.getFullName());
-            if (existingSchema == null) {
+            if (Objects.isNull(existingSchema)) {
                 super.put(schema);
             } else {
                 requireSameDefinition(existingSchema, schema);
@@ -258,7 +258,7 @@ final class WebhookEnvelopeSchemas {
         public void commit() {
             // Make references available to Avro's resolver without replacing the inline definitions.
             this.referencedSchemas.forEach((fullName, schema) -> {
-                if (super.getNamedSchema(fullName) == null) {
+                if (Objects.isNull(super.getNamedSchema(fullName))) {
                     super.put(schema);
                 }
             });

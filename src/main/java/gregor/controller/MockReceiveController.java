@@ -2,6 +2,7 @@ package gregor.controller;
 
 import gregor.component.SignatureComponent;
 import gregor.config.properties.WebhookProperties;
+import org.apache.commons.lang3.StringUtils;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -12,6 +13,7 @@ import org.springframework.web.bind.annotation.RestController;
 import java.security.MessageDigest;
 import java.time.Clock;
 import java.util.Base64;
+import java.util.Objects;
 
 @RestController
 @RequestMapping("/api/mocked-webhook-receiver")
@@ -46,7 +48,7 @@ public class MockReceiveController {
     }
 
     private boolean verify(String webhookId, String timestampHeader, String signatureHeader, byte[] bodyBytes) {
-        if (webhookId == null || timestampHeader == null || signatureHeader == null || bodyBytes == null) {
+        if (Objects.isNull(webhookId) || Objects.isNull(timestampHeader) || Objects.isNull(signatureHeader) || Objects.isNull(bodyBytes)) {
             return false;
         }
 
@@ -70,7 +72,7 @@ public class MockReceiveController {
         String expectedSignature = this.signatureComponent.sign(webhookId, webhookTimestamp, bodyBytes);
         byte[] expectedSignatureBytes = Base64.getDecoder().decode(expectedSignature.substring(SIGNATURE_PREFIX.length()));
         for (String candidateSignature : signatureHeader.split(" +")) {
-            if (!candidateSignature.startsWith(SIGNATURE_PREFIX)) {
+            if (!StringUtils.startsWith(candidateSignature, SIGNATURE_PREFIX)) {
                 continue;
             }
             try {

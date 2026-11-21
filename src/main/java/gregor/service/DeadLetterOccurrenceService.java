@@ -8,11 +8,13 @@ import jakarta.persistence.EntityExistsException;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.PersistenceContext;
 import lombok.RequiredArgsConstructor;
+import org.apache.commons.lang3.StringUtils;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
+import java.util.Objects;
 import java.util.UUID;
 
 @Service
@@ -26,15 +28,15 @@ public class DeadLetterOccurrenceService {
 
     @Transactional
     public DeadLetterOccurrence insert(UUID occurrenceId, StoredWebhookEnvelope storedWebhookEnvelope, Instant deadLetteredAt) {
-        if (occurrenceId == null) {
+        if (Objects.isNull(occurrenceId)) {
             throw new IllegalArgumentException("Dead-letter occurrence ID is required");
         }
-        if (deadLetteredAt == null) {
+        if (Objects.isNull(deadLetteredAt)) {
             throw new IllegalArgumentException("Dead-letter timestamp is required");
         }
         WebhookEvent webhookEvent = this.webhookEnvelopeCodec.decode(storedWebhookEnvelope);
         UUID eventId = parseEventId(webhookEvent.getEventId());
-        if (occurrenceId.equals(eventId)) {
+        if (Objects.equals(occurrenceId, eventId)) {
             throw new IllegalArgumentException("Dead-letter occurrence ID must differ from the event ID");
         }
         int replayCount = webhookEvent.getReplayCount();
@@ -55,7 +57,7 @@ public class DeadLetterOccurrenceService {
     private static UUID parseEventId(String eventIdText) {
         try {
             UUID eventId = UUID.fromString(eventIdText);
-            if (!eventId.toString().equalsIgnoreCase(eventIdText)) {
+            if (!Objects.equals(eventId.toString(), StringUtils.toRootLowerCase(eventIdText))) {
                 throw new IllegalArgumentException();
             }
             return eventId;

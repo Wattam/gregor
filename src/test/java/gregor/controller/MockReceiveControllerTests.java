@@ -20,6 +20,7 @@ import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.Base64;
+import java.util.Objects;
 
 class MockReceiveControllerTests {
 
@@ -84,13 +85,13 @@ class MockReceiveControllerTests {
 
     private static MockHttpServletResponse post(MockMvc mockMvc, byte[] bodyBytes, String webhookId, String timestamp, String signature) throws Exception {
         MockHttpServletRequestBuilder mockHttpServletRequestBuilder = MockMvcRequestBuilders.post("/api/mocked-webhook-receiver").contentType(MediaType.APPLICATION_JSON).content(bodyBytes);
-        if (webhookId != null) {
+        if (Objects.nonNull(webhookId)) {
             mockHttpServletRequestBuilder.header("webhook-id", webhookId);
         }
-        if (timestamp != null) {
+        if (Objects.nonNull(timestamp)) {
             mockHttpServletRequestBuilder.header("webhook-timestamp", timestamp);
         }
-        if (signature != null) {
+        if (Objects.nonNull(signature)) {
             mockHttpServletRequestBuilder.header("webhook-signature", signature);
         }
         return mockMvc.perform(mockHttpServletRequestBuilder).andReturn().getResponse();

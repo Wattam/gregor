@@ -19,6 +19,7 @@ import java.time.Clock;
 import java.time.Instant;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 
 @Component
@@ -62,7 +63,7 @@ public class RestComponent {
                     });
             Instant completedAt = Instant.now(this.clock);
             DeliveryOutcome deliveryOutcome = classifyStatus(httpStatus);
-            Map<String, String> details = deliveryOutcome == DeliveryOutcome.SUCCEEDED ? Map.of() : Map.of("type", "HTTP_FAILURE");
+            Map<String, String> details = Objects.equals(deliveryOutcome, DeliveryOutcome.SUCCEEDED) ? Map.of() : Map.of("type", "HTTP_FAILURE");
 
             return new DeliveryAttemptResult(deliveryOutcome, httpStatus, elapsedMilliseconds(startNanos), attemptedAt, completedAt, details);
         } catch (RestClientException restClientException) {
@@ -100,7 +101,7 @@ public class RestComponent {
 
     private static TransportFailure classifyTransportFailure(RestClientException restClientException) {
         IOException transportIOException = null;
-        for (Throwable throwable = restClientException; throwable != null; throwable = throwable.getCause()) {
+        for (Throwable throwable = restClientException; Objects.nonNull(throwable); throwable = throwable.getCause()) {
             switch (throwable) {
                 case HttpTimeoutException httpTimeoutException -> {
                     return new TransportFailure("TIMEOUT", httpTimeoutException);
@@ -113,7 +114,7 @@ public class RestComponent {
                 }
             }
         }
-        if (transportIOException != null) {
+        if (Objects.nonNull(transportIOException)) {
             return new TransportFailure("CONNECTION_FAILURE", transportIOException);
         }
         return new TransportFailure("INVALID_RESPONSE", restClientException);

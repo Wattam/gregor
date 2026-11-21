@@ -32,6 +32,7 @@ import org.apache.avro.generic.GenericDatumReader;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.avro.io.BinaryDecoder;
 import org.apache.avro.io.DecoderFactory;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.kafka.common.header.Headers;
 import org.apache.kafka.common.header.internals.RecordHeaders;
 import org.assertj.core.api.Assertions;
@@ -198,10 +199,10 @@ class ApicurioWebhookEnvelopeReaderIntegrationTests {
             default -> throw new IllegalArgumentException(referenceVariant);
         };
         RegistryArtifactReference sharedRegistryArtifactReference = this.registerReference(registryClientFacade, topicName + "-shared", "gregor.avro.SharedContext", sharedSchemaJson, Set.of());
-        RegistryArtifactReference rightSharedRegistryArtifactReference = "same version".equals(referenceVariant)
+        RegistryArtifactReference rightSharedRegistryArtifactReference = Objects.equals("same version", referenceVariant)
                 ? sharedRegistryArtifactReference
                 : this.registerReference(registryClientFacade, topicName + "-shared", "gregor.avro.SharedContext", rightSharedSchemaJson, Set.of());
-        if (!"same version".equals(referenceVariant)) {
+        if (!Objects.equals("same version", referenceVariant)) {
             Assertions.assertThat(rightSharedRegistryArtifactReference.getVersion()).isNotEqualTo(sharedRegistryArtifactReference.getVersion());
             Assertions.assertThat(registryClientFacade.getSchemaByGAV("default", topicName + "-shared", rightSharedRegistryArtifactReference.getVersion())).isEqualTo(rightSharedSchemaJson);
         }
@@ -229,7 +230,7 @@ class ApicurioWebhookEnvelopeReaderIntegrationTests {
         Headers headers = globalIdHeaders(coordinates);
 
         try (ApicurioWebhookEnvelopeReader apicurioWebhookEnvelopeReader = new ApicurioWebhookEnvelopeReader(this.webhookEnvelopeCodec, serdeProperties)) {
-            if ("conflicting version".equals(referenceVariant)) {
+            if (Objects.equals("conflicting version", referenceVariant)) {
                 assertFailure(() -> apicurioWebhookEnvelopeReader.read(topicName, headers, datumBytes), UNRESOLVABLE_SCHEMA);
             } else {
                 StoredWebhookEnvelope storedWebhookEnvelope = apicurioWebhookEnvelopeReader.read(topicName, headers, datumBytes);
@@ -278,7 +279,7 @@ class ApicurioWebhookEnvelopeReaderIntegrationTests {
         byte[] datumBytes = WebhookEnvelopeFixtures.phaseOneDatumWith((byte) 1, (byte) 0);
 
         try (ApicurioWebhookEnvelopeReader apicurioWebhookEnvelopeReader = new ApicurioWebhookEnvelopeReader(this.webhookEnvelopeCodec, serdeProperties)) {
-            if (!inlineMetadataJson.isEmpty()) {
+            if (StringUtils.isNotEmpty(inlineMetadataJson)) {
                 assertFailure(() -> apicurioWebhookEnvelopeReader.read(topicName, headers, datumBytes), UNRESOLVABLE_SCHEMA);
             } else {
                 StoredWebhookEnvelope storedWebhookEnvelope = apicurioWebhookEnvelopeReader.read(topicName, headers, datumBytes);
@@ -661,7 +662,7 @@ class ApicurioWebhookEnvelopeReaderIntegrationTests {
                 deleteArtifact.accept(artifactIdIterator.next());
             } catch (RuntimeException exception) {
                 if (!(exception instanceof ProblemDetails problemDetails && Objects.equals(problemDetails.getStatus(), HttpStatus.NOT_FOUND.value()))) {
-                    if (cleanupFailure == null) {
+                    if (Objects.isNull(cleanupFailure)) {
                         cleanupFailure = new IllegalStateException("Could not remove all registry fixture artifacts");
                     }
                     cleanupFailure.addSuppressed(exception);
@@ -670,7 +671,7 @@ class ApicurioWebhookEnvelopeReaderIntegrationTests {
             }
             artifactIdIterator.remove();
         }
-        if (cleanupFailure != null) {
+        if (Objects.nonNull(cleanupFailure)) {
             throw cleanupFailure;
         }
     }

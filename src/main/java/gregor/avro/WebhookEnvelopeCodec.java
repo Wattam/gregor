@@ -2,6 +2,8 @@ package gregor.avro;
 
 import gregor.dto.StoredWebhookEnvelope;
 import gregor.exception.InvalidWebhookEnvelopeException;
+import lombok.AccessLevel;
+import lombok.RequiredArgsConstructor;
 import org.apache.avro.Schema;
 import org.apache.avro.SchemaCompatibility;
 import org.apache.avro.io.BinaryDecoder;
@@ -27,6 +29,7 @@ import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 
 @Component
@@ -38,7 +41,7 @@ public class WebhookEnvelopeCodec {
     public StoredWebhookEnvelope encode(WebhookEvent webhookEvent) {
         try {
             CharsetEncoder charsetEncoder = StandardCharsets.UTF_8.newEncoder();
-            if (webhookEvent == null
+            if (Objects.isNull(webhookEvent)
                     || !charsetEncoder.canEncode(webhookEvent.getEventId())
                     || !charsetEncoder.canEncode(webhookEvent.getEventType())
                     || !charsetEncoder.canEncode(webhookEvent.getTenantId())
@@ -58,10 +61,10 @@ public class WebhookEnvelopeCodec {
     }
 
     public StoredWebhookEnvelope retain(Schema writerSchema, byte[] datumBytes) {
-        if (writerSchema == null) {
+        if (Objects.isNull(writerSchema)) {
             throw new InvalidWebhookEnvelopeException("Webhook envelope writer schema is missing");
         }
-        if (datumBytes == null || datumBytes.length == 0) {
+        if (Objects.isNull(datumBytes) || datumBytes.length == 0) {
             throw new InvalidWebhookEnvelopeException(MALFORMED_DATUM);
         }
         byte[] snapshotBytes = datumBytes.clone();
@@ -76,7 +79,7 @@ public class WebhookEnvelopeCodec {
     }
 
     public WebhookEvent decode(StoredWebhookEnvelope storedWebhookEnvelope) {
-        if (storedWebhookEnvelope == null) {
+        if (Objects.isNull(storedWebhookEnvelope)) {
             throw new InvalidWebhookEnvelopeException("Webhook envelope is missing");
         }
         return this.decodeDatum(parse(storedWebhookEnvelope.writerSchemaJson()), storedWebhookEnvelope.datumBytes());
@@ -103,11 +106,11 @@ public class WebhookEnvelopeCodec {
         }
 
         try {
-            DatumProjection datumProjection = new BinaryDatumValidator(datumBytes).validateAndProject(writerSchema, readerSchema);
+            DatumProjection datumProjection = new BinaryDatumValidator(ByteBuffer.wrap(datumBytes)).validateAndProject(writerSchema, readerSchema);
             BinaryDecoder binaryDecoder = DecoderFactory.get().binaryDecoder(datumProjection.datumBytes(), null);
             SpecificDatumReader<WebhookEvent> specificDatumReader = new SpecificDatumReader<>(datumProjection.writerSchema(), readerSchema, SpecificData.getForClass(WebhookEvent.class));
             WebhookEvent webhookEvent = specificDatumReader.read(null, binaryDecoder);
-            if (webhookEvent != null && binaryDecoder.isEnd()) {
+            if (Objects.nonNull(webhookEvent) && binaryDecoder.isEnd()) {
                 return webhookEvent;
             }
         } catch (IOException | RuntimeException | StackOverflowError exception) {
@@ -117,22 +120,22 @@ public class WebhookEnvelopeCodec {
     }
 
     private static boolean isCompatible(Schema writerSchema, Schema readerSchema) {
-        if (writerSchema.getType() != Schema.Type.RECORD
-                || !readerSchema.getFullName().equals(writerSchema.getFullName())
-                || SchemaCompatibility.checkReaderWriterCompatibility(readerSchema, writerSchema).getType() != SchemaCompatibility.SchemaCompatibilityType.COMPATIBLE) {
+        if (!Objects.equals(writerSchema.getType(), Schema.Type.RECORD)
+                || !Objects.equals(readerSchema.getFullName(), writerSchema.getFullName())
+                || !Objects.equals(SchemaCompatibility.checkReaderWriterCompatibility(readerSchema, writerSchema).getType(), SchemaCompatibility.SchemaCompatibilityType.COMPATIBLE)) {
             return false;
         }
         for (Schema.Field readerField : readerSchema.getFields()) {
             Schema.Field writerField = writerSchema.getField(readerField.name());
-            if (writerField == null) {
+            if (Objects.isNull(writerField)) {
                 continue;
             }
             List<Schema> readerBranches = branches(readerField.schema());
             for (Schema writerBranch : branches(writerField.schema())) {
                 boolean matches = readerBranches
                         .stream()
-                        .anyMatch(readerBranch -> readerBranch.getType() == writerBranch.getType()
-                                && (readerBranch.getLogicalType() == null || writerBranch.getLogicalType() != null && readerBranch.getLogicalType().getName().equals(writerBranch.getLogicalType().getName())));
+                        .anyMatch(readerBranch -> Objects.equals(readerBranch.getType(), writerBranch.getType())
+                                && (Objects.isNull(readerBranch.getLogicalType()) || Objects.nonNull(writerBranch.getLogicalType()) && Objects.equals(readerBranch.getLogicalType().getName(), writerBranch.getLogicalType().getName())));
                 if (!matches) {
                     return false;
                 }
@@ -142,12 +145,13 @@ public class WebhookEnvelopeCodec {
     }
 
     private static List<Schema> branches(Schema schema) {
-        return schema.getType() == Schema.Type.UNION ? schema.getTypes() : List.of(schema);
+        return Objects.equals(schema.getType(), Schema.Type.UNION) ? schema.getTypes() : List.of(schema);
     }
 
     private record DatumProjection(Schema writerSchema, byte[] datumBytes) {
     }
 
+    @RequiredArgsConstructor(access = AccessLevel.PRIVATE)
     private static final class BinaryDatumValidator {
 
         private final ByteBuffer byteBuffer;
@@ -155,12 +159,8 @@ public class WebhookEnvelopeCodec {
         private final Map<Schema, Integer> recordOffsets = new IdentityHashMap<>();
         private final Set<Schema> zeroWidthRecords = Collections.newSetFromMap(new IdentityHashMap<>());
 
-        private BinaryDatumValidator(byte[] datumBytes) {
-            this.byteBuffer = ByteBuffer.wrap(datumBytes);
-        }
-
         private DatumProjection validateAndProject(Schema writerSchema, Schema readerSchema) throws IOException {
-            boolean hasWriterOnlyFields = writerSchema.getFields().stream().anyMatch(field -> readerSchema.getField(field.name()) == null);
+            boolean hasWriterOnlyFields = writerSchema.getFields().stream().anyMatch(field -> Objects.isNull(readerSchema.getField(field.name())));
             if (!hasWriterOnlyFields) {
                 this.read(writerSchema);
                 this.requireEndOfInput();
@@ -173,7 +173,7 @@ public class WebhookEnvelopeCodec {
             for (Schema.Field field : writerSchema.getFields()) {
                 int fieldStart = this.byteBuffer.position();
                 this.read(field.schema());
-                if (readerSchema.getField(field.name()) != null) {
+                if (Objects.nonNull(readerSchema.getField(field.name()))) {
                     projectedFields.add(new Schema.Field(field, field.schema()));
                     projectedByteArrayOutputStream.write(this.byteBuffer.array(), fieldStart, this.byteBuffer.position() - fieldStart);
                 }
@@ -192,12 +192,12 @@ public class WebhookEnvelopeCodec {
         private void read(Schema schema) throws IOException {
             // Datum depth can grow independently of schema depth. Keep pending fields and blocks off the Java call stack.
             Deque<ReadFrame> readFrames = new ArrayDeque<>();
-            while (schema != null || !readFrames.isEmpty()) {
-                if (schema != null) {
+            while (Objects.nonNull(schema) || !readFrames.isEmpty()) {
+                if (Objects.nonNull(schema)) {
                     schema = this.readValue(schema, readFrames);
                 } else {
                     schema = readFrames.peek().nextSchema();
-                    if (schema == null) {
+                    if (Objects.isNull(schema)) {
                         readFrames.pop();
                     }
                 }
@@ -295,7 +295,7 @@ public class WebhookEnvelopeCodec {
             private RecordFrame(Schema schema) throws IOException {
                 this.startOffset = BinaryDatumValidator.this.byteBuffer.position();
                 this.previousOffset = BinaryDatumValidator.this.recordOffsets.put(schema, this.startOffset);
-                if (this.previousOffset != null && this.previousOffset == this.startOffset) {
+                if (Objects.equals(this.previousOffset, this.startOffset)) {
                     // A recursive record cannot finish if it reenters without consuming any bytes.
                     throw new IOException();
                 }
@@ -312,7 +312,7 @@ public class WebhookEnvelopeCodec {
                     // Without a discriminator or content bytes, every occurrence of this schema is zero-width.
                     BinaryDatumValidator.this.zeroWidthRecords.add(this.schema);
                 }
-                if (this.previousOffset == null) {
+                if (Objects.isNull(this.previousOffset)) {
                     BinaryDatumValidator.this.recordOffsets.remove(this.schema);
                 } else {
                     BinaryDatumValidator.this.recordOffsets.put(this.schema, this.previousOffset);
@@ -321,6 +321,7 @@ public class WebhookEnvelopeCodec {
             }
         }
 
+        @RequiredArgsConstructor(access = AccessLevel.PRIVATE)
         private final class CollectionFrame implements ReadFrame {
 
             private final Schema itemSchema;
@@ -328,11 +329,6 @@ public class WebhookEnvelopeCodec {
             private long remainingItems;
             private int enclosingLimit = -1;
             private int itemStart = -1;
-
-            private CollectionFrame(Schema itemSchema, boolean hasKeys) {
-                this.itemSchema = itemSchema;
-                this.hasKeys = hasKeys;
-            }
 
             @Override
             public Schema nextSchema() throws IOException {

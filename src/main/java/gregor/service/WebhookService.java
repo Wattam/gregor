@@ -190,7 +190,7 @@ public class WebhookService {
     public Optional<RetryPublication> planRetry(@Body WebhookRouteMessage webhookRouteMessage) {
         WebhookEvent attemptedWebhookEvent = webhookRouteMessage.webhookEvent();
         DeliveryAttemptResult deliveryAttemptResult = webhookRouteMessage.deliveryAttemptResult();
-        if (deliveryAttemptResult.outcome() != DeliveryOutcome.RETRYABLE_FAILURE) {
+        if (!Objects.equals(deliveryAttemptResult.outcome(), DeliveryOutcome.RETRYABLE_FAILURE)) {
             return Optional.empty();
         }
 
@@ -250,7 +250,7 @@ public class WebhookService {
     }
 
     private static void restoreInterruptIfNeeded(Throwable throwable) {
-        for (Throwable currentThrowable = throwable; currentThrowable != null; currentThrowable = currentThrowable.getCause()) {
+        for (Throwable currentThrowable = throwable; Objects.nonNull(currentThrowable); currentThrowable = currentThrowable.getCause()) {
             if (currentThrowable instanceof InterruptedException) {
                 Thread.currentThread().interrupt();
                 return;
