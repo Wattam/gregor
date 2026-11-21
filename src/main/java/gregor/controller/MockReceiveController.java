@@ -2,7 +2,7 @@ package gregor.controller;
 
 import gregor.component.SignatureComponent;
 import gregor.config.properties.WebhookProperties;
-import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.Strings;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -72,7 +72,7 @@ public class MockReceiveController {
         String expectedSignature = this.signatureComponent.sign(webhookId, webhookTimestamp, bodyBytes);
         byte[] expectedSignatureBytes = Base64.getDecoder().decode(expectedSignature.substring(SIGNATURE_PREFIX.length()));
         for (String candidateSignature : signatureHeader.split(" +")) {
-            if (!StringUtils.startsWith(candidateSignature, SIGNATURE_PREFIX)) {
+            if (!Strings.CS.startsWith(candidateSignature, SIGNATURE_PREFIX)) {
                 continue;
             }
             try {

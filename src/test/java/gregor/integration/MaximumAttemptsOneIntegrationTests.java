@@ -7,7 +7,7 @@ import gregor.route.WebhookRoute;
 import io.vertx.core.Vertx;
 import lombok.AccessLevel;
 import lombok.RequiredArgsConstructor;
-import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.Strings;
 import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
@@ -147,7 +147,7 @@ class MaximumAttemptsOneIntegrationTests {
                 .getHandlerMethods()
                 .entrySet()
                 .stream()
-                .filter(entry -> StringUtils.startsWith(entry.getValue().getBeanType().getPackageName(), "gregor."))
+                .filter(entry -> Strings.CS.startsWith(entry.getValue().getBeanType().getPackageName(), "gregor."))
                 .map(Map.Entry::getKey)
                 .toList();
         Assertions.assertThat(requestMappingInfos)

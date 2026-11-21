@@ -7,6 +7,7 @@ import org.apache.avro.ParseContext;
 import org.apache.avro.Schema;
 import org.apache.avro.SchemaParseException;
 import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.Strings;
 import tools.jackson.core.JsonGenerator;
 import tools.jackson.core.JsonParser;
 import tools.jackson.core.JsonToken;
@@ -53,7 +54,7 @@ final class WebhookEnvelopeSchemas {
         Map<String, Schema> namedSchemas = new HashMap<>();
         mergeNamedDefinitions(namedSchemas, List.of(writerSchema));
         String schemaJson = writerSchema.toString();
-        if (namedSchemas.values().stream().anyMatch(schema -> Objects.isNull(schema.getNamespace()) || schema.getAliases().stream().anyMatch(alias -> StringUtils.startsWith(alias, ".")))) {
+        if (namedSchemas.values().stream().anyMatch(schema -> Objects.isNull(schema.getNamespace()) || schema.getAliases().stream().anyMatch(alias -> Strings.CS.startsWith(alias, ".")))) {
             schemaJson = writeExplicitEmptyNamespaceNames(writerSchema, schemaJson);
         }
 
@@ -227,7 +228,7 @@ final class WebhookEnvelopeSchemas {
 
         @Override
         public Schema find(String name, String namespace) {
-            if (StringUtils.startsWith(name, ".") && StringUtils.indexOf(name, '.', 1) < 0) {
+            if (Strings.CS.startsWith(name, ".") && StringUtils.indexOf(name, '.', 1) < 0) {
                 Schema schema = super.find(name.substring(1), null);
                 if (!isNamed(schema)) {
                     throw new SchemaParseException("Expected an empty-namespace Avro named type");

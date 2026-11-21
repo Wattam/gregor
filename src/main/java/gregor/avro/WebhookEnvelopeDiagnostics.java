@@ -22,6 +22,7 @@ final class WebhookEnvelopeDiagnostics {
 
     private static final Set<String> AVRO_SCHEMA_LOGGER_NAMES = Set.of(Schema.class.getName(), LogicalTypes.class.getName(), SchemaCompatibility.class.getName());
     private static final ThreadLocal<Boolean> AVRO_SCHEMA_LOGGING_SUPPRESSED = new ThreadLocal<>();
+    @SuppressWarnings("unused")
     private static final Object FILTER_INSTALLATION_LOCK = new Object();
 
     static <T> T withoutAvroSchemaLogging(Supplier<T> supplier) {

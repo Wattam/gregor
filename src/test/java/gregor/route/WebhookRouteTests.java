@@ -14,7 +14,7 @@ import org.apache.camel.component.kafka.consumer.KafkaManualCommit;
 import org.apache.camel.component.mock.MockEndpoint;
 import org.apache.camel.test.spring.junit5.CamelSpringBootTest;
 import org.apache.camel.test.spring.junit5.UseAdviceWith;
-import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.Strings;
 import org.assertj.core.api.Assertions;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
@@ -164,7 +164,7 @@ class WebhookRouteTests {
             Assertions.assertThat(publicationFailure).hasRootCause(publicationException);
         }
         Assertions.assertThat(operations).containsExactly(expectedOperations.split("/"));
-        boolean terminal = StringUtils.contains(expectedOperations, "/dead-letter");
+        boolean terminal = Strings.CS.contains(expectedOperations, "/dead-letter");
         if (terminal) {
             WebhookEvent expectedWebhookEvent = new WebhookEvent(
                     "event-1",

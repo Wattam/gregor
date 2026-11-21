@@ -14,7 +14,7 @@
 - In wrapped map factory calls, keep each key and value together. Put exactly one pair per line.
 - Keep array initializers on one line or put exactly one element per line with `}` on its own line. For a wrapped `@ValueSource` array, keep `{` on the annotation line and close with `})`.
 - Qualify instance members with `this.` or `super.`. Qualify external statics with their declaring class; leave own statics unqualified. Never use static imports.
-- Use `org.apache.commons.lang3.StringUtils` for string and character checks (`isBlank`, `isEmpty`, etc.), except equality.
+- For string and character checks other than equality, use non-deprecated `org.apache.commons.lang3.StringUtils` methods such as `isBlank` and `isEmpty`. For checks moved to `org.apache.commons.lang3.Strings`, use `Strings.CS` for case-sensitive checks (`startsWith`, `contains`) and `Strings.CI` for case-insensitive variants.
 - Use `Objects.equals` for non-primitive equality; negate it for inequality.
 - Use `Objects.isNull` and `Objects.nonNull` for null checks.
 - Prefer Lombok annotations over handwritten constructors, getters, setters, and other boilerplate.
