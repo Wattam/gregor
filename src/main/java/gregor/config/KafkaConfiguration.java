@@ -1,5 +1,7 @@
 package gregor.config;
 
+import gregor.avro.ApicurioWebhookEnvelopeReader;
+import gregor.avro.WebhookEnvelopeCodec;
 import gregor.config.properties.KafkaTopicProperties;
 import gregor.route.WebhookRoute;
 import io.apicurio.registry.resolver.config.SchemaResolverConfig;
@@ -12,11 +14,17 @@ import org.apache.camel.component.kafka.consumer.KafkaManualCommitFactory;
 import org.apache.camel.spi.ComponentCustomizer;
 import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.common.config.TopicConfig;
+import org.springframework.boot.context.properties.bind.Bindable;
+import org.springframework.boot.context.properties.bind.Binder;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Lazy;
+import org.springframework.core.env.Environment;
 import org.springframework.kafka.config.TopicBuilder;
 
 import java.time.Duration;
+import java.util.HashMap;
+import java.util.Map;
 
 @AllArgsConstructor
 @Configuration(proxyBeanMethods = false)
@@ -32,6 +40,14 @@ public class KafkaConfiguration {
     @Bean
     public ComponentCustomizer registryVertxCustomizer(Vertx registryVertx) {
         return ComponentCustomizer.builder(KafkaComponent.class).withOrder(Ordered.LOWEST).build(kafkaComponent -> kafkaComponent.getConfiguration().getAdditionalProperties().put(SchemaResolverConfig.VERTX_INSTANCE, registryVertx));
+    }
+
+    @Lazy
+    @Bean(destroyMethod = "close")
+    public ApicurioWebhookEnvelopeReader apicurioWebhookEnvelopeReader(Environment environment, Vertx registryVertx, WebhookEnvelopeCodec webhookEnvelopeCodec) {
+        Map<String, Object> serdeProperties = new HashMap<>(Binder.get(environment).bind("camel.component.kafka.additional-properties", Bindable.mapOf(String.class, Object.class)).orElseGet(Map::of));
+        serdeProperties.put(SchemaResolverConfig.VERTX_INSTANCE, registryVertx);
+        return new ApicurioWebhookEnvelopeReader(webhookEnvelopeCodec, serdeProperties);
     }
 
     @Bean

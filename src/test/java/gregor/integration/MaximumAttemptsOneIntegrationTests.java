@@ -19,6 +19,9 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.web.bind.annotation.RequestMethod;
+import org.springframework.web.servlet.mvc.method.RequestMappingInfo;
+import org.springframework.web.servlet.mvc.method.annotation.RequestMappingHandlerMapping;
 import tools.jackson.databind.ObjectMapper;
 
 import java.io.IOException;
@@ -30,7 +33,9 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -50,6 +55,8 @@ class MaximumAttemptsOneIntegrationTests {
     private ObjectMapper objectMapper;
     @Autowired
     private Vertx registryVertx;
+    @Autowired
+    private RequestMappingHandlerMapping requestMappingHandlerMapping;
 
     @DynamicPropertySource
     static void configureInfrastructure(DynamicPropertyRegistry dynamicPropertyRegistry) {
@@ -125,8 +132,26 @@ class MaximumAttemptsOneIntegrationTests {
                         .containsEntry("replay_count", 0)
                         .containsEntry("dead_lettered", true);
                 Assertions.assertThat(KafkaTestRecords.retryEndOffsets(adminClient)).isEqualTo(retryOffsets);
+                Assertions.assertThat(this.jdbcTemplate.queryForObject("SELECT count(*) FROM dead_letter_occurrence WHERE event_id = ?::uuid", Integer.class, eventId)).isZero();
             }
         }
+    }
+
+    @Test
+    void exposesOnlyTheTwoExistingApplicationHttpEndpoints() {
+        List<RequestMappingInfo> requestMappingInfos = this.requestMappingHandlerMapping
+                .getHandlerMethods()
+                .entrySet()
+                .stream()
+                .filter(entry -> entry.getValue().getBeanType().getPackageName().startsWith("gregor."))
+                .map(Map.Entry::getKey)
+                .toList();
+        Assertions.assertThat(requestMappingInfos)
+                .extracting(requestMappingInfo -> Assertions.tuple(requestMappingInfo.getPatternValues(), requestMappingInfo.getMethodsCondition().getMethods()))
+                .containsExactlyInAnyOrder(
+                        Assertions.tuple(Set.of("/api/events"), Set.of(RequestMethod.POST)),
+                        Assertions.tuple(Set.of("/api/mocked-webhook-receiver"), Set.of(RequestMethod.POST))
+                );
     }
 
     private String postEvent() throws Exception {

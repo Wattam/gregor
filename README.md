@@ -134,6 +134,21 @@ Kafka declares this topic topology:
 
 All topics use 12 default partitions and replication factor 1.
 
+## Dead-letter occurrence storage
+
+Hibernate `ddl-auto: update` creates the additive PostgreSQL `dead_letter_occurrence` table and its constraints. It does not alter existing attempt rows or Kafka records. Terminal delivery still publishes to `webhook-events-dead-letter` and uses the existing attempt audit path. Gregor has no dead-letter consumer, and the running delivery routes do not insert occurrences.
+
+Internal occurrence storage retains the complete unframed binary Avro writer datum and its resolved writer schema. The schema can reconstruct a typed event without a registry lookup. The table and `webhook-events-dead-letter` both contain customer payloads. Restrict access to trusted local operators. Do not enable external SQL parameter or protocol tracing against these payload stores.
+
+To roll back, run the prior binary with the unused table intact. `DROP TABLE dead_letter_occurrence;` is optional destructive cleanup that deletes all stored occurrences.
+
+To recreate local storage, run the following commands. **This deletes all local PostgreSQL, Kafka, and Apicurio data.**
+
+```bash
+docker compose down -v
+docker compose up -d
+```
+
 ## Local receiver and signatures
 
 `POST /api/mocked-webhook-receiver` is a local-development facility. It reads the request body without modification and verifies the `webhook-id`, `webhook-timestamp`, and
@@ -144,4 +159,4 @@ empty `401 Unauthorized` response. The default timestamp tolerance is five minut
 
 Both HTTP endpoints are publicly reachable without application authentication or authorization. Gregor has no SSRF protection, rate limiting, tenant isolation, or production-safe secret
 management. The configured signing secret is a local-development default and must not be used in production. Do not expose this service to untrusted networks or use it as a production webhook
-platform. Restrict access to `webhook-events-dead-letter` to trusted local operators. Its records contain customer payloads.
+platform. Restrict access to both dead-letter payload stores to trusted local operators.

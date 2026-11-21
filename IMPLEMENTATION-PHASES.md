@@ -1,6 +1,6 @@
 # Webhook Delivery Service: Build Phases
 
-This document is the complete implementation roadmap for the webhook delivery service. Phase 1 and Phases 2A through 2E are implemented and are kept
+This document is the complete implementation roadmap for the webhook delivery service. Phase 1 and Phases 2A through 2F are implemented and are kept
 whole. Every remaining phase is broken into the smallest dependency-ordered increment that still has a useful, independently testable
 boundary and its own completion gate. Phase 6 stays one release unit because splitting it would advertise an ordering guarantee that does
 not hold yet. Completing groundwork or an isolated test suite does not mark an increment as implemented.
@@ -15,7 +15,8 @@ not hold yet. Completing groundwork or an isolated test suite does not mark an i
 | Phase 2C            | Implemented                        | Phase 2B                                                            |
 | Phase 2D            | Implemented                        | Phase 2C                                                            |
 | Phase 2E            | Implemented                        | Phase 2D                                                            |
-| Phase 2F through 2J | Planned                            | Phase 2E, in listed order                                           |
+| Phase 2F            | Implemented                        | Phase 2E                                                            |
+| Phase 2G through 2J | Planned                            | Phase 2F, in listed order                                           |
 | Phase 3A through 3J | Planned                            | Phase 2; subphases in listed order                                  |
 | Phase 4A through 4F | Planned                            | Stable Phase 2 event contract; can proceed in parallel with Phase 3 |
 | Phase 5A through 5R | Planned                            | Phases 2 through 4; subphases in listed order                       |
@@ -77,7 +78,7 @@ signed webhook delivery and durable logical-attempt history.
 - There is no retry topic, dead-letter queue, replay, endpoint management, production security, tenant isolation, or strict FIFO mode.
 - Endpoint configuration and tenant identity are single configured values rather than managed or authenticated runtime state.
 
-## Phase 2: Retry Topology, Dead-Letter Queue, and Replay (PHASES 2A THROUGH 2E IMPLEMENTED, REST PLANNED)
+## Phase 2: Retry Topology, Dead-Letter Queue, and Replay (PHASES 2A THROUGH 2F IMPLEMENTED, REST PLANNED)
 
 Phase 2 is split because contracts, retry consumption, retry publication, terminal retention, dead-letter persistence, and replay each have
 a separate testable boundary. The subphases must be implemented in order. Retry attempts are sequential within a single non-redelivered
@@ -233,23 +234,23 @@ exhausted event stops after its final tier and produces no dead-letter record ye
 
 A committed terminal result has an acknowledged dead letter and terminal attempt. There is no Gregor dead-letter consumer.
 
-### Phase 2F: Dead-letter occurrence model and envelope codec
+### Phase 2F: Dead-letter occurrence model and envelope codec (IMPLEMENTED)
 
 **Goal:** Define a persistable, replay-ready representation of one terminal delivery generation.
 
 #### Tasks
 
-- [ ] Define a dead-letter occurrence model keyed by a unique occurrence ID and unique event/replay generation.
-- [ ] Store the original opaque Avro event envelope, dead-letter timestamp, replay state, and replay generation; never store a signing
+- [x] Define a dead-letter occurrence model keyed by a unique occurrence ID and unique event/replay generation.
+- [x] Store the original opaque Avro event envelope, dead-letter timestamp, replay state, and replay generation; never store a signing
   secret.
-- [ ] Add a binary Avro codec for storing and reconstructing the exact event envelope, including registry-resolved schema handling.
-- [ ] Add retained-occurrence lookup operations for later reads and replay.
-- [ ] Document the schema addition, rollback expectations, and local database recreation requirement.
-- [ ] Test envelope round trips across schema versions, generation uniqueness, payload and secret exclusion, and lookup behavior.
+- [x] Add a binary Avro codec for storing and reconstructing the exact event envelope, including registry-resolved schema handling.
+- [x] Add retained-occurrence lookup operations for later reads and replay.
+- [x] Document the schema addition, rollback expectations, and local database recreation requirement.
+- [x] Test envelope round trips across schema versions, generation uniqueness, payload and secret exclusion, and lookup behavior.
 
 #### Completion gate
 
-The occurrence model and envelope codec exist and are proven by tests, and no consumer writes occurrences yet.
+The envelope codec and occurrence table are available internally. Gregor has no dead-letter consumer or automatic occurrence writer.
 
 ### Phase 2G: Idempotent dead-letter persistence
 

@@ -8,6 +8,8 @@ import org.junit.jupiter.api.Test;
 import org.springframework.boot.autoconfigure.AutoConfigurations;
 import org.springframework.boot.autoconfigure.context.ConfigurationPropertiesAutoConfiguration;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.boot.context.properties.bind.Bindable;
+import org.springframework.boot.context.properties.bind.Binder;
 import org.springframework.boot.context.properties.bind.validation.BindValidationException;
 import org.springframework.boot.env.YamlPropertySourceLoader;
 import org.springframework.boot.test.context.ConfigDataApplicationContextInitializer;
@@ -27,6 +29,7 @@ import java.time.Duration;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 class ConfigurationPropertiesTests {
@@ -59,6 +62,17 @@ class ConfigurationPropertiesTests {
             Assertions.assertThat(environment.getRequiredProperty("camel.component.kafka.auto-commit-enable", Boolean.class)).isFalse();
             Assertions.assertThat(environment.getRequiredProperty("camel.component.kafka.allow-manual-commit", Boolean.class)).isTrue();
             Assertions.assertThat(environment.getRequiredProperty("camel.component.kafka.break-on-first-error", Boolean.class)).isTrue();
+        });
+    }
+
+    @Test
+    void keepsTheExistingKafkaSchemaRegistryConfigurationSurface() {
+        this.applicationContextRunner.run(assertableApplicationContext -> {
+            Map<String, String> serdeProperties = Binder.get(assertableApplicationContext.getEnvironment()).bind("camel.component.kafka.additional-properties", Bindable.mapOf(String.class, String.class)).get();
+            Assertions.assertThat(serdeProperties)
+                    .containsOnlyKeys("apicurio.registry.url", "apicurio.registry.auto-register", "apicurio.registry.use-specific-avro-reader")
+                    .containsEntry("apicurio.registry.auto-register", "true")
+                    .containsEntry("apicurio.registry.use-specific-avro-reader", "true");
         });
     }
 

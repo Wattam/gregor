@@ -2,12 +2,9 @@ package gregor.avro;
 
 import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericData;
-import org.apache.avro.generic.GenericDatumWriter;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.avro.io.BinaryDecoder;
-import org.apache.avro.io.BinaryEncoder;
 import org.apache.avro.io.DecoderFactory;
-import org.apache.avro.io.EncoderFactory;
 import org.apache.avro.specific.SpecificDatumReader;
 import org.apache.avro.util.ClassSecurityValidator;
 import org.assertj.core.api.Assertions;
@@ -16,7 +13,6 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.springframework.context.support.GenericApplicationContext;
 
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
@@ -24,24 +20,6 @@ import java.time.Instant;
 
 class AvroContractsTests {
 
-    private static final Schema PHASE_ONE_WEBHOOK_EVENT_SCHEMA = new Schema.Parser().parse(
-            """
-            {
-                "type": "record",
-                "name": "WebhookEvent",
-                "namespace": "gregor.avro",
-                "fields": [
-                    {"name": "eventId", "type": "string"},
-                    {"name": "eventType", "type": "string"},
-                    {"name": "tenantId", "type": "string"},
-                    {"name": "endpointId", "type": "string"},
-                    {"name": "createdAt", "type": {"type": "long", "logicalType": "timestamp-millis"}},
-                    {"name": "payload", "type": "bytes"},
-                    {"name": "retryCount", "type": "int", "default": 0}
-                ]
-            }
-            """
-    );
     private static final Schema PHASE_ONE_DELIVERY_ATTEMPT_SCHEMA = new Schema.Parser().parse(
             """
             {
@@ -99,27 +77,13 @@ class AvroContractsTests {
                 .containsExactly("eventId", "eventType", "tenantId", "endpointId", "createdAt", "payload", "retryCount", "nextEligibleAt", "deliveryAttemptCount", "replayCount");
         Assertions.assertThat(DeliveryAttempt.getClassSchema().getFields())
                 .extracting(Schema.Field::name)
-                .containsExactly(
-                        "attemptId",
-                        "eventId",
-                        "tenantId",
-                        "endpointId",
-                        "eventType",
-                        "attemptNumber",
-                        "outcome",
-                        "httpStatus",
-                        "latencyMs",
-                        "attemptedAt",
-                        "details",
-                        "retryCount",
-                        "replayCount",
-                        "deadLettered"
-                );
+                .containsExactly("attemptId", "eventId", "tenantId", "endpointId", "eventType", "attemptNumber", "outcome", "httpStatus", "latencyMs", "attemptedAt", "details", "retryCount", "replayCount", "deadLettered");
     }
 
     @Test
     void phaseOneWebhookEventDeserializesWithDeliveryStateDefaults() throws IOException {
-        GenericRecord phaseOneWebhookEventGenericRecord = new GenericData.Record(PHASE_ONE_WEBHOOK_EVENT_SCHEMA);
+        Schema writerSchema = WebhookEnvelopeFixtures.PHASE_ONE_WEBHOOK_EVENT_SCHEMA;
+        GenericRecord phaseOneWebhookEventGenericRecord = new GenericData.Record(writerSchema);
         phaseOneWebhookEventGenericRecord.put("eventId", "00000000-0000-0000-0000-000000000010");
         phaseOneWebhookEventGenericRecord.put("eventType", "compatibility.event");
         phaseOneWebhookEventGenericRecord.put("tenantId", "00000000-0000-0000-0000-000000000001");
@@ -128,7 +92,7 @@ class AvroContractsTests {
         phaseOneWebhookEventGenericRecord.put("payload", ByteBuffer.wrap("{\"compatible\":true}".getBytes(StandardCharsets.UTF_8)));
         phaseOneWebhookEventGenericRecord.put("retryCount", 2);
 
-        WebhookEvent webhookEvent = read(PHASE_ONE_WEBHOOK_EVENT_SCHEMA, WebhookEvent.getClassSchema(), phaseOneWebhookEventGenericRecord);
+        WebhookEvent webhookEvent = read(writerSchema, WebhookEvent.getClassSchema(), phaseOneWebhookEventGenericRecord);
 
         Assertions.assertThat(webhookEvent.getEventId()).isEqualTo("00000000-0000-0000-0000-000000000010");
         Assertions.assertThat(webhookEvent.getCreatedAt()).isEqualTo(Instant.parse("2026-07-10T12:00:00Z"));
@@ -167,14 +131,8 @@ class AvroContractsTests {
     }
 
     private static <T> T read(Schema writerSchema, Schema readerSchema, GenericRecord genericRecord) throws IOException {
-        ByteArrayOutputStream byteArrayOutputStream = new ByteArrayOutputStream();
-        GenericDatumWriter<GenericRecord> genericDatumWriter = new GenericDatumWriter<>(writerSchema);
-        BinaryEncoder binaryEncoder = EncoderFactory.get().binaryEncoder(byteArrayOutputStream, null);
-        genericDatumWriter.write(genericRecord, binaryEncoder);
-        binaryEncoder.flush();
-
         SpecificDatumReader<T> specificDatumReader = new SpecificDatumReader<>(writerSchema, readerSchema);
-        BinaryDecoder binaryDecoder = DecoderFactory.get().binaryDecoder(byteArrayOutputStream.toByteArray(), null);
+        BinaryDecoder binaryDecoder = DecoderFactory.get().binaryDecoder(WebhookEnvelopeFixtures.writeDatum(genericRecord), null);
         return specificDatumReader.read(null, binaryDecoder);
     }
 }

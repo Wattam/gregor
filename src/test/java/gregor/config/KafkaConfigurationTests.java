@@ -1,11 +1,14 @@
 package gregor.config;
 
+import gregor.avro.ApicurioWebhookEnvelopeReader;
+import gregor.avro.WebhookEnvelopeCodec;
 import gregor.config.properties.KafkaTopicProperties;
 import org.apache.kafka.clients.admin.NewTopic;
 import org.apache.kafka.common.config.TopicConfig;
 import org.assertj.core.api.Assertions;
 import org.jspecify.annotations.NonNull;
 import org.junit.jupiter.api.Test;
+import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 
 import java.time.Duration;
 import java.util.Map;
@@ -22,6 +25,20 @@ class KafkaConfigurationTests {
             Assertions.assertThat(newTopic.replicationFactor()).as("%s replicas", newTopic.name()).isEqualTo((short) 2);
             Assertions.assertThat(newTopic.configs()).as("%s retention", newTopic.name()).containsEntry(TopicConfig.RETENTION_MS_CONFIG, retention);
         });
+    }
+
+    @Test
+    void registersTheInternalRegistryReaderWithoutInitializingItAtStartup() {
+        new ApplicationContextRunner()
+                .withUserConfiguration(KafkaConfiguration.class)
+                .withBean(KafkaTopicProperties.class, () -> new KafkaTopicProperties(12, 1, Duration.ofDays(7), Duration.ofDays(30)))
+                .withBean(WebhookEnvelopeCodec.class, WebhookEnvelopeCodec::new)
+                .run(assertableApplicationContext -> {
+                    Assertions.assertThat(assertableApplicationContext.getStartupFailure()).isNull();
+                    String[] readerNames = assertableApplicationContext.getBeanNamesForType(ApicurioWebhookEnvelopeReader.class);
+                    Assertions.assertThat(readerNames).hasSize(1);
+                    Assertions.assertThat(assertableApplicationContext.getBeanFactory().containsSingleton(readerNames[0])).isFalse();
+                });
     }
 
     private static @NonNull Map<NewTopic, String> getExpectedRetentions(KafkaTopicProperties kafkaTopicProperties) {
