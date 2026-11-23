@@ -20,6 +20,7 @@
 - Prefer Lombok annotations over handwritten constructors, getters, setters, and other boilerplate.
 - Use Lombok `@Slf4j` with bracketed fields: `log.info("Published event [id={}]", eventId)`.
 - Format Camel routes as EIP trees between `// @formatter:off` and `// @formatter:on`. Indent nested steps four spaces, align `.end()` with its opener, and keep each EIP's calls together (`.choice().when().method(...)`).
+- In concrete Camel route classes, declare only `configure()` and methods that take a single `Exchange` parameter.
 - Use Jackson 3 (`tools.jackson.databind`), not transitive Jackson 2. Keep core annotations under `com.fasterxml.jackson.annotation`. Inject the configured mapper in production.
 
 ## Configuration and tests

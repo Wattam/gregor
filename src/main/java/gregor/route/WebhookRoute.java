@@ -6,6 +6,9 @@ import gregor.dto.RetryPublication;
 import gregor.dto.WebhookRouteMessage;
 import gregor.service.WebhookService;
 import lombok.AllArgsConstructor;
+import org.apache.camel.Exchange;
+import org.apache.camel.InvalidPayloadException;
+import org.apache.camel.Message;
 import org.apache.camel.component.kafka.KafkaConstants;
 import org.apache.camel.processor.aggregate.UseOriginalAggregationStrategy;
 import org.springframework.stereotype.Component;
@@ -78,18 +81,13 @@ public class WebhookRoute extends BaseRoute {
                 .end()
                 .pipeline()
                     .bean(this.webhookService, "createAttempt")
-                    .removeHeaders("*")
-                    .setHeader(KafkaConstants.KEY).body(DeliveryAttempt.class, DeliveryAttempt::getEventId)
+                    .process(this::prepareAttemptPublication)
                     .to(super.kafkaProducerUri(PERSIST_DELIVERY_ATTEMPT_TOPIC))
                 .end()
                 .pipeline()
                     .bean(this.webhookService, "planRetry")
                     .filter().body(Optional.class, Optional::isPresent)
-                        .setBody().body(Optional.class, Optional::get)
-                        .removeHeaders("*")
-                        .setHeader(KafkaConstants.OVERRIDE_TOPIC).body(RetryPublication.class, RetryPublication::topic)
-                        .setBody().body(RetryPublication.class, RetryPublication::webhookEvent)
-                        .setHeader(KafkaConstants.KEY).body(WebhookEvent.class, WebhookEvent::getEndpointId)
+                        .process(this::prepareRetryPublication)
                         .to(super.kafkaProducerUri(WEBHOOK_EVENT_RETRY_1M_TOPIC))
                     .end()
                 .end()
@@ -99,5 +97,22 @@ public class WebhookRoute extends BaseRoute {
             .bean(this.webhookService, "persistDeliveryAttempt")
             .process(super::commitOffset);
         // @formatter:on
+    }
+
+    private void prepareAttemptPublication(Exchange exchange) throws InvalidPayloadException {
+        Message message = exchange.getMessage();
+        DeliveryAttempt deliveryAttempt = message.getMandatoryBody(DeliveryAttempt.class);
+        message.removeHeaders("*");
+        message.setHeader(KafkaConstants.KEY, deliveryAttempt.getEventId());
+    }
+
+    private void prepareRetryPublication(Exchange exchange) throws InvalidPayloadException {
+        Message message = exchange.getMessage();
+        RetryPublication retryPublication = (RetryPublication) message.getMandatoryBody(Optional.class).orElseThrow();
+        WebhookEvent webhookEvent = retryPublication.webhookEvent();
+        message.removeHeaders("*");
+        message.setHeader(KafkaConstants.OVERRIDE_TOPIC, retryPublication.topic());
+        message.setBody(webhookEvent);
+        message.setHeader(KafkaConstants.KEY, webhookEvent.getEndpointId());
     }
 }
