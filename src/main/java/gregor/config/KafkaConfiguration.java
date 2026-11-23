@@ -5,9 +5,12 @@ import gregor.avro.WebhookEnvelopeCodec;
 import gregor.config.properties.KafkaTopicProperties;
 import gregor.route.WebhookRoute;
 import io.apicurio.registry.resolver.config.SchemaResolverConfig;
+import io.apicurio.registry.serde.kafka.config.KafkaSerdeConfig;
 import io.vertx.core.Vertx;
 import lombok.AllArgsConstructor;
 import org.apache.camel.Ordered;
+import org.apache.camel.component.kafka.DefaultKafkaClientFactory;
+import org.apache.camel.component.kafka.KafkaClientFactory;
 import org.apache.camel.component.kafka.KafkaComponent;
 import org.apache.camel.component.kafka.consumer.DefaultKafkaManualSyncCommit;
 import org.apache.camel.component.kafka.consumer.KafkaManualCommitFactory;
@@ -25,6 +28,7 @@ import org.springframework.kafka.config.TopicBuilder;
 import java.time.Duration;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Objects;
 
 @AllArgsConstructor
 @Configuration(proxyBeanMethods = false)
@@ -38,8 +42,19 @@ public class KafkaConfiguration {
     }
 
     @Bean
-    public ComponentCustomizer registryVertxCustomizer(Vertx registryVertx) {
-        return ComponentCustomizer.builder(KafkaComponent.class).withOrder(Ordered.LOWEST).build(kafkaComponent -> kafkaComponent.getConfiguration().getAdditionalProperties().put(SchemaResolverConfig.VERTX_INSTANCE, registryVertx));
+    public ComponentCustomizer kafkaComponentCustomizer(Vertx registryVertx) {
+        return ComponentCustomizer.builder(KafkaComponent.class).withOrder(Ordered.LOWEST).build(kafkaComponent -> {
+            kafkaComponent.getConfiguration().getAdditionalProperties().put(SchemaResolverConfig.VERTX_INSTANCE, registryVertx);
+            // Keep Camel from autowiring the dead-letter endpoint's factory onto the shared component.
+            if (Objects.isNull(kafkaComponent.getKafkaClientFactory())) {
+                kafkaComponent.setKafkaClientFactory(new DefaultKafkaClientFactory());
+            }
+        });
+    }
+
+    @Bean
+    public KafkaClientFactory deadLetterKafkaClientFactory() {
+        return new DeadLetterKafkaClientFactory();
     }
 
     @Lazy
@@ -47,6 +62,7 @@ public class KafkaConfiguration {
     public ApicurioWebhookEnvelopeReader apicurioWebhookEnvelopeReader(Environment environment, Vertx registryVertx, WebhookEnvelopeCodec webhookEnvelopeCodec) {
         Map<String, Object> serdeProperties = new HashMap<>(Binder.get(environment).bind("camel.component.kafka.additional-properties", Bindable.mapOf(String.class, Object.class)).orElseGet(Map::of));
         serdeProperties.put(SchemaResolverConfig.VERTX_INSTANCE, registryVertx);
+        serdeProperties.put(KafkaSerdeConfig.ENABLE_HEADERS, true);
         return new ApicurioWebhookEnvelopeReader(webhookEnvelopeCodec, serdeProperties);
     }
 

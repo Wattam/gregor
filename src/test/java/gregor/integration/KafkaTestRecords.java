@@ -14,8 +14,12 @@ import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.ProducerConfig;
 import org.apache.kafka.common.TopicPartition;
+import org.apache.kafka.common.serialization.ByteArraySerializer;
 import org.apache.kafka.common.serialization.StringDeserializer;
+import org.apache.kafka.common.serialization.StringSerializer;
 import org.assertj.core.api.Assertions;
 
 import java.time.Duration;
@@ -37,6 +41,15 @@ final class KafkaTestRecords {
 
     static AdminClient adminClient() {
         return AdminClient.create(Map.of(AdminClientConfig.BOOTSTRAP_SERVERS_CONFIG, brokers()));
+    }
+
+    static KafkaProducer<String, byte[]> rawProducer() {
+        return new KafkaProducer<>(Map.of(
+                ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, brokers(),
+                ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class,
+                ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, ByteArraySerializer.class,
+                ProducerConfig.ACKS_CONFIG, "all"
+        ));
     }
 
     static Map<TopicPartition, Long> endOffsets(AdminClient adminClient, String... topics) throws Exception {
@@ -144,8 +157,12 @@ final class KafkaTestRecords {
     }
 
     private static long committedOffset(AdminClient adminClient, TopicPartition topicPartition) throws Exception {
-        OffsetAndMetadata committedOffsetAndMetadata = adminClient.listConsumerGroupOffsets(topicPartition.topic()).partitionsToOffsetAndMetadata().get(5, TimeUnit.SECONDS).get(topicPartition);
-        return Objects.isNull(committedOffsetAndMetadata) ? -1L : committedOffsetAndMetadata.offset();
+        return committedOffset(adminClient, topicPartition.topic(), topicPartition);
+    }
+
+    static long committedOffset(AdminClient adminClient, String groupId, TopicPartition topicPartition) throws Exception {
+        OffsetAndMetadata offsetAndMetadata = adminClient.listConsumerGroupOffsets(groupId).partitionsToOffsetAndMetadata().get(5, TimeUnit.SECONDS).get(topicPartition);
+        return Objects.isNull(offsetAndMetadata) ? -1L : offsetAndMetadata.offset();
     }
 
     private static boolean matchesEvent(Object recordValue, String eventId) {

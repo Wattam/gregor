@@ -2,7 +2,10 @@ package gregor.integration;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
+import gregor.avro.WebhookEnvelopeCodec;
 import gregor.avro.WebhookEvent;
+import gregor.entity.DeadLetterOccurrence;
+import gregor.repository.DeadLetterOccurrenceRepository;
 import gregor.route.WebhookRoute;
 import io.vertx.core.Vertx;
 import lombok.AccessLevel;
@@ -40,6 +43,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -61,6 +65,10 @@ class MaximumAttemptsOneIntegrationTests {
     private Vertx registryVertx;
     @Autowired
     private RequestMappingHandlerMapping requestMappingHandlerMapping;
+    @Autowired
+    private DeadLetterOccurrenceRepository deadLetterOccurrenceRepository;
+    @Autowired
+    private WebhookEnvelopeCodec webhookEnvelopeCodec;
 
     @DynamicPropertySource
     static void configureInfrastructure(DynamicPropertyRegistry dynamicPropertyRegistry) {
@@ -136,7 +144,13 @@ class MaximumAttemptsOneIntegrationTests {
                         .containsEntry("replay_count", 0)
                         .containsEntry("dead_lettered", true);
                 Assertions.assertThat(KafkaTestRecords.retryEndOffsets(adminClient)).isEqualTo(retryOffsets);
-                Assertions.assertThat(this.jdbcTemplate.queryForObject("SELECT count(*) FROM dead_letter_occurrence WHERE event_id = ?::uuid", Integer.class, eventId)).isZero();
+                KafkaTestRecords.awaitCommit(adminClient, deadLetterConsumerRecord);
+                UUID eventUuid = UUID.fromString(eventId);
+                DeadLetterOccurrence deadLetterOccurrence = this.deadLetterOccurrenceRepository.findByEventIdAndReplayCount(eventUuid, 0).orElseThrow();
+                Assertions.assertThat(deadLetterOccurrence.getOccurrenceId()).isNotNull().isNotEqualTo(eventUuid);
+                Assertions.assertThat(deadLetterOccurrence.getDeadLetteredAt()).isEqualTo(Instant.ofEpochMilli(deadLetterConsumerRecord.timestamp()));
+                Assertions.assertThat(deadLetterOccurrence.isReplayAccepted()).isFalse();
+                Assertions.assertThat(this.webhookEnvelopeCodec.decode(deadLetterOccurrence.getStoredWebhookEnvelope())).isEqualTo(deadLetterConsumerRecord.value());
             }
         }
     }

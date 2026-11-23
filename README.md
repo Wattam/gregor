@@ -1,7 +1,7 @@
 # Gregor
 
 Gregor is a local-development Spring Boot webhook delivery service. It uses Apache Camel routes as the messaging backbone to accept JSON events, publish versioned Avro records through Kafka and Apicurio Registry, send signed HTTP webhooks,
-and store delivery attempts in PostgreSQL.
+and store delivery attempts and dead-letter occurrences in PostgreSQL.
 
 ## Run locally
 
@@ -54,12 +54,12 @@ Kafka acknowledgement occurs before the API returns a `202 Accepted` response:
 {"eventId":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}
 ```
 
-Each accepted request creates a new event ID. Delivery is at least once: failures before Kafka offset commit can deliver the same event again with the same `webhook-id`.
+Each accepted request creates a new event ID. Webhook delivery is at least once: failures before a source or retry offset commits can deliver the same event again with the same `webhook-id`.
 Receivers must handle duplicate deliveries idempotently. Attempt persistence ignores a duplicate `(event_id, attempt_number)` row.
 
 ## Delivery state and attempt numbering
 
-Each valid Kafka consumption performs at most one HTTP request. The attempt number is the incoming `deliveryAttemptCount + 1`. The attempt audits the incoming `retryCount` and `replayCount`. Terminal audits are published after dead-letter acknowledgement with `deadLettered=true`. Other audits have `deadLettered=false`.
+Each consumption of a valid source or retry record performs at most one HTTP request. The attempt number is the incoming `deliveryAttemptCount + 1`. The attempt audits the incoming `retryCount` and `replayCount`. Terminal audits are published after dead-letter acknowledgement with `deadLettered=true`. Other audits have `deadLettered=false`.
 
 HTTP `2xx` succeeds. Connection failures, timeouts, invalid responses, returned `1xx` statuses, `408`, `429`, and `5xx` are retryable. Redirects and other `4xx` responses are permanent failures.
 
@@ -92,7 +92,7 @@ Later source records on the same partition and endpoint can pass a pending retry
 
 ## Publication order and redelivery
 
-Publication and commit order depend on the HTTP result:
+For source and retry records, publication and commit order depend on the HTTP result:
 
 | Result | Order |
 |---|---|
@@ -100,7 +100,7 @@ Publication and commit order depend on the HTTP result:
 | Scheduled retry | HTTP → attempt acknowledgement → retry acknowledgement → commit |
 | Terminal failure | HTTP → dead-letter acknowledgement → attempt acknowledgement → commit |
 
-The PostgreSQL consumer persists attempts independently. Delivery-offset commit does not wait for a database row.
+Two separate consumers persist attempts and dead-letter occurrences in PostgreSQL. Delivery offset commits do not wait for either database write.
 
 A failed dead-letter send stops processing before the audit. If processing fails before the dead letter becomes durable, there is no guarantee that the first outcome is recorded. If Kafka stores the dead letter but its acknowledgement is lost, or if processing fails after dead-letter acknowledgement and before commit, redelivery can publish another dead letter for the same `(eventId, replayCount)`.
 
@@ -130,17 +130,25 @@ Kafka declares this topic topology:
 | `webhook-events-retry-1m` | Configured retry retention (`7d` by default) | Delivery result route | Time-gated 1-minute tier (`webhook-events-retry-1m`) |
 | `webhook-events-retry-10m` | Configured retry retention (`7d` by default) | Delivery result route | Time-gated 10-minute tier (`webhook-events-retry-10m`) |
 | `webhook-events-retry-1h` | Configured retry retention (`7d` by default) | Delivery result route | Time-gated 1-hour tier (`webhook-events-retry-1h`) |
-| `webhook-events-dead-letter` | Configured dead-letter retention (`30d` by default) | Delivery result route | None |
+| `webhook-events-dead-letter` | Configured dead-letter retention (`30d` by default) | Delivery result route | PostgreSQL persistence (`webhook-events-dead-letter`) |
 
 All topics use 12 default partitions and replication factor 1.
 
 ## Dead-letter occurrence storage
 
-Hibernate `ddl-auto: update` creates the additive PostgreSQL `dead_letter_occurrence` table and its constraints. It does not alter existing attempt rows or Kafka records. Terminal delivery still publishes to `webhook-events-dead-letter` and uses the existing attempt audit path. Gregor has no dead-letter consumer, and the running delivery routes do not insert occurrences.
+The `webhook-events-dead-letter` group starts with Gregor. On startup it reads each partition from its committed offset, or from the earliest retained offset if the commit is missing or out of range. Delivery and attempt groups use separate offsets. Their commits do not depend on occurrence persistence. Attempt and occurrence persistence share the PostgreSQL connection pool.
 
-Internal occurrence storage retains the complete unframed binary Avro writer datum and its resolved writer schema. The schema can reconstruct a typed event without a registry lookup. The table and `webhook-events-dead-letter` both contain customer payloads. Restrict access to trusted local operators. Do not enable external SQL parameter or protocol tracing against these payload stores.
+Hibernate `ddl-auto: update` creates the PostgreSQL `dead_letter_occurrence` table and its constraints. Each valid generation has one row keyed by `(event_id, replay_count)`. The `dead_lettered_at` column holds the consumed Kafka record's metadata timestamp at millisecond precision. The consumer may query Apicurio for the writer schema and its named references. It does not call the webhook receiver. The row retains the original unframed binary Avro datum and resolved writer schema for offline decoding. Gregor does not attach signing material or copy Kafka headers into the row.
 
-To roll back, run the prior binary with the unused table intact. `DROP TABLE dead_letter_occurrence;` is optional destructive cleanup that deletes all stored occurrences.
+PostgreSQL commits before the consumer commits its Kafka offset. A record can be redelivered after the database commit if the Kafka offset did not commit. The first committed row wins. Duplicate writes leave every column unchanged. One row per generation does not imply exactly-once Kafka consumption or HTTP delivery.
+
+While Gregor runs, a Kafka reconnect or resume retries a partition's pending record before later records, even if a previously out-of-range commit becomes readable. The pending position is not stored across application restarts. A persistently invalid record blocks its partition while retained. Gregor does not automatically skip or quarantine failed records. Kafka cannot recover records it no longer retains. Kafka retention does not filter or remove PostgreSQL occurrences.
+
+The `dead_letter_occurrence` table and `webhook-events-dead-letter` topic contain customer payloads. Limit access to trusted local operators. Keep exchange body and record tracing off. Keep external SQL parameter and protocol tracing off. Gregor exposes no public dead-letter or replay endpoint.
+
+Rolling back to the prior binary stops automatic inserts. It leaves the table, rows, and broker offsets intact. No schema rollback or volume reset is required.
+
+## Reset local data
 
 To recreate local storage, run the following commands. **This deletes all local PostgreSQL, Kafka, and Apicurio data.**
 

@@ -1,6 +1,6 @@
 # Webhook Delivery Service: Build Phases
 
-This document is the complete implementation roadmap for the webhook delivery service. Phase 1 and Phases 2A through 2F are implemented and are kept
+This document is the complete implementation roadmap for the webhook delivery service. Phase 1 and Phases 2A through 2G are implemented and are kept
 whole. Every remaining phase is broken into the smallest dependency-ordered increment that still has a useful, independently testable
 boundary and its own completion gate. Phase 6 stays one release unit because splitting it would advertise an ordering guarantee that does
 not hold yet. Completing groundwork or an isolated test suite does not mark an increment as implemented.
@@ -16,7 +16,8 @@ not hold yet. Completing groundwork or an isolated test suite does not mark an i
 | Phase 2D            | Implemented                        | Phase 2C                                                            |
 | Phase 2E            | Implemented                        | Phase 2D                                                            |
 | Phase 2F            | Implemented                        | Phase 2E                                                            |
-| Phase 2G through 2J | Planned                            | Phase 2F, in listed order                                           |
+| Phase 2G            | Implemented                        | Phase 2F                                                            |
+| Phase 2H through 2J | Planned                            | Phase 2G, in listed order                                           |
 | Phase 3A through 3J | Planned                            | Phase 2; subphases in listed order                                  |
 | Phase 4A through 4F | Planned                            | Stable Phase 2 event contract; can proceed in parallel with Phase 3 |
 | Phase 5A through 5R | Planned                            | Phases 2 through 4; subphases in listed order                       |
@@ -78,7 +79,7 @@ signed webhook delivery and durable logical-attempt history.
 - There is no retry topic, dead-letter queue, replay, endpoint management, production security, tenant isolation, or strict FIFO mode.
 - Endpoint configuration and tenant identity are single configured values rather than managed or authenticated runtime state.
 
-## Phase 2: Retry Topology, Dead-Letter Queue, and Replay (PHASES 2A THROUGH 2F IMPLEMENTED, REST PLANNED)
+## Phase 2: Retry Topology, Dead-Letter Queue, and Replay (PHASES 2A THROUGH 2G IMPLEMENTED, REST PLANNED)
 
 Phase 2 is split because contracts, retry consumption, retry publication, terminal retention, dead-letter persistence, and replay each have
 a separate testable boundary. The subphases must be implemented in order. Retry attempts are sequential within a single non-redelivered
@@ -252,17 +253,17 @@ A committed terminal result has an acknowledged dead letter and terminal attempt
 
 The envelope codec and occurrence table are available internally. Gregor has no dead-letter consumer or automatic occurrence writer.
 
-### Phase 2G: Idempotent dead-letter persistence
+### Phase 2G: Idempotent dead-letter persistence (IMPLEMENTED)
 
 **Goal:** Persist each terminal generation exactly once per generation before committing offsets.
 
 #### Tasks
 
-- [ ] Consume the dead-letter topic in a separate consumer group.
-- [ ] Insert occurrences idempotently before committing offsets so a duplicate record cannot create a second occurrence for one generation.
-- [ ] Use Kafka publication time as the dead-letter time so redelivery does not extend retention.
-- [ ] Fail the consumption without committing when persistence fails so Kafka redelivers the record.
-- [ ] Test duplicate consumption, persistence failure and redelivery, restart recovery, and repeated generations.
+- [x] Consume the dead-letter topic in a separate consumer group.
+- [x] Insert occurrences idempotently before committing offsets so a duplicate record cannot create a second occurrence for one generation.
+- [x] Use Kafka publication time as the dead-letter time so redelivery does not extend retention.
+- [x] Fail the consumption without committing when persistence fails so Kafka redelivers the record.
+- [x] Test duplicate consumption, persistence failure and redelivery, restart recovery, and repeated generations.
 
 #### Completion gate
 

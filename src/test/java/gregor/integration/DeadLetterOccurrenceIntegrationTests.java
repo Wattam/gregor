@@ -7,6 +7,7 @@ import gregor.dto.StoredWebhookEnvelope;
 import gregor.entity.DeadLetterOccurrence;
 import gregor.exception.InvalidWebhookEnvelopeException;
 import gregor.repository.DeadLetterOccurrenceRepository;
+import gregor.repository.DeadLetterOccurrenceWriter;
 import gregor.service.DeadLetterOccurrenceService;
 import jakarta.persistence.EntityExistsException;
 import jakarta.persistence.EntityManagerFactory;
@@ -23,12 +24,12 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.MethodSource;
-import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.Mockito;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.core.NestedExceptionUtils;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.transaction.IllegalTransactionStateException;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.UnexpectedRollbackException;
 import org.springframework.transaction.support.TransactionTemplate;
@@ -65,6 +66,8 @@ class DeadLetterOccurrenceIntegrationTests {
     private DeadLetterOccurrenceService deadLetterOccurrenceService;
     @Autowired
     private DeadLetterOccurrenceRepository deadLetterOccurrenceRepository;
+    @Autowired
+    private DeadLetterOccurrenceWriter deadLetterOccurrenceWriter;
     @Autowired
     private WebhookEnvelopeCodec webhookEnvelopeCodec;
     @Autowired
@@ -110,6 +113,62 @@ class DeadLetterOccurrenceIntegrationTests {
                 String.class,
                 occurrenceId
         )).isEqualTo(storedWebhookEnvelope.writerSchemaJson());
+    }
+
+    @Test
+    void commitsTheOccurrenceEvenIfAnAmbientTransactionRollsBack() {
+        UUID eventId = UUID.randomUUID();
+        UUID rolledBackEventId = UUID.randomUUID();
+        UUID rolledBackOccurrenceId = UUID.randomUUID();
+        StoredWebhookEnvelope storedWebhookEnvelope = this.encode(eventId, 3);
+        TransactionTemplate transactionTemplate = new TransactionTemplate(this.platformTransactionManager);
+
+        transactionTemplate.executeWithoutResult(transactionStatus -> {
+            this.deadLetterOccurrenceService.insert(rolledBackOccurrenceId, this.encode(rolledBackEventId, 0), DEAD_LETTERED_AT);
+            this.deadLetterOccurrenceService.persistIfAbsent(storedWebhookEnvelope, Instant.parse("2026-07-10T12:00:01.987654Z"));
+            transactionStatus.setRollbackOnly();
+        });
+
+        DeadLetterOccurrence deadLetterOccurrence = this.deadLetterOccurrenceRepository.findByEventIdAndReplayCount(eventId, 3).orElseThrow();
+        Assertions.assertThat(deadLetterOccurrence.getOccurrenceId()).isNotNull().isNotEqualTo(eventId);
+        Assertions.assertThat(deadLetterOccurrence.getDeadLetteredAt()).isEqualTo(DEAD_LETTERED_AT);
+        Assertions.assertThat(deadLetterOccurrence.isReplayAccepted()).isFalse();
+        Assertions.assertThat(deadLetterOccurrence.getStoredWebhookEnvelope()).isEqualTo(storedWebhookEnvelope);
+        Assertions.assertThat(this.deadLetterOccurrenceRepository.findById(rolledBackOccurrenceId)).isEmpty();
+        Assertions.assertThat(this.countOccurrences(eventId)).isEqualTo(1);
+    }
+
+    @Test
+    void writerRequiresATransactionAndIgnoresOnlyGenerationConflicts() {
+        UUID eventId = UUID.randomUUID();
+        UUID occurrenceId = UUID.randomUUID();
+        UUID otherEventId = UUID.randomUUID();
+        UUID otherOccurrenceId = UUID.randomUUID();
+        StoredWebhookEnvelope storedWebhookEnvelope = this.encode(eventId, 0);
+        Assertions.assertThatExceptionOfType(IllegalTransactionStateException.class).isThrownBy(() -> this.deadLetterOccurrenceWriter.insertIfAbsent(occurrenceId, eventId, 0, storedWebhookEnvelope, DEAD_LETTERED_AT));
+        Assertions.assertThat(this.countOccurrences(eventId)).isZero();
+
+        TransactionTemplate transactionTemplate = new TransactionTemplate(this.platformTransactionManager);
+        transactionTemplate.executeWithoutResult(transactionStatus -> {
+            Assertions.assertThat(this.deadLetterOccurrenceWriter.insertIfAbsent(occurrenceId, eventId, 0, storedWebhookEnvelope, DEAD_LETTERED_AT)).isEqualTo(1);
+            Assertions.assertThat(this.countOccurrences(eventId)).isEqualTo(1);
+            transactionStatus.setRollbackOnly();
+        });
+        Assertions.assertThat(this.countOccurrences(eventId)).isZero();
+
+        Integer insertedRowCount = transactionTemplate.execute(_ -> this.deadLetterOccurrenceWriter.insertIfAbsent(occurrenceId, eventId, 0, storedWebhookEnvelope, DEAD_LETTERED_AT));
+        Assertions.assertThat(insertedRowCount).isEqualTo(1);
+        StoredWebhookEnvelope otherStoredWebhookEnvelope = this.encode(otherEventId, 0);
+        this.deadLetterOccurrenceService.insert(otherOccurrenceId, otherStoredWebhookEnvelope, DEAD_LETTERED_AT);
+
+        Integer duplicateRowCount = transactionTemplate.execute(_ -> this.deadLetterOccurrenceWriter.insertIfAbsent(otherOccurrenceId, eventId, 0, storedWebhookEnvelope, DEAD_LETTERED_AT));
+        Assertions.assertThat(duplicateRowCount).isZero();
+        StoredWebhookEnvelope newGenerationEnvelope = this.encode(eventId, 1);
+        assertSqlState(() -> transactionTemplate.execute(_ -> this.deadLetterOccurrenceWriter.insertIfAbsent(otherOccurrenceId, eventId, 1, newGenerationEnvelope, DEAD_LETTERED_AT)), "23505");
+        assertOccurrence(this.deadLetterOccurrenceRepository.findById(occurrenceId).orElseThrow(), occurrenceId, eventId, 0, DEAD_LETTERED_AT, false, storedWebhookEnvelope);
+        assertOccurrence(this.deadLetterOccurrenceRepository.findById(otherOccurrenceId).orElseThrow(), otherOccurrenceId, otherEventId, 0, DEAD_LETTERED_AT, false, otherStoredWebhookEnvelope);
+        Assertions.assertThat(this.countOccurrences(eventId)).isEqualTo(1);
+        Assertions.assertThat(this.countOccurrences(otherEventId)).isEqualTo(1);
     }
 
     @Test
@@ -300,20 +359,19 @@ class DeadLetterOccurrenceIntegrationTests {
     void rejectsMissingInputsEqualIdsAndNegativeGenerationBeforeWriting() {
         UUID eventId = UUID.randomUUID();
         UUID occurrenceId = UUID.randomUUID();
-        StoredWebhookEnvelope storedWebhookEnvelope = this.encode(eventId, 0);
         StoredWebhookEnvelope negativeStoredWebhookEnvelope = this.encode(eventId, -1);
-        assertInvalidInput(() -> this.deadLetterOccurrenceService.insert(null, storedWebhookEnvelope, DEAD_LETTERED_AT), "Dead-letter occurrence ID is required");
-        assertInvalidInput(() -> this.deadLetterOccurrenceService.insert(occurrenceId, storedWebhookEnvelope, null), "Dead-letter timestamp is required");
-        assertInvalidInput(() -> this.deadLetterOccurrenceService.insert(eventId, storedWebhookEnvelope, DEAD_LETTERED_AT), "Dead-letter occurrence ID must differ from the event ID");
+        assertInvalidInput(() -> this.deadLetterOccurrenceService.insert(null, null, null), "Dead-letter occurrence ID is required");
+        assertInvalidInput(() -> this.deadLetterOccurrenceService.insert(occurrenceId, null, null), "Dead-letter timestamp is required");
+        assertInvalidInput(() -> this.deadLetterOccurrenceService.insert(eventId, negativeStoredWebhookEnvelope, DEAD_LETTERED_AT), "Dead-letter occurrence ID must differ from the event ID");
         assertInvalidInput(() -> this.deadLetterOccurrenceService.insert(occurrenceId, negativeStoredWebhookEnvelope, DEAD_LETTERED_AT), "Dead-letter replay count must be nonnegative");
         Assertions.assertThat(this.countOccurrences(eventId)).isZero();
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"private-not-a-uuid", "1-1-1-1-1"})
-    void rejectsInvalidAndNoncanonicalEnvelopeEventIds(String eventIdText) {
+    @CsvSource({"private-not-a-uuid, 0", "private-not-a-uuid, -1", "1-1-1-1-1, 0", "1-1-1-1-1, -1"})
+    void rejectsInvalidAndNoncanonicalEnvelopeEventIds(String eventIdText, int replayCount) {
         UUID occurrenceId = UUID.randomUUID();
-        StoredWebhookEnvelope storedWebhookEnvelope = this.webhookEnvelopeCodec.encode(WebhookEnvelopeFixtures.currentEvent(eventIdText, 0, null));
+        StoredWebhookEnvelope storedWebhookEnvelope = this.webhookEnvelopeCodec.encode(WebhookEnvelopeFixtures.currentEvent(eventIdText, replayCount, null));
         assertInvalidInput(() -> this.deadLetterOccurrenceService.insert(occurrenceId, storedWebhookEnvelope, DEAD_LETTERED_AT), "Webhook envelope event ID must be a UUID");
         Assertions.assertThat(this.deadLetterOccurrenceRepository.findById(occurrenceId)).isEmpty();
     }

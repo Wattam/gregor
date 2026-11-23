@@ -64,6 +64,8 @@ class ConfigurationPropertiesTests {
             Assertions.assertThat(environment.getRequiredProperty("camel.component.kafka.auto-commit-enable", Boolean.class)).isFalse();
             Assertions.assertThat(environment.getRequiredProperty("camel.component.kafka.allow-manual-commit", Boolean.class)).isTrue();
             Assertions.assertThat(environment.getRequiredProperty("camel.component.kafka.break-on-first-error", Boolean.class)).isTrue();
+            Assertions.assertThat(environment.getRequiredProperty("camel.component.kafka.auto-offset-reset")).isEqualTo("earliest");
+            Assertions.assertThat(environment.getRequiredProperty("camel.component.kafka.max-poll-records", Integer.class)).isEqualTo(1);
         });
     }
 

@@ -17,7 +17,11 @@ public abstract class BaseRoute extends RouteBuilder {
     }
 
     protected RouteDefinition routeDefinition(String uri, Class<?> inputType) {
-        return super.from(uri).routeId(uri).inputType(inputType);
+        return this.routeDefinition(uri, uri, inputType);
+    }
+
+    protected RouteDefinition routeDefinition(String uri, String routeId, Class<?> inputType) {
+        return super.from(uri).routeId(routeId).inputType(inputType);
     }
 
     protected String kafkaProducerUri(String topicName) {

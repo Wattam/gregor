@@ -4,15 +4,26 @@ import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import gregor.avro.DeliveryAttempt;
 import gregor.avro.DeliveryOutcome;
+import gregor.avro.WebhookEnvelopeCodec;
+import gregor.avro.WebhookEnvelopeFixtures;
 import gregor.avro.WebhookEvent;
+import gregor.entity.DeadLetterOccurrence;
+import gregor.repository.DeadLetterOccurrenceRepository;
 import gregor.route.WebhookRoute;
 import gregor.service.WebhookService;
+import io.apicurio.registry.resolver.client.RegistryClientFacade;
+import io.apicurio.registry.resolver.client.RegistryVersionCoordinates;
+import io.apicurio.registry.serde.avro.AvroKafkaDeserializer;
+import io.apicurio.registry.serde.kafka.config.KafkaSerdeConfig;
 import io.vertx.core.Vertx;
 import lombok.AccessLevel;
 import lombok.RequiredArgsConstructor;
+import org.apache.avro.generic.GenericRecord;
 import org.apache.camel.CamelContext;
 import org.apache.camel.ProducerTemplate;
 import org.apache.camel.Route;
+import org.apache.camel.component.kafka.DefaultKafkaClientFactory;
+import org.apache.camel.component.kafka.KafkaClientFactory;
 import org.apache.camel.component.kafka.KafkaConstants;
 import org.apache.camel.component.kafka.KafkaEndpoint;
 import org.apache.camel.spi.RouteController;
@@ -20,14 +31,21 @@ import org.apache.kafka.clients.admin.AdminClient;
 import org.apache.kafka.clients.admin.Config;
 import org.apache.kafka.clients.admin.ConfigEntry;
 import org.apache.kafka.clients.admin.ConsumerGroupDescription;
+import org.apache.kafka.clients.admin.GroupListing;
+import org.apache.kafka.clients.admin.ListGroupsOptions;
 import org.apache.kafka.clients.admin.MemberDescription;
 import org.apache.kafka.clients.admin.TopicDescription;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.RecordMetadata;
 import org.apache.kafka.common.GroupState;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.config.ConfigResource;
 import org.apache.kafka.common.config.TopicConfig;
+import org.apache.kafka.common.header.Headers;
+import org.apache.kafka.common.header.internals.RecordHeaders;
+import org.apache.kafka.common.serialization.ByteArrayDeserializer;
 import org.assertj.core.api.Assertions;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -36,8 +54,10 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.Mockito;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
+import org.springframework.core.env.Environment;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.DynamicPropertyRegistry;
@@ -55,11 +75,17 @@ import java.net.http.HttpResponse;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
 import java.util.Base64;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
@@ -73,19 +99,23 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = "gregor.webhook.maximum-attempts=4")
+@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = {"spring.config.location=file:./src/main/resources/application.yaml", "gregor.webhook.maximum-attempts=4"})
 class CoreWebhookDeliveryLoopIntegrationTests {
 
     private static final String TENANT_ID = "00000000-0000-0000-0000-000000000001";
     private static final String ENDPOINT_ID = "00000000-0000-0000-0000-000000000002";
     private static final String SIGNING_SECRET = "whsec_" + Base64.getEncoder().encodeToString("01234567890123456789012345678901".getBytes(StandardCharsets.UTF_8));
     private static final TestReceiver TEST_RECEIVER = TestReceiver.start();
+    private static final String KAFKA_CLIENT_ID = "gregor-it-core-" + UUID.randomUUID();
     private static final String RETRY_TOPIC = WebhookRoute.WEBHOOK_EVENT_RETRY_1M_TOPIC;
 
     @LocalServerPort
     private int serverPort;
     @Autowired
     private CamelContext camelContext;
+    @Autowired
+    @Qualifier("deadLetterKafkaClientFactory")
+    private KafkaClientFactory deadLetterKafkaClientFactory;
     @Autowired
     private ProducerTemplate producerTemplate;
     @Autowired
@@ -94,6 +124,12 @@ class CoreWebhookDeliveryLoopIntegrationTests {
     private JdbcTemplate jdbcTemplate;
     @Autowired
     private ObjectMapper objectMapper;
+    @Autowired
+    private Environment environment;
+    @Autowired
+    private WebhookEnvelopeCodec webhookEnvelopeCodec;
+    @Autowired
+    private DeadLetterOccurrenceRepository deadLetterOccurrenceRepository;
     @MockitoSpyBean
     private WebhookService webhookService;
     @MockitoSpyBean
@@ -110,27 +146,12 @@ class CoreWebhookDeliveryLoopIntegrationTests {
         dynamicPropertyRegistry.add("spring.datasource.url", () -> "jdbc:postgresql://" + postgresHost + ":" + postgresPort + "/" + postgresDatabase);
         dynamicPropertyRegistry.add("spring.datasource.username", () -> System.getenv().getOrDefault("POSTGRES_USER", "gregor"));
         dynamicPropertyRegistry.add("spring.datasource.password", () -> System.getenv().getOrDefault("POSTGRES_PASSWORD", "gregor"));
-        dynamicPropertyRegistry.add("spring.jpa.hibernate.ddl-auto", () -> "update");
         dynamicPropertyRegistry.add("spring.kafka.bootstrap-servers", () -> "localhost:" + kafkaPort);
-        dynamicPropertyRegistry.add("spring.kafka.admin.auto-create", () -> "true");
         dynamicPropertyRegistry.add("camel.component.kafka.brokers", () -> "localhost:" + kafkaPort);
-        dynamicPropertyRegistry.add("camel.component.kafka.consumers-count", () -> "12");
-        dynamicPropertyRegistry.add("camel.component.kafka.auto-commit-enable", () -> "false");
-        dynamicPropertyRegistry.add("camel.component.kafka.allow-manual-commit", () -> "true");
-        dynamicPropertyRegistry.add("camel.component.kafka.break-on-first-error", () -> "true");
-        dynamicPropertyRegistry.add("camel.component.kafka.auto-offset-reset", () -> "earliest");
-        dynamicPropertyRegistry.add("camel.component.kafka.max-poll-records", () -> "1");
+        dynamicPropertyRegistry.add("camel.component.kafka.client-id", () -> KAFKA_CLIENT_ID);
         // Interrupt the pending wait before the first tier's real delay can elapse during shutdown.
         dynamicPropertyRegistry.add("camel.component.kafka.shutdown-timeout", () -> "1000");
-        dynamicPropertyRegistry.add("camel.main.auto-startup", () -> "true");
-        dynamicPropertyRegistry.add("camel.component.kafka.request-required-acks", () -> "all");
-        dynamicPropertyRegistry.add("camel.component.kafka.key-serializer", () -> "org.apache.kafka.common.serialization.StringSerializer");
-        dynamicPropertyRegistry.add("camel.component.kafka.value-serializer", () -> "io.apicurio.registry.serde.avro.AvroKafkaSerializer");
-        dynamicPropertyRegistry.add("camel.component.kafka.key-deserializer", () -> "org.apache.kafka.common.serialization.StringDeserializer");
-        dynamicPropertyRegistry.add("camel.component.kafka.value-deserializer", () -> "io.apicurio.registry.serde.avro.AvroKafkaDeserializer");
         dynamicPropertyRegistry.add("camel.component.kafka.additional-properties[apicurio.registry.url]", () -> "http://localhost:" + registryPort + "/apis/registry/v3");
-        dynamicPropertyRegistry.add("camel.component.kafka.additional-properties[apicurio.registry.auto-register]", () -> "true");
-        dynamicPropertyRegistry.add("camel.component.kafka.additional-properties[apicurio.registry.use-specific-avro-reader]", () -> "true");
         dynamicPropertyRegistry.add("gregor.kafka.listener-concurrency", () -> "12");
         dynamicPropertyRegistry.add("gregor.webhook.tenant-id", () -> TENANT_ID);
         dynamicPropertyRegistry.add("gregor.webhook.endpoint-id", () -> ENDPOINT_ID);
@@ -422,17 +443,159 @@ class CoreWebhookDeliveryLoopIntegrationTests {
     }
 
     @Test
-    void persistsTerminalAuditWithoutReceiverResponseText() throws Exception {
+    void persistsTerminalOccurrenceIndependentlyOfDeliveryAndAuditCommits() throws Exception {
+        String eventId = UUID.randomUUID().toString();
         String payload = "{\"private\":\"request-payload-marker\"}";
+        Instant httpTime = Instant.parse("2001-01-02T03:04:05Z");
         TEST_RECEIVER.respondWith(400, "Unknown customer: request-payload-marker");
+        Mockito.when(this.clock.instant()).thenReturn(httpTime);
+        WebhookEvent webhookEvent = WebhookEvent
+                .newBuilder(event("sensitive-details.test", ENDPOINT_ID))
+                .setEventId(eventId)
+                .setCreatedAt(httpTime.minusSeconds(600))
+                .setNextEligibleAt(httpTime.minusSeconds(60))
+                .setPayload(ByteBuffer.wrap(payload.getBytes(StandardCharsets.UTF_8)))
+                .build();
+        CountDownLatch terminalDeliveryCountDownLatch = new CountDownLatch(1);
+        Mockito.doAnswer(invocationOnMock -> {
+                    invocationOnMock.callRealMethod();
+                    if (!terminalDeliveryCountDownLatch.await(30, TimeUnit.SECONDS)) {
+                        throw new IllegalStateException("Fixture did not release terminal delivery");
+                    }
+                    return null;
+                })
+                .when(this.webhookService)
+                .publishDeadLetter(Mockito.argThat(webhookRouteMessage -> Objects.equals(webhookRouteMessage.webhookEvent().getEventId(), eventId)));
 
-        HttpResponse<String> httpResponse = this.postEvent("{\"eventType\":\"sensitive-details.test\",\"payload\":" + payload + "}");
-        Assertions.assertThat(httpResponse.statusCode()).isEqualTo(202);
-        String eventId = this.objectMapper.readTree(httpResponse.body()).get("eventId").asString();
-        CapturedRequest capturedRequest = TEST_RECEIVER.awaitRequest(eventId, 1);
-        Assertions.assertThat(capturedRequest.bodyBytes()).isEqualTo(payload.getBytes(StandardCharsets.UTF_8));
-        this.awaitAttemptRows(eventId, 1);
+        RouteController routeController = this.camelContext.getRouteController();
+        routeController.stopRoute(DeadLetterTestRecords.ROUTE_ID);
+        try (
+                AdminClient adminClient = KafkaTestRecords.adminClient();
+                KafkaConsumer<String, Object> sourceKafkaConsumer = this.observeNewRecords(adminClient, WebhookRoute.WEBHOOK_EVENT_TOPIC);
+                KafkaConsumer<String, Object> attemptKafkaConsumer = this.observeNewRecords(adminClient, WebhookRoute.PERSIST_DELIVERY_ATTEMPT_TOPIC);
+                KafkaConsumer<String, Object> deadLetterKafkaConsumer = this.observeNewRecords(adminClient, DeadLetterTestRecords.GROUP_ID)
+        ) {
+            ConsumerRecord<String, Object> deadLetterConsumerRecord;
+            UUID eventUuid = UUID.fromString(eventId);
+            try (DeadLetterDatabaseFixtures.InsertGate insertGate = DeadLetterDatabaseFixtures.holdInsert(this.jdbcTemplate, eventUuid)) {
+                this.sendToPartition(webhookEvent, 0);
+                deadLetterConsumerRecord = KafkaTestRecords.awaitRecord(deadLetterKafkaConsumer, eventId);
+                ConsumerRecord<String, Object> sourceConsumerRecord = KafkaTestRecords.awaitRecord(sourceKafkaConsumer, eventId);
+                Instant recordTime = Instant.ofEpochMilli(deadLetterConsumerRecord.timestamp());
+                Assertions.assertThat(recordTime).isNotIn(webhookEvent.getCreatedAt(), webhookEvent.getNextEligibleAt(), httpTime);
+                awaitClockPast(recordTime);
+                routeController.startRoute(DeadLetterTestRecords.ROUTE_ID);
+                insertGate.awaitPendingInsert();
 
+                Assertions.assertThat(KafkaTestRecords.committedOffset(adminClient, sourceConsumerRecord)).isLessThanOrEqualTo(sourceConsumerRecord.offset());
+                Assertions.assertThat(this.attemptRowCount(eventId)).isZero();
+                terminalDeliveryCountDownLatch.countDown();
+                KafkaTestRecords.awaitCommit(adminClient, sourceConsumerRecord);
+                ConsumerRecord<String, Object> attemptConsumerRecord = KafkaTestRecords.awaitRecord(attemptKafkaConsumer, eventId);
+                KafkaTestRecords.awaitCommit(adminClient, attemptConsumerRecord);
+                Assertions.assertThat(((DeliveryAttempt) attemptConsumerRecord.value()).getAttemptedAt()).isEqualTo(httpTime);
+                Assertions.assertThat(this.attemptRowCount(eventId)).isEqualTo(1);
+                Assertions.assertThat(TEST_RECEIVER.awaitRequest(eventId, 1).bodyBytes()).isEqualTo(payload.getBytes(StandardCharsets.UTF_8));
+                this.assertTerminalAuditWithoutReceiverResponse(eventId);
+                Assertions.assertThat(KafkaTestRecords.committedOffset(adminClient, deadLetterConsumerRecord)).isLessThanOrEqualTo(deadLetterConsumerRecord.offset());
+                Assertions.assertThat(this.deadLetterOccurrenceRepository.findByEventIdAndReplayCount(eventUuid, 0)).isEmpty();
+            }
+
+            KafkaTestRecords.awaitCommit(adminClient, deadLetterConsumerRecord);
+            Assertions.assertThat(KafkaTestRecords.committedOffset(adminClient, deadLetterConsumerRecord)).isEqualTo(deadLetterConsumerRecord.offset() + 1);
+            DeadLetterOccurrence deadLetterOccurrence = this.assertOccurrence(deadLetterConsumerRecord, eventUuid);
+            Assertions.assertThat(this.webhookEnvelopeCodec.decode(deadLetterOccurrence.getStoredWebhookEnvelope())).isEqualTo(WebhookEvent.newBuilder(webhookEvent).setDeliveryAttemptCount(1).build());
+            Assertions.assertThat(TEST_RECEIVER.count(eventId)).isEqualTo(1);
+        } finally {
+            terminalDeliveryCountDownLatch.countDown();
+            if (routeController.getRouteStatus(DeadLetterTestRecords.ROUTE_ID).isStopped()) {
+                routeController.startRoute(DeadLetterTestRecords.ROUTE_ID);
+            }
+        }
+    }
+
+    @Test
+    void storesTerminalInputWithoutDeliveryChecksOrSideEffects() throws Exception {
+        Instant recordTime = Instant.now().minus(Duration.ofHours(1)).truncatedTo(ChronoUnit.MILLIS);
+        List<TerminalInput> terminalInputs = List.of(
+                new TerminalInput(1, 0, recordTime.minusSeconds(1)),
+                new TerminalInput(4, 3, recordTime.minusSeconds(1)),
+                new TerminalInput(4, 3, recordTime.plus(Duration.ofDays(2))),
+                new TerminalInput(4, 3, null),
+                new TerminalInput(5, 4, null),
+                new TerminalInput(-1, 3, null),
+                new TerminalInput(4, -1, null)
+        );
+        RegistryClientFacade registryClientFacade = DeadLetterTestRecords.registry(this.environment, this.registryVertx);
+        RegistryVersionCoordinates coordinates = DeadLetterTestRecords.registerCurrent(registryClientFacade);
+        String[] topics = DeadLetterTestRecords.APPLICATION_TOPICS.toArray(String[]::new);
+        List<UUID> occurrenceIds = new ArrayList<>();
+
+        try (AdminClient adminClient = KafkaTestRecords.adminClient(); KafkaProducer<String, byte[]> kafkaProducer = KafkaTestRecords.rawProducer()) {
+            Map<TopicPartition, Long> offsetsBefore = KafkaTestRecords.endOffsets(adminClient, topics);
+            Map<TopicPartition, Long> expectedOffsets = new HashMap<>(offsetsBefore);
+            TopicPartition topicPartition = new TopicPartition(DeadLetterTestRecords.GROUP_ID, 0);
+            try (KafkaConsumer<String, Object> kafkaConsumer = KafkaTestRecords.consumer(this.registryVertx, offsetsBefore)) {
+                for (TerminalInput terminalInput : terminalInputs) {
+                    UUID eventId = UUID.fromString("abcdefab-" + UUID.randomUUID().toString().substring(9));
+                    String uppercaseEventId = eventId.toString().toUpperCase(Locale.ROOT);
+                    GenericRecord genericRecord = DeadLetterTestRecords.terminalDatum(uppercaseEventId, 0, terminalInput.nextEligibleAt());
+                    genericRecord.put("eventType", "direct-storage.test");
+                    genericRecord.put("deliveryAttemptCount", terminalInput.deliveryAttemptCount());
+                    genericRecord.put("retryCount", terminalInput.retryCount());
+                    byte[] datumBytes = WebhookEnvelopeFixtures.writeDatum(genericRecord);
+                    Headers headers = new RecordHeaders().add("signing-secret", SIGNING_SECRET.getBytes(StandardCharsets.UTF_8));
+                    RecordMetadata recordMetadata = DeadLetterTestRecords.send(kafkaProducer, topicPartition, recordTime, ENDPOINT_ID, DeadLetterTestRecords.prefix(coordinates, datumBytes), headers);
+                    expectedOffsets.compute(topicPartition, (_, offset) -> offset + 1);
+                    ConsumerRecord<String, Object> consumerRecord = KafkaTestRecords.awaitRecord(kafkaConsumer, uppercaseEventId);
+                    Assertions.assertThat(consumerRecord.topic()).isEqualTo(DeadLetterTestRecords.GROUP_ID);
+                    Assertions.assertThat(consumerRecord.partition()).isEqualTo(topicPartition.partition());
+                    Assertions.assertThat(consumerRecord.offset()).isEqualTo(recordMetadata.offset());
+                    Assertions.assertThat(consumerRecord.timestamp()).isEqualTo(recordTime.toEpochMilli());
+                    KafkaTestRecords.awaitCommit(adminClient, consumerRecord);
+                    Assertions.assertThat(KafkaTestRecords.committedOffset(adminClient, consumerRecord)).isEqualTo(recordMetadata.offset() + 1);
+
+                    DeadLetterOccurrence deadLetterOccurrence = this.assertOccurrence(consumerRecord, eventId);
+                    occurrenceIds.add(deadLetterOccurrence.getOccurrenceId());
+                    Assertions.assertThat(deadLetterOccurrence.getStoredWebhookEnvelope().datumBytes()).containsExactly(datumBytes);
+                    Assertions.assertThat(deadLetterOccurrence.getStoredWebhookEnvelope().writerSchemaJson()).doesNotContain(SIGNING_SECRET, "signing-secret");
+                    WebhookEvent storedWebhookEvent = this.webhookEnvelopeCodec.decode(deadLetterOccurrence.getStoredWebhookEnvelope());
+                    Assertions.assertThat(storedWebhookEvent.getDeliveryAttemptCount()).isEqualTo(terminalInput.deliveryAttemptCount());
+                    Assertions.assertThat(storedWebhookEvent.getRetryCount()).isEqualTo(terminalInput.retryCount());
+                    Assertions.assertThat(storedWebhookEvent.getNextEligibleAt()).isEqualTo(terminalInput.nextEligibleAt());
+                    Assertions.assertThat(TEST_RECEIVER.count(uppercaseEventId)).isZero();
+                    Assertions.assertThat(TEST_RECEIVER.count(eventId.toString())).isZero();
+                    Assertions.assertThat(this.attemptRowCount(eventId.toString())).isZero();
+                }
+            }
+            Assertions.assertThat(KafkaTestRecords.endOffsets(adminClient, topics)).isEqualTo(expectedOffsets);
+        }
+        Assertions.assertThat(occurrenceIds).hasSize(7).doesNotHaveDuplicates();
+    }
+
+    private DeadLetterOccurrence assertOccurrence(ConsumerRecord<String, Object> consumerRecord, UUID eventId) {
+        DeadLetterOccurrence deadLetterOccurrence = this.deadLetterOccurrenceRepository.findByEventIdAndReplayCount(eventId, 0).orElseThrow();
+        Assertions.assertThat(deadLetterOccurrence.getOccurrenceId()).isNotNull().isNotEqualTo(eventId);
+        Assertions.assertThat(deadLetterOccurrence.getEventId()).isEqualTo(eventId);
+        Assertions.assertThat(deadLetterOccurrence.getReplayCount()).isZero();
+        Assertions.assertThat(deadLetterOccurrence.isReplayAccepted()).isFalse();
+        Assertions.assertThat(deadLetterOccurrence.getDeadLetteredAt()).isEqualTo(Instant.ofEpochMilli(consumerRecord.timestamp()));
+        Assertions.assertThat(this.jdbcTemplate.queryForObject("SELECT count(*) FROM dead_letter_occurrence WHERE event_id = ?", Integer.class, eventId)).isEqualTo(1);
+        return deadLetterOccurrence;
+    }
+
+    private static void awaitClockPast(Instant recordTime) throws InterruptedException {
+        Instant deadline = Instant.now().plusSeconds(5);
+        while (Instant.now().isBefore(deadline)) {
+            if (Instant.now().truncatedTo(ChronoUnit.MILLIS).isAfter(recordTime)) {
+                return;
+            }
+            Thread.sleep(10L);
+        }
+        throw new AssertionError("The consumption time must differ from the terminal Kafka timestamp");
+    }
+
+    private void assertTerminalAuditWithoutReceiverResponse(String eventId) {
         Map<String, Object> attemptColumns = this.jdbcTemplate.queryForMap(
                 """
                 SELECT retry_count, replay_count, dead_lettered, outcome, http_status, details::text AS details
@@ -441,12 +604,7 @@ class CoreWebhookDeliveryLoopIntegrationTests {
                 """,
                 eventId
         );
-        Assertions.assertThat(attemptColumns)
-                .containsEntry("retry_count", 0)
-                .containsEntry("replay_count", 0)
-                .containsEntry("dead_lettered", true)
-                .containsEntry("outcome", "PERMANENT_FAILURE")
-                .containsEntry("http_status", 400);
+        Assertions.assertThat(attemptColumns).containsEntry("retry_count", 0).containsEntry("replay_count", 0).containsEntry("dead_lettered", true).containsEntry("outcome", "PERMANENT_FAILURE").containsEntry("http_status", 400);
         Assertions.assertThat(this.objectMapper.readTree(attemptColumns.get("details").toString())).isEqualTo(this.objectMapper.readTree("{\"type\":\"HTTP_FAILURE\"}"));
     }
 
@@ -604,10 +762,10 @@ class CoreWebhookDeliveryLoopIntegrationTests {
 
     @Test
     void declaresTopicsWithTheExpectedPartitioningAndRetention() throws Exception {
-        List<String> expectedTopics = List.of("webhook-events", "persist-delivery-attempt", "webhook-events-retry-1m", "webhook-events-retry-10m", "webhook-events-retry-1h", "webhook-events-dead-letter");
+        List<String> topics = DeadLetterTestRecords.APPLICATION_TOPICS;
         try (AdminClient adminClient = KafkaTestRecords.adminClient()) {
-            Map<String, TopicDescription> topicDescriptions = adminClient.describeTopics(expectedTopics).allTopicNames().get(10, TimeUnit.SECONDS);
-            Assertions.assertThat(topicDescriptions.keySet()).containsExactlyInAnyOrderElementsOf(expectedTopics);
+            Map<String, TopicDescription> topicDescriptions = adminClient.describeTopics(topics).allTopicNames().get(10, TimeUnit.SECONDS);
+            Assertions.assertThat(topicDescriptions.keySet()).containsExactlyInAnyOrderElementsOf(topics);
             Assertions.assertThat(topicDescriptions.values()).allSatisfy(topicDescription -> {
                 Assertions.assertThat(topicDescription.partitions()).hasSize(12);
                 Assertions.assertThat(topicDescription.partitions()).allSatisfy(topicPartitionInfo -> Assertions.assertThat(topicPartitionInfo.replicas()).hasSize(1));
@@ -621,22 +779,73 @@ class CoreWebhookDeliveryLoopIntegrationTests {
                     "webhook-events-retry-1h", "604800000",
                     "webhook-events-dead-letter", "2592000000"
             );
-            List<ConfigResource> configResources = expectedTopics.stream().map(topic -> new ConfigResource(ConfigResource.Type.TOPIC, topic)).toList();
+            List<ConfigResource> configResources = topics.stream().map(topic -> new ConfigResource(ConfigResource.Type.TOPIC, topic)).toList();
             Map<ConfigResource, Config> configs = adminClient.describeConfigs(configResources).all().get(10, TimeUnit.SECONDS);
             for (ConfigResource configResource : configResources) {
                 Assertions.assertThat(configValue(configs.get(configResource), TopicConfig.CLEANUP_POLICY_CONFIG)).isEqualTo(TopicConfig.CLEANUP_POLICY_DELETE);
                 Assertions.assertThat(configValue(configs.get(configResource), TopicConfig.RETENTION_MS_CONFIG)).isEqualTo(expectedRetentions.get(configResource.name()));
             }
+            assertActiveTopicNamedGroups(adminClient);
         }
-        List<String> consumedTopics = this.camelContext
-                .getRoutes()
-                .stream()
-                .map(Route::getEndpoint)
-                .filter(KafkaEndpoint.class::isInstance)
-                .map(KafkaEndpoint.class::cast)
-                .map(kafkaEndpoint -> kafkaEndpoint.getConfiguration().getTopic())
-                .toList();
-        Assertions.assertThat(consumedTopics).containsExactlyInAnyOrder("webhook-events", "webhook-events-retry-1m", "webhook-events-retry-10m", "webhook-events-retry-1h", "persist-delivery-attempt");
+        List<KafkaEndpoint> kafkaEndpoints = this.camelContext.getRoutes().stream().map(Route::getEndpoint).filter(KafkaEndpoint.class::isInstance).map(KafkaEndpoint.class::cast).toList();
+        Assertions.assertThat(kafkaEndpoints).extracting(kafkaEndpoint -> kafkaEndpoint.getConfiguration().getTopic()).containsExactlyInAnyOrderElementsOf(topics);
+        for (String topic : topics) {
+            String routeId = KafkaTestRecords.consumerRoute(topic);
+            Assertions.assertThat(this.camelContext.getRouteController().getRouteStatus(routeId).isStarted()).as(routeId).isTrue();
+            KafkaEndpoint kafkaEndpoint = (KafkaEndpoint) this.camelContext.getRoute(routeId).getEndpoint();
+            Assertions.assertThat(kafkaEndpoint.getConfiguration().getGroupId()).isEqualTo(topic);
+            boolean deadLetterTopic = Objects.equals(topic, DeadLetterTestRecords.GROUP_ID);
+            Class<?> deserializerType = deadLetterTopic ? ByteArrayDeserializer.class : AvroKafkaDeserializer.class;
+            Assertions.assertThat(kafkaEndpoint.getConfiguration().getValueDeserializer()).isEqualTo(deserializerType.getName());
+            Assertions.assertThat(kafkaEndpoint.getConfiguration().getAdditionalProperties()).doesNotContainKey(KafkaSerdeConfig.ENABLE_HEADERS);
+            if (deadLetterTopic) {
+                Assertions.assertThat(kafkaEndpoint.getKafkaClientFactory()).isSameAs(this.deadLetterKafkaClientFactory);
+            } else {
+                Assertions.assertThat(kafkaEndpoint.getKafkaClientFactory()).isExactlyInstanceOf(DefaultKafkaClientFactory.class);
+            }
+        }
+    }
+
+    private static void assertActiveTopicNamedGroups(AdminClient adminClient) throws InterruptedException {
+        List<String> topics = DeadLetterTestRecords.APPLICATION_TOPICS;
+        ListGroupsOptions listGroupsOptions = ListGroupsOptions.forConsumerGroups().inGroupStates(Set.of(GroupState.STABLE, GroupState.PREPARING_REBALANCE, GroupState.COMPLETING_REBALANCE));
+        Instant deadline = Instant.now().plusSeconds(25);
+        while (Instant.now().isBefore(deadline)) {
+            try {
+                List<String> groupIds = adminClient.listGroups(listGroupsOptions).all().get(2, TimeUnit.SECONDS).stream().map(GroupListing::groupId).toList();
+                List<ConsumerGroupDescription> applicationGroups = adminClient
+                        .describeConsumerGroups(groupIds)
+                        .all()
+                        .get(2, TimeUnit.SECONDS)
+                        .values()
+                        .stream()
+                        .filter(consumerGroupDescription -> consumerGroupDescription.members().stream().anyMatch(CoreWebhookDeliveryLoopIntegrationTests::isApplicationMember))
+                        .toList();
+                List<String> stableGroupIds = applicationGroups.stream().filter(consumerGroupDescription -> Objects.equals(consumerGroupDescription.groupState(), GroupState.STABLE)).map(ConsumerGroupDescription::groupId).toList();
+                if (stableGroupIds.containsAll(topics)) {
+                    Assertions.assertThat(applicationGroups).extracting(ConsumerGroupDescription::groupId).containsExactlyInAnyOrderElementsOf(topics);
+                    for (ConsumerGroupDescription consumerGroupDescription : applicationGroups) {
+                        List<String> assignedTopics = consumerGroupDescription
+                                .members()
+                                .stream()
+                                .filter(CoreWebhookDeliveryLoopIntegrationTests::isApplicationMember)
+                                .flatMap(memberDescription -> memberDescription.assignment().topicPartitions().stream())
+                                .map(TopicPartition::topic)
+                                .toList();
+                        Assertions.assertThat(assignedTopics).hasSize(12).containsOnly(consumerGroupDescription.groupId());
+                    }
+                    return;
+                }
+            } catch (ExecutionException | TimeoutException exception) {
+                // The groups can be absent or rebalancing at startup.
+            }
+            Thread.sleep(50L);
+        }
+        throw new AssertionError("Application consumer groups did not become stable: " + topics);
+    }
+
+    private static boolean isApplicationMember(MemberDescription memberDescription) {
+        return Objects.equals(memberDescription.clientId(), KAFKA_CLIENT_ID);
     }
 
     @Test
@@ -751,6 +960,9 @@ class CoreWebhookDeliveryLoopIntegrationTests {
     private static String configValue(Config config, String key) {
         ConfigEntry configEntry = config.get(key);
         return Objects.isNull(configEntry) ? null : configEntry.value();
+    }
+
+    private record TerminalInput(int deliveryAttemptCount, int retryCount, Instant nextEligibleAt) {
     }
 
     private record CapturedRequest(byte[] bodyBytes, String eventType, String webhookId, String timestamp, String signature, String contentType) {

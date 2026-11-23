@@ -554,7 +554,10 @@ class ApicurioWebhookEnvelopeReaderIntegrationTests {
         assertFailure(() -> this.apicurioWebhookEnvelopeReader.read(topicName, headers, null), MALFORMED_FRAMING);
         assertFailure(() -> this.apicurioWebhookEnvelopeReader.read(topicName, headers, new byte[0]), MALFORMED_FRAMING);
         assertFailure(() -> this.apicurioWebhookEnvelopeReader.read(topicName, headers, new byte[]{0}), MALFORMED_FRAMING);
-        assertFailure(() -> this.apicurioWebhookEnvelopeReader.read(topicName, headers, new byte[]{1, 0, 0, 0, 0}), MALFORMED_FRAMING);
+        // Check a non-magic prefix with header identifiers disabled.
+        try (ApicurioWebhookEnvelopeReader prefixApicurioWebhookEnvelopeReader = new ApicurioWebhookEnvelopeReader(this.webhookEnvelopeCodec, this.serdeProperties())) {
+            assertFailure(() -> prefixApicurioWebhookEnvelopeReader.read(topicName, headers, new byte[]{1, 0, 0, 0, 0}), MALFORMED_FRAMING);
+        }
         assertFailure(() -> this.apicurioWebhookEnvelopeReader.read(topicName, null, new byte[]{1, 0, 0, 0, 0}), MALFORMED_FRAMING);
     }
 
