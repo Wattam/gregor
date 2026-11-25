@@ -14,6 +14,7 @@ import org.slf4j.Marker;
 
 import java.util.Objects;
 import java.util.Set;
+import java.util.function.Supplier;
 
 @NoArgsConstructor(access = AccessLevel.PRIVATE)
 final class DeadLetterPersistenceDiagnostics {
@@ -24,13 +25,20 @@ final class DeadLetterPersistenceDiagnostics {
     private static final Object FILTER_INSTALLATION_LOCK = new Object();
 
     static void withoutRawDatabaseLogging(Runnable runnable) {
+        withoutRawDatabaseLogging(() -> {
+            runnable.run();
+            return null;
+        });
+    }
+
+    static <T> T withoutRawDatabaseLogging(Supplier<T> supplier) {
         if (LoggerFactory.getILoggerFactory() instanceof LoggerContext loggerContext) {
             installFilter(loggerContext);
         }
         Boolean previouslySuppressed = DATABASE_LOGGING_SUPPRESSED.get();
         DATABASE_LOGGING_SUPPRESSED.set(true);
         try {
-            runnable.run();
+            return supplier.get();
         } finally {
             if (Objects.isNull(previouslySuppressed)) {
                 DATABASE_LOGGING_SUPPRESSED.remove();

@@ -6,6 +6,7 @@ import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
 import jakarta.persistence.EntityExistsException;
 import jakarta.persistence.Id;
+import jakarta.persistence.Index;
 import jakarta.persistence.PersistenceException;
 import jakarta.persistence.Table;
 import jakarta.persistence.UniqueConstraint;
@@ -40,6 +41,7 @@ import java.util.UUID;
 @NoArgsConstructor(access = AccessLevel.PROTECTED)
 @Table(
         name = "dead_letter_occurrence",
+        indexes = @Index(name = "ix_dead_letter_occurrence_expiry", columnList = "dead_lettered_at, occurrence_id"),
         uniqueConstraints = @UniqueConstraint(name = "uk_dead_letter_occurrence_event_replay", columnNames = {"event_id", "replay_count"}),
         check = {
                 @CheckConstraint(name = "ck_dead_letter_occurrence_distinct_ids", constraint = "occurrence_id <> event_id"),

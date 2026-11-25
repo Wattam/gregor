@@ -1,5 +1,9 @@
 package gregor.integration;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import gregor.avro.WebhookEnvelopeCodec;
 import gregor.avro.WebhookEnvelopeFixtures;
 import gregor.avro.WebhookEvent;
@@ -12,6 +16,7 @@ import gregor.service.DeadLetterOccurrenceService;
 import jakarta.persistence.EntityExistsException;
 import jakarta.persistence.EntityManagerFactory;
 import jakarta.persistence.PersistenceException;
+import org.apache.commons.lang3.Strings;
 import org.assertj.core.api.Assertions;
 import org.assertj.core.api.ThrowableAssert.ThrowingCallable;
 import org.hibernate.engine.spi.SessionFactoryImplementor;
@@ -19,16 +24,19 @@ import org.hibernate.persister.entity.EntityPersister;
 import org.hibernate.type.BasicType;
 import org.hibernate.type.descriptor.ValueBinder;
 import org.hibernate.type.descriptor.java.JavaType;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.mockito.Mockito;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.core.NestedExceptionUtils;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.transaction.IllegalTransactionStateException;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.UnexpectedRollbackException;
@@ -37,6 +45,7 @@ import org.springframework.transaction.support.TransactionTemplate;
 import java.nio.ByteBuffer;
 import java.sql.CallableStatement;
 import java.sql.SQLException;
+import java.time.Clock;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.util.HexFormat;
@@ -76,6 +85,13 @@ class DeadLetterOccurrenceIntegrationTests {
     private EntityManagerFactory entityManagerFactory;
     @Autowired
     private PlatformTransactionManager platformTransactionManager;
+    @MockitoBean
+    private Clock clock;
+
+    @BeforeEach
+    void useAnObservationTimeWithinFixtureRetention() {
+        Mockito.when(this.clock.instant()).thenReturn(Instant.parse("2026-07-10T12:01:00Z"));
+    }
 
     @Test
     void storesDerivedIdentityEnvelopeAndSuppliedTimestampAtMillisecondPrecision() {
@@ -135,6 +151,7 @@ class DeadLetterOccurrenceIntegrationTests {
         Assertions.assertThat(deadLetterOccurrence.isReplayAccepted()).isFalse();
         Assertions.assertThat(deadLetterOccurrence.getStoredWebhookEnvelope()).isEqualTo(storedWebhookEnvelope);
         Assertions.assertThat(this.deadLetterOccurrenceRepository.findById(rolledBackOccurrenceId)).isEmpty();
+        Assertions.assertThat(this.countOccurrences(rolledBackEventId)).isZero();
         Assertions.assertThat(this.countOccurrences(eventId)).isEqualTo(1);
     }
 
@@ -203,6 +220,35 @@ class DeadLetterOccurrenceIntegrationTests {
         Assertions.assertThat(loggableRepresentation(entityPersister.findAttributeMapping("replayCount").getJavaType(), 2)).isEqualTo("[redacted]");
         Assertions.assertThat(loggableRepresentation(entityPersister.findAttributeMapping("writerSchemaJson").getJavaType(), storedWebhookEnvelope.writerSchemaJson())).isEqualTo("[redacted]");
         Assertions.assertThat(loggableRepresentation(entityPersister.findAttributeMapping("datumBytes").getJavaType(), storedWebhookEnvelope.datumBytes())).isEqualTo("[redacted]");
+    }
+
+    @Test
+    void redactsEventLookupParametersInHibernateBindTrace() {
+        UUID occurrenceId = UUID.randomUUID();
+        UUID eventId = UUID.randomUUID();
+        int replayCount = 971;
+        this.deadLetterOccurrenceService.insert(occurrenceId, this.encode(eventId, replayCount), DEAD_LETTERED_AT);
+
+        Logger bindLogger = (Logger) LoggerFactory.getLogger("org.hibernate.orm.jdbc.bind");
+        Level previousLevel = bindLogger.getLevel();
+        ListAppender<ILoggingEvent> listAppender = new ListAppender<>();
+        listAppender.start();
+        bindLogger.addAppender(listAppender);
+        bindLogger.setLevel(Level.TRACE);
+        try {
+            DeadLetterOccurrence generationOccurrence = this.deadLetterOccurrenceRepository.findByEventIdAndReplayCount(eventId, replayCount).orElseThrow();
+            DeadLetterOccurrence latestOccurrence = this.deadLetterOccurrenceRepository.findFirstByEventIdOrderByReplayCountDesc(eventId).orElseThrow();
+            Assertions.assertThat(generationOccurrence.getOccurrenceId()).isEqualTo(occurrenceId);
+            Assertions.assertThat(latestOccurrence.getOccurrenceId()).isEqualTo(occurrenceId);
+
+            List<String> bindMessages = listAppender.list.stream().map(ILoggingEvent::getFormattedMessage).toList();
+            Assertions.assertThat(bindMessages).allSatisfy(message -> Assertions.assertThat(message).doesNotContain(eventId.toString(), " <- [" + replayCount + "]"));
+            Assertions.assertThat(bindMessages).filteredOn(message -> Strings.CS.endsWith(message, " <- [[redacted]]")).hasSize(3);
+        } finally {
+            bindLogger.setLevel(previousLevel);
+            bindLogger.detachAppender(listAppender);
+            listAppender.stop();
+        }
     }
 
     @ParameterizedTest(name = "{0}")
@@ -320,7 +366,7 @@ class DeadLetterOccurrenceIntegrationTests {
         StoredWebhookEnvelope highestStoredWebhookEnvelope = this.encode(eventId, 2);
         Instant nextEligibleAt = Instant.parse("2026-07-10T12:00:00Z");
         Instant lowestDeadLetteredAt = Instant.parse("2026-07-10T12:00:01Z");
-        Instant highestDeadLetteredAt = highestTimestampEarlier ? Instant.parse("2001-01-01T00:00:00.123Z") : lowestDeadLetteredAt.plusSeconds(1);
+        Instant highestDeadLetteredAt = highestTimestampEarlier ? Instant.parse("2026-07-10T12:00:00.123Z") : lowestDeadLetteredAt.plusSeconds(1);
         StoredWebhookEnvelope lowestStoredWebhookEnvelope = this.webhookEnvelopeCodec.encode(WebhookEnvelopeFixtures.currentEvent(eventId.toString(), 0, nextEligibleAt));
         if (highestInsertedFirst) {
             this.deadLetterOccurrenceService.insert(highestOccurrenceId, highestStoredWebhookEnvelope, highestDeadLetteredAt);

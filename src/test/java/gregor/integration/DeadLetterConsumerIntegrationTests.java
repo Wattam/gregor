@@ -3,9 +3,7 @@ package gregor.integration;
 import gregor.avro.WebhookEnvelopeCodec;
 import gregor.avro.WebhookEnvelopeFixtures;
 import gregor.dto.StoredWebhookEnvelope;
-import gregor.entity.DeadLetterOccurrence;
 import gregor.exception.InvalidWebhookEnvelopeException;
-import gregor.repository.DeadLetterOccurrenceRepository;
 import io.apicurio.registry.resolver.client.RegistryArtifactReference;
 import io.apicurio.registry.resolver.client.RegistryClientFacade;
 import io.apicurio.registry.resolver.client.RegistryVersionCoordinates;
@@ -71,6 +69,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.OffsetDateTime;
 import java.util.Arrays;
 import java.util.HexFormat;
 import java.util.List;
@@ -97,6 +96,7 @@ import java.util.stream.Stream;
         properties = {
                 "spring.config.location=file:./src/main/resources/application.yaml",
                 "spring.kafka.bootstrap-servers=localhost:${KAFKA_PORT:9092}",
+                "gregor.dead-letter.cleanup-interval=1d",
                 "camel.main.auto-startup=false",
                 "camel.component.kafka.brokers=localhost:${KAFKA_PORT:9092}",
                 "camel.component.kafka.consumers-count=3",
@@ -118,8 +118,6 @@ class DeadLetterConsumerIntegrationTests {
     private CamelContext camelContext;
     @Autowired
     private JdbcTemplate jdbcTemplate;
-    @Autowired
-    private DeadLetterOccurrenceRepository deadLetterOccurrenceRepository;
     @Autowired
     private Environment environment;
     @Autowired
@@ -847,14 +845,21 @@ class DeadLetterConsumerIntegrationTests {
     }
 
     private OccurrenceSnapshot occurrence(UUID eventId, int replayCount) {
-        DeadLetterOccurrence deadLetterOccurrence = this.deadLetterOccurrenceRepository.findByEventIdAndReplayCount(eventId, replayCount).orElseThrow();
-        return new OccurrenceSnapshot(
-                deadLetterOccurrence.getOccurrenceId(),
-                deadLetterOccurrence.getEventId(),
-                deadLetterOccurrence.getReplayCount(),
-                deadLetterOccurrence.getDeadLetteredAt(),
-                deadLetterOccurrence.isReplayAccepted(),
-                deadLetterOccurrence.getStoredWebhookEnvelope()
+        return this.jdbcTemplate.queryForObject(
+                """
+                SELECT occurrence_id, event_id, replay_count, dead_lettered_at, replay_accepted, writer_schema, datum_bytes
+                FROM dead_letter_occurrence WHERE event_id = ? AND replay_count = ?
+                """,
+                (resultSet, _) -> new OccurrenceSnapshot(
+                        resultSet.getObject("occurrence_id", UUID.class),
+                        resultSet.getObject("event_id", UUID.class),
+                        resultSet.getInt("replay_count"),
+                        resultSet.getObject("dead_lettered_at", OffsetDateTime.class).toInstant(),
+                        resultSet.getBoolean("replay_accepted"),
+                        new StoredWebhookEnvelope(resultSet.getString("writer_schema"), resultSet.getBytes("datum_bytes"))
+                ),
+                eventId,
+                replayCount
         );
     }
 

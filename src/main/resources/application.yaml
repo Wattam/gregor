@@ -8,6 +8,9 @@ logging:
         org.hibernate: WARN
 
 gregor:
+    dead-letter:
+        cleanup-interval: ${DEAD_LETTER_CLEANUP_INTERVAL:1m}
+        cleanup-batch-size: ${DEAD_LETTER_CLEANUP_BATCH_SIZE:100}
     kafka:
         listener-concurrency: ${KAFKA_LISTENER_CONCURRENCY:12}
         topics:
@@ -46,6 +49,14 @@ camel:
                 "[apicurio.registry.url]": ${APICURIO_REGISTRY_URL:http://localhost:${SCHEMA_REGISTRY_PORT:8081}/apis/registry/v3}
                 "[apicurio.registry.use-specific-avro-reader]": true
                 "[apicurio.registry.auto-register]": true
+
+management:
+    endpoints:
+        access:
+            default: none
+        web:
+            discovery:
+                enabled: false
 
 spring:
     application:

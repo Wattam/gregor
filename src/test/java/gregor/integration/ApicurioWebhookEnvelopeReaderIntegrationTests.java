@@ -54,6 +54,7 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -166,7 +167,7 @@ class ApicurioWebhookEnvelopeReaderIntegrationTests {
 
         StoredWebhookEnvelope storedWebhookEnvelope = this.apicurioWebhookEnvelopeReader.read(topicName, headers, valueBytes);
         UUID occurrenceId = UUID.randomUUID();
-        this.deadLetterOccurrenceService.insert(occurrenceId, storedWebhookEnvelope, Instant.parse("2026-07-10T12:00:01.987Z"));
+        this.deadLetterOccurrenceService.insert(occurrenceId, storedWebhookEnvelope, Instant.now().truncatedTo(ChronoUnit.MILLIS));
         DeadLetterOccurrence deadLetterOccurrence = this.deadLetterOccurrenceRepository.findById(occurrenceId).orElseThrow();
         StoredWebhookEnvelope reloadedStoredWebhookEnvelope = deadLetterOccurrence.getStoredWebhookEnvelope();
 
@@ -210,10 +211,18 @@ class ApicurioWebhookEnvelopeReaderIntegrationTests {
                                   {"type":"record","name":"gregor.avro.%s","fields":[{"name":"context","type":"SharedContext"}]}
                                   """;
         RegistryArtifactReference leftRegistryArtifactReference = this.registerReference(
-                registryClientFacade, topicName + "-left", "gregor.avro.LeftContext", branchSchemaJson.formatted("LeftContext"), Set.of(sharedRegistryArtifactReference)
+                registryClientFacade,
+                topicName + "-left",
+                "gregor.avro.LeftContext",
+                branchSchemaJson.formatted("LeftContext"),
+                Set.of(sharedRegistryArtifactReference)
         );
         RegistryArtifactReference rightRegistryArtifactReference = this.registerReference(
-                registryClientFacade, topicName + "-right", "gregor.avro.RightContext", branchSchemaJson.formatted("RightContext"), Set.of(rightSharedRegistryArtifactReference)
+                registryClientFacade,
+                topicName + "-right",
+                "gregor.avro.RightContext",
+                branchSchemaJson.formatted("RightContext"),
+                Set.of(rightSharedRegistryArtifactReference)
         );
         RegistryVersionCoordinates coordinates = this.registerSchema(
                 registryClientFacade,
@@ -254,7 +263,11 @@ class ApicurioWebhookEnvelopeReaderIntegrationTests {
                                   {"type":"record","name":"gregor.avro.SharedContext",%s"fields":[{"name":"archived","type":"boolean"}]}
                                   """;
         RegistryArtifactReference sharedRegistryArtifactReference = this.registerReference(
-                registryClientFacade, topicName + "-shared", "gregor.avro.SharedContext", sharedSchemaJson.formatted(""), Set.of()
+                registryClientFacade,
+                topicName + "-shared",
+                "gregor.avro.SharedContext",
+                sharedSchemaJson.formatted(""),
+                Set.of()
         );
         RegistryArtifactReference externalRegistryArtifactReference = this.registerReference(
                 registryClientFacade,
@@ -414,7 +427,10 @@ class ApicurioWebhookEnvelopeReaderIntegrationTests {
                 Set.of()
         );
         RegistryVersionCoordinates coordinates = this.registerSchema(
-                registryClientFacade, topicName + "-value", WebhookEnvelopeFixtures.PHASE_ONE_WEBHOOK_EVENT_SCHEMA.toString(), Set.of(registryArtifactReference)
+                registryClientFacade,
+                topicName + "-value",
+                WebhookEnvelopeFixtures.PHASE_ONE_WEBHOOK_EVENT_SCHEMA.toString(),
+                Set.of(registryArtifactReference)
         );
         Headers headers = globalIdHeaders(coordinates);
         byte[] datumBytes = WebhookEnvelopeFixtures.phaseOneDatumWith();
@@ -441,7 +457,11 @@ class ApicurioWebhookEnvelopeReaderIntegrationTests {
         String malformedSchemaJson = malformedReference ? referenceSchemaJson : writerSchemaJson;
         malformedSchemaJson = containsComment ? "/* schema comment */ " + malformedSchemaJson : malformedSchemaJson + '\u000b';
         RegistryArtifactReference registryArtifactReference = this.registerReference(
-                registryClientFacade, topicName + "-reference", "gregor.avro.ArchivedContext", malformedReference ? malformedSchemaJson : referenceSchemaJson, Set.of()
+                registryClientFacade,
+                topicName + "-reference",
+                "gregor.avro.ArchivedContext",
+                malformedReference ? malformedSchemaJson : referenceSchemaJson,
+                Set.of()
         );
         RegistryVersionCoordinates coordinates = this.registerSchema(registryClientFacade, topicName + "-value", malformedReference ? writerSchemaJson : malformedSchemaJson, Set.of(registryArtifactReference));
         Headers headers = globalIdHeaders(coordinates);

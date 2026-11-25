@@ -50,6 +50,7 @@ Map<String, List<String>> sourceDependencies = [
                 "io.apicurio:apicurio-registry-serde-common:${apicurioVersion}",
                 "io.apicurio:apicurio-registry-serde-common-avro:${apicurioVersion}",
                 "io.apicurio:apicurio-registry-serde-kafka-common:${apicurioVersion}",
+                "io.micrometer:micrometer-core",
                 "io.vertx:vertx-core:${vertxVersion}",
                 "jakarta.persistence:jakarta.persistence-api",
                 "jakarta.validation:jakarta.validation-api",
@@ -99,6 +100,7 @@ dependencies {
         modules.each { module -> add(configurationName, module) }
     }
 
+    implementation "org.springframework.boot:spring-boot-starter-actuator"
     implementation "org.springframework.boot:spring-boot-starter-data-jpa"
     implementation "org.springframework.boot:spring-boot-starter-kafka"
     implementation "org.springframework.boot:spring-boot-starter-restclient"

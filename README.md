@@ -33,8 +33,12 @@ The runtime supports these environment overrides:
 | `KAFKA_MAX_POLL_INTERVAL_MS`           | `4500000`                                           |
 | `KAFKA_RETRY_TOPIC_RETENTION`          | `7d`                                                |
 | `KAFKA_DEAD_LETTER_TOPIC_RETENTION`    | `30d`                                               |
+| `DEAD_LETTER_CLEANUP_INTERVAL`         | `1m`                                                |
+| `DEAD_LETTER_CLEANUP_BATCH_SIZE`       | `100`                                               |
 
 `WEBHOOK_MAXIMUM_ATTEMPTS` must be from `1` through `4`. `KAFKA_MAX_POLL_INTERVAL_MS` must exceed `3900000`. The maximum permitted eligibility wait is this poll interval minus five minutes. The default poll interval is 75 minutes, and the default maximum permitted wait is 70 minutes. Camel's Kafka client idle connection timeout follows the poll interval so the client does not close an idle connection before that interval expires. `KAFKA_RETRY_TOPIC_RETENTION` must exceed `1h`, and `KAFKA_DEAD_LETTER_TOPIC_RETENTION` must be positive.
+
+`DEAD_LETTER_CLEANUP_INTERVAL` accepts Spring Boot durations such as `1m`, `PT1M`, or plain milliseconds. The supported range is `1ms` through `4611686018427387902ns`, inclusive. `DEAD_LETTER_CLEANUP_BATCH_SIZE` accepts decimal integers from `1` through `1000`, inclusive.
 
 ## Ingest an event
 
@@ -138,15 +142,46 @@ All topics use 12 default partitions and replication factor 1.
 
 The `webhook-events-dead-letter` group starts with Gregor. On startup it reads each partition from its committed offset, or from the earliest retained offset if the commit is missing or out of range. Delivery and attempt groups use separate offsets. Their commits do not depend on occurrence persistence. Attempt and occurrence persistence share the PostgreSQL connection pool.
 
-Hibernate `ddl-auto: update` creates the PostgreSQL `dead_letter_occurrence` table and its constraints. Each valid generation has one row keyed by `(event_id, replay_count)`. The `dead_lettered_at` column holds the consumed Kafka record's metadata timestamp at millisecond precision. The consumer may query Apicurio for the writer schema and its named references. It does not call the webhook receiver. The row retains the original unframed binary Avro datum and resolved writer schema for offline decoding. Gregor does not attach signing material or copy Kafka headers into the row.
+Hibernate `ddl-auto: update` creates the PostgreSQL `dead_letter_occurrence` table, its constraints, and the expiry index. It also adds the index to an existing table. The table allows at most one row per `(event_id, replay_count)`. The `dead_lettered_at` column holds the consumed Kafka record's metadata timestamp at millisecond precision. The consumer may query Apicurio for the writer schema and its named references. It does not call the webhook receiver. The row retains the original unframed binary Avro datum and resolved writer schema for offline decoding. Gregor does not attach signing material or copy Kafka headers into the row.
 
-PostgreSQL commits before the consumer commits its Kafka offset. A record can be redelivered after the database commit if the Kafka offset did not commit. The first committed row wins. Duplicate writes leave every column unchanged. One row per generation does not imply exactly-once Kafka consumption or HTTP delivery.
+PostgreSQL commits before the consumer commits its Kafka offset. A record can be redelivered after the database commit if the Kafka offset did not commit. A duplicate insert preserves every column of the existing row. One row per generation does not imply exactly-once Kafka consumption or HTTP delivery.
 
-While Gregor runs, a Kafka reconnect or resume retries a partition's pending record before later records, even if a previously out-of-range commit becomes readable. The pending position is not stored across application restarts. A persistently invalid record blocks its partition while retained. Gregor does not automatically skip or quarantine failed records. Kafka cannot recover records it no longer retains. Kafka retention does not filter or remove PostgreSQL occurrences.
+While Gregor runs, a Kafka reconnect or resume retries a partition's pending record before later records, even if a previously out-of-range commit becomes readable. The pending position is not stored across application restarts. A persistently invalid record blocks its partition while retained. Gregor does not automatically skip or quarantine failed records. Kafka cannot recover records it no longer retains.
+
+A PostgreSQL occurrence expires when the application UTC clock reaches its stored Kafka timestamp plus `KAFKA_DEAD_LETTER_TOPIC_RETENTION` (`30d` by default). The exact expiry instant is excluded. New lookups filter expired rows before physical deletion, and the latest lookup returns the highest retained replay generation regardless of replay acceptance. Replay acceptance and redelivery do not extend an occurrence's retention. Previously returned data and administrative SQL are not filtered. Kafka applies the same configured retention duration independently to log segments, not to individual PostgreSQL rows. Keep UTC clocks synchronized across instances and brokers.
+
+Each instance waits `DEAD_LETTER_CLEANUP_INTERVAL` before its first run and after completion of each run, including its count sample. Each run deletes at most `DEAD_LETTER_CLEANUP_BATCH_SIZE` expired rows, oldest first, breaking timestamp ties by occurrence ID. It skips locked rows. Subsequent runs drain the backlog. Locks, downtime, insufficient batch capacity, or failures can delay physical deletion.
+
+After deletion, redelivery with the original expired timestamp can recreate a physical row. It stays invisible to application lookups and eligible for cleanup. A distinct publication with a newer timestamp for the same generation can create a retained row after deletion. Increasing retention or rolling back cannot recover deleted rows. Rolling back to the preceding binary stops filtering and cleanup but preserves ingestion, the table, the index, surviving rows, and broker offsets. No schema rollback or volume reset is required.
 
 The `dead_letter_occurrence` table and `webhook-events-dead-letter` topic contain customer payloads. Limit access to trusted local operators. Keep exchange body and record tracing off. Keep external SQL parameter and protocol tracing off. Gregor exposes no public dead-letter or replay endpoint.
 
-Rolling back to the prior binary stops automatic inserts. It leaves the table, rows, and broker offsets intact. No schema rollback or volume reset is required.
+### Inspect cleanup metrics
+
+| Metric | Meaning |
+|---|---|
+| `gregor.deadletter.occurrences.retained` | Retained rows at the last successful sample. No numeric count is available before the first successful sample. A count failure leaves the last sample unchanged. Do not sum this shared-store gauge across instances. |
+| `gregor.deadletter.cleanup.deleted` | Rows deleted in acknowledged commits. |
+| `gregor.deadletter.cleanup.runs` | Deletion runs tagged `outcome=success` or `outcome=failure`. Empty batches count as successes. A count failure does not change the deletion outcome. An unacknowledged commit counts as a failed run and may have deleted rows. |
+
+Metrics are disabled over HTTP by default. For unauthenticated, read-only access on trusted local loopback, start Gregor with:
+
+```bash
+MANAGEMENT_SERVER_PORT=8082 \
+MANAGEMENT_SERVER_ADDRESS=127.0.0.1 \
+MANAGEMENT_ENDPOINT_METRICS_ACCESS=read-only \
+MANAGEMENT_ENDPOINTS_WEB_EXPOSURE_INCLUDE=metrics \
+bash ./gradlew bootRun
+```
+
+```bash
+curl --fail --silent --show-error http://127.0.0.1:8082/actuator/metrics/gregor.deadletter.occurrences.retained
+curl --fail --silent --show-error http://127.0.0.1:8082/actuator/metrics/gregor.deadletter.cleanup.deleted
+curl --fail --silent --show-error 'http://127.0.0.1:8082/actuator/metrics/gregor.deadletter.cleanup.runs?tag=outcome:success'
+curl --fail --silent --show-error 'http://127.0.0.1:8082/actuator/metrics/gregor.deadletter.cleanup.runs?tag=outcome:failure'
+```
+
+With this opt-in, metrics are served on the management port, not the application port. Management discovery and health remain disabled.
 
 ## Reset local data
 
@@ -165,6 +200,6 @@ empty `401 Unauthorized` response. The default timestamp tolerance is five minut
 
 ## Safety boundaries
 
-Both HTTP endpoints are publicly reachable without application authentication or authorization. Gregor has no SSRF protection, rate limiting, tenant isolation, or production-safe secret
+Both application HTTP endpoints are publicly reachable without application authentication or authorization. Gregor has no SSRF protection, rate limiting, tenant isolation, or production-safe secret
 management. The configured signing secret is a local-development default and must not be used in production. Do not expose this service to untrusted networks or use it as a production webhook
-platform. Restrict access to both dead-letter payload stores to trusted local operators.
+platform. Restrict access to both dead-letter payload stores to trusted local operators. Do not expose the optional management port to an untrusted network.

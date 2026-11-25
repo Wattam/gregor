@@ -8,6 +8,9 @@ logging:
         org.hibernate: WARN
 
 gregor:
+    dead-letter:
+        cleanup-interval: 1d # Keep background cleanup out of routine H2 and shared-store fixtures.
+        cleanup-batch-size: 100
     kafka:
         listener-concurrency: 1
         topics:

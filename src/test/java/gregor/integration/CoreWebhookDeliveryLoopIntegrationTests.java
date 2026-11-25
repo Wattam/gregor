@@ -99,7 +99,14 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
 @DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
-@SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = {"spring.config.location=file:./src/main/resources/application.yaml", "gregor.webhook.maximum-attempts=4"})
+@SpringBootTest(
+        webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
+        properties = {
+                "spring.config.location=file:./src/main/resources/application.yaml",
+                "gregor.webhook.maximum-attempts=4",
+                "gregor.dead-letter.cleanup-interval=1d"
+        }
+)
 class CoreWebhookDeliveryLoopIntegrationTests {
 
     private static final String TENANT_ID = "00000000-0000-0000-0000-000000000001";

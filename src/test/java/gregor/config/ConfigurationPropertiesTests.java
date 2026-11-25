@@ -1,11 +1,14 @@
 package gregor.config;
 
+import gregor.config.properties.DeadLetterCleanupProperties;
 import gregor.config.properties.KafkaConsumerProperties;
 import gregor.config.properties.KafkaTopicProperties;
 import gregor.config.properties.WebhookProperties;
 import org.apache.commons.lang3.Strings;
 import org.assertj.core.api.Assertions;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.boot.autoconfigure.AutoConfigurations;
 import org.springframework.boot.autoconfigure.context.ConfigurationPropertiesAutoConfiguration;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
@@ -19,11 +22,15 @@ import org.springframework.boot.validation.autoconfigure.ValidationAutoConfigura
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.env.EnumerablePropertySource;
 import org.springframework.core.env.Environment;
+import org.springframework.core.env.PropertySource;
+import org.springframework.core.env.SystemEnvironmentPropertySource;
+import org.springframework.core.io.ByteArrayResource;
 import org.springframework.core.io.FileSystemResource;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -53,6 +60,9 @@ class ConfigurationPropertiesTests {
             KafkaTopicProperties kafkaTopicProperties = assertableApplicationContext.getBean(KafkaTopicProperties.class);
             Assertions.assertThat(kafkaTopicProperties.retryRetention()).isEqualTo(Duration.ofDays(7));
             Assertions.assertThat(kafkaTopicProperties.deadLetterRetention()).isEqualTo(Duration.ofDays(30));
+            DeadLetterCleanupProperties deadLetterCleanupProperties = assertableApplicationContext.getBean(DeadLetterCleanupProperties.class);
+            Assertions.assertThat(deadLetterCleanupProperties.cleanupInterval()).isEqualTo(Duration.ofMinutes(1));
+            Assertions.assertThat(deadLetterCleanupProperties.batchSize()).isEqualTo(100);
         });
     }
 
@@ -83,7 +93,14 @@ class ConfigurationPropertiesTests {
     @Test
     void bindsEnvironmentOverrides() {
         this.applicationContextRunner
-                .withSystemProperties("WEBHOOK_MAXIMUM_ATTEMPTS=1", "KAFKA_MAX_POLL_INTERVAL_MS=4200000", "KAFKA_RETRY_TOPIC_RETENTION=2h", "KAFKA_DEAD_LETTER_TOPIC_RETENTION=3d")
+                .withSystemProperties(
+                        "WEBHOOK_MAXIMUM_ATTEMPTS=1",
+                        "KAFKA_MAX_POLL_INTERVAL_MS=4200000",
+                        "KAFKA_RETRY_TOPIC_RETENTION=2h",
+                        "KAFKA_DEAD_LETTER_TOPIC_RETENTION=3d",
+                        "DEAD_LETTER_CLEANUP_INTERVAL=PT2S",
+                        "DEAD_LETTER_CLEANUP_BATCH_SIZE=42"
+                )
                 .run(assertableApplicationContext -> {
                     Assertions.assertThat(assertableApplicationContext.getStartupFailure()).isNull();
                     Assertions.assertThat(assertableApplicationContext.getBean(WebhookProperties.class).maximumAttempts()).isEqualTo(1);
@@ -94,6 +111,9 @@ class ConfigurationPropertiesTests {
                     KafkaTopicProperties kafkaTopicProperties = assertableApplicationContext.getBean(KafkaTopicProperties.class);
                     Assertions.assertThat(kafkaTopicProperties.retryRetention()).isEqualTo(Duration.ofHours(2));
                     Assertions.assertThat(kafkaTopicProperties.deadLetterRetention()).isEqualTo(Duration.ofDays(3));
+                    DeadLetterCleanupProperties deadLetterCleanupProperties = assertableApplicationContext.getBean(DeadLetterCleanupProperties.class);
+                    Assertions.assertThat(deadLetterCleanupProperties.cleanupInterval()).isEqualTo(Duration.ofSeconds(2));
+                    Assertions.assertThat(deadLetterCleanupProperties.batchSize()).isEqualTo(42);
                 });
     }
 
@@ -188,8 +208,72 @@ class ConfigurationPropertiesTests {
         }
     }
 
+    @Test
+    void acceptsBothSupportedCleanupLimits() {
+        this.assertCleanupSettings("1ms", "1", Duration.ofMillis(1), 1);
+        this.assertCleanupSettings("4611686018427387902ns", "1000", Duration.ofNanos(4_611_686_018_427_387_902L), 1000);
+        this.assertCleanupSettings("1500", "42", Duration.ofMillis(1500), 42);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"", "nonsense", "1fortnight", "0ms", "-1ms", "999999ns", "4611686018427387903ns", "PT30000000000000H"})
+    void rejectsInvalidCleanupIntervals(String interval) {
+        this.withCleanupEnvironmentOverride("DEAD_LETTER_CLEANUP_INTERVAL", interval)
+                .run(assertableApplicationContext -> Assertions.assertThat(assertableApplicationContext.getStartupFailure()).hasStackTraceContaining("gregor.dead-letter"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"", " ", "1.5", "2.0", "1e2", "+1", "-1", "0", "1001", "2147483648"})
+    void rejectsInvalidCleanupBatchSizes(String batchSize) {
+        this.withCleanupEnvironmentOverride("DEAD_LETTER_CLEANUP_BATCH_SIZE", batchSize)
+                .run(assertableApplicationContext -> Assertions.assertThat(assertableApplicationContext.getStartupFailure()).hasRootCauseInstanceOf(BindValidationException.class));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"1.5", "2.0"})
+    void rejectsNumericDecimalCleanupBatchSizesFromYaml(String batchSize) throws IOException {
+        ByteArrayResource byteArrayResource = new ByteArrayResource(("gregor.dead-letter.cleanup-batch-size: " + batchSize).getBytes(StandardCharsets.UTF_8));
+        PropertySource<?> yamlPropertySource = new YamlPropertySourceLoader().load("cleanup-batch-size", byteArrayResource).getFirst();
+        this.applicationContextRunner
+                .withInitializer(assertableApplicationContext -> assertableApplicationContext.getEnvironment().getPropertySources().addFirst(yamlPropertySource))
+                .run(assertableApplicationContext -> Assertions.assertThat(assertableApplicationContext.getStartupFailure()).hasRootCauseInstanceOf(BindValidationException.class));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"gregor.dead-letter.cleanup-interval=1m", "gregor.dead-letter.cleanup-batch-size=100"})
+    void rejectsEitherMissingEffectiveCleanupSetting(String otherSetting) {
+        new ApplicationContextRunner()
+                .withConfiguration(AutoConfigurations.of(ConfigurationPropertiesAutoConfiguration.class, ValidationAutoConfiguration.class))
+                .withUserConfiguration(CleanupPropertiesConfiguration.class)
+                .withPropertyValues(otherSetting)
+                .run(assertableApplicationContext -> Assertions.assertThat(assertableApplicationContext.getStartupFailure()).hasRootCauseInstanceOf(BindValidationException.class));
+    }
+
+    private ApplicationContextRunner withCleanupEnvironmentOverride(String name, String value) {
+        return this.applicationContextRunner.withInitializer(assertableApplicationContext -> assertableApplicationContext.getEnvironment().getPropertySources().addFirst(new SystemEnvironmentPropertySource(
+                "cleanup-test-systemEnvironment",
+                Map.of(name, value)
+        )));
+    }
+
+    private void assertCleanupSettings(String interval, String batchSize, Duration expectedInterval, int expectedBatchSize) {
+        this.applicationContextRunner
+                .withPropertyValues("gregor.dead-letter.cleanup-interval=" + interval, "gregor.dead-letter.cleanup-batch-size=" + batchSize)
+                .run(assertableApplicationContext -> {
+                    Assertions.assertThat(assertableApplicationContext.getStartupFailure()).isNull();
+                    DeadLetterCleanupProperties deadLetterCleanupProperties = assertableApplicationContext.getBean(DeadLetterCleanupProperties.class);
+                    Assertions.assertThat(deadLetterCleanupProperties.cleanupInterval()).isEqualTo(expectedInterval);
+                    Assertions.assertThat(deadLetterCleanupProperties.batchSize()).isEqualTo(expectedBatchSize);
+                });
+    }
+
     @Configuration(proxyBeanMethods = false)
-    @EnableConfigurationProperties({WebhookProperties.class, KafkaConsumerProperties.class, KafkaTopicProperties.class})
+    @EnableConfigurationProperties(DeadLetterCleanupProperties.class)
+    private static class CleanupPropertiesConfiguration {
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    @EnableConfigurationProperties({WebhookProperties.class, KafkaConsumerProperties.class, KafkaTopicProperties.class, DeadLetterCleanupProperties.class})
     private static class PropertiesConfiguration {
     }
 }
