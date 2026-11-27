@@ -1,6 +1,6 @@
 # Webhook Delivery Service: Build Phases
 
-This document is the complete implementation roadmap for the webhook delivery service. Phase 1 and Phases 2A through 2G are implemented and are kept
+This document is the complete implementation roadmap for the webhook delivery service. Phase 1 and Phases 2A through 2H are implemented and are kept
 whole. Every remaining phase is broken into the smallest dependency-ordered increment that still has a useful, independently testable
 boundary and its own completion gate. Phase 6 stays one release unit because splitting it would advertise an ordering guarantee that does
 not hold yet. Completing groundwork or an isolated test suite does not mark an increment as implemented.
@@ -17,7 +17,8 @@ not hold yet. Completing groundwork or an isolated test suite does not mark an i
 | Phase 2E            | Implemented                        | Phase 2D                                                            |
 | Phase 2F            | Implemented                        | Phase 2E                                                            |
 | Phase 2G            | Implemented                        | Phase 2F                                                            |
-| Phase 2H through 2J | Planned                            | Phase 2G, in listed order                                           |
+| Phase 2H            | Implemented                        | Phase 2G                                                            |
+| Phase 2I through 2J | Planned                            | Phase 2H, in listed order                                           |
 | Phase 3A through 3J | Planned                            | Phase 2; subphases in listed order                                  |
 | Phase 4A through 4F | Planned                            | Stable Phase 2 event contract; can proceed in parallel with Phase 3 |
 | Phase 5A through 5R | Planned                            | Phases 2 through 4; subphases in listed order                       |
@@ -79,7 +80,7 @@ signed webhook delivery and durable logical-attempt history.
 - There is no retry topic, dead-letter queue, replay, endpoint management, production security, tenant isolation, or strict FIFO mode.
 - Endpoint configuration and tenant identity are single configured values rather than managed or authenticated runtime state.
 
-## Phase 2: Retry Topology, Dead-Letter Queue, and Replay (PHASES 2A THROUGH 2G IMPLEMENTED, REST PLANNED)
+## Phase 2: Retry Topology, Dead-Letter Queue, and Replay (PHASES 2A THROUGH 2H IMPLEMENTED, REST PLANNED)
 
 Phase 2 is split because contracts, retry consumption, retry publication, terminal retention, dead-letter persistence, and replay each have
 a separate testable boundary. The subphases must be implemented in order. Retry attempts are sequential within a single non-redelivered
@@ -269,17 +270,17 @@ The envelope codec and occurrence table are available internally. Gregor has no 
 
 Every terminal event is an idempotently persisted dead-letter occurrence that is written before its offset commits.
 
-### Phase 2H: Dead-letter retention and cleanup
+### Phase 2H: Dead-letter retention and cleanup (IMPLEMENTED)
 
 **Goal:** Bound retained dead-letter state without hiding it from operators before it expires.
 
 #### Tasks
 
-- [ ] Exclude expired occurrences from every read immediately at the configured dead-letter retention boundary.
-- [ ] Add scheduled physical cleanup with a validated interval and bounded batch size.
-- [ ] Keep cleanup safe with concurrent readers, replay requests, and multiple instances.
-- [ ] Add retained-volume and cleanup metrics and logs without payloads or signing secrets.
-- [ ] Test the expiry boundary just inside and just outside retention, cleanup batching, concurrent cleanup, and read exclusion before
+- [x] Exclude expired occurrences from every read immediately at the configured dead-letter retention boundary.
+- [x] Add scheduled physical cleanup with a validated interval and bounded batch size.
+- [x] Keep cleanup safe with concurrent readers, replay requests, and multiple instances.
+- [x] Add retained-volume and cleanup metrics and logs without payloads or signing secrets.
+- [x] Test the expiry boundary just inside and just outside retention, cleanup batching, concurrent cleanup, and read exclusion before
   physical deletion.
 
 #### Completion gate

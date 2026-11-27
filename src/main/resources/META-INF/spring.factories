@@ -1,1 +1,4 @@
 org.springframework.context.ApplicationContextInitializer=gregor.avro.AvroClassSecurityInitializer
+org.springframework.boot.env.PropertySourceLoader=\
+    gregor.config.DeadLetterBatchSizeYamlPropertySourceLoader$PropertiesLoader,\
+    gregor.config.DeadLetterBatchSizeYamlPropertySourceLoader

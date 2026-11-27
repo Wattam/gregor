@@ -14,6 +14,7 @@ import gregor.service.DeadLetterOccurrenceService;
 import io.micrometer.core.instrument.MeterRegistry;
 import org.assertj.core.api.Assertions;
 import org.jspecify.annotations.NullMarked;
+import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -47,6 +48,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -57,6 +59,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.DoubleSupplier;
 
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class DeadLetterRetentionCleanupIntegrationTests {
@@ -65,6 +68,8 @@ class DeadLetterRetentionCleanupIntegrationTests {
     private static final Instant EXPIRY = Instant.parse("2026-01-31T00:00:00Z");
     private static final OffsetDateTime CUTOFF = OffsetDateTime.parse("2026-01-01T00:00:00Z");
     private static final Duration CLEANUP_INTERVAL = Duration.ofMillis(400);
+    private static final UUID PRE_INDEX_OCCURRENCE_ID = UUID.fromString("88000000-0000-0000-0000-000000000001");
+    private static final UUID PRE_INDEX_EVENT_ID = UUID.fromString("88000000-0000-0000-0000-000000000002");
     private static final String SCHEMA = "gregor_retention_it_" + UUID.randomUUID().toString().replace("-", "");
     private static final String DATABASE_URL = "jdbc:postgresql://%s:%s/%s".formatted(
             System.getenv().getOrDefault("POSTGRES_HOST", "localhost"),
@@ -83,6 +88,7 @@ class DeadLetterRetentionCleanupIntegrationTests {
     private DeadLetterOccurrenceCleanupService deadLetterOccurrenceCleanupService;
     private TransactionTemplate transactionTemplate;
     private MeterRegistry meterRegistry;
+    private @Nullable DeadLetterOccurrence upgradedDeadLetterOccurrence;
 
     @BeforeAll
     void startApplicationInAnIsolatedPostgresqlSchema() {
@@ -101,9 +107,19 @@ class DeadLetterRetentionCleanupIntegrationTests {
                 )
                 """.formatted(SCHEMA)
         );
+        this.adminJdbcTemplate.update(
+                """
+                INSERT INTO %s.dead_letter_occurrence (occurrence_id, event_id, replay_count, writer_schema, datum_bytes, dead_lettered_at, replay_accepted)
+                VALUES (?, ?, 4, '"null"', ?, TIMESTAMPTZ '2026-01-01 00:00:00.001+00', true)
+                """.formatted(SCHEMA),
+                PRE_INDEX_OCCURRENCE_ID,
+                PRE_INDEX_EVENT_ID,
+                new byte[]{8, -3, 5}
+        );
         this.configurableApplicationContext = this.startApplication("30d");
         this.jdbcTemplate = this.configurableApplicationContext.getBean(JdbcTemplate.class);
         this.deadLetterOccurrenceRepository = this.configurableApplicationContext.getBean(DeadLetterOccurrenceRepository.class);
+        this.upgradedDeadLetterOccurrence = this.deadLetterOccurrenceRepository.findById(PRE_INDEX_OCCURRENCE_ID).orElse(null);
         this.deadLetterOccurrenceCleanupService = this.configurableApplicationContext.getBean(DeadLetterOccurrenceCleanupService.class);
         this.transactionTemplate = new TransactionTemplate(this.configurableApplicationContext.getBean(PlatformTransactionManager.class));
         this.meterRegistry = this.configurableApplicationContext.getBean(MeterRegistry.class);
@@ -153,7 +169,10 @@ class DeadLetterRetentionCleanupIntegrationTests {
         UUID eventId = UUID.randomUUID();
         this.insert(occurrenceId, eventId, 0, KAFKA_TIMESTAMP, false);
 
-        try (ConfigurableApplicationContext configuredApplicationContext = this.startApplication("PT720H0.000000500S")) {
+        try (
+                ConfigurableApplicationContext configuredApplicationContext = this.startApplication("PT720H0.000000500S");
+                ExecutorService executorService = Executors.newVirtualThreadPerTaskExecutor()
+        ) {
             DeadLetterOccurrenceRepository deadLetterOccurrenceRepository = configuredApplicationContext.getBean(DeadLetterOccurrenceRepository.class);
             DeadLetterOccurrenceCleanupService deadLetterOccurrenceCleanupService = configuredApplicationContext.getBean(DeadLetterOccurrenceCleanupService.class);
             MeterRegistry meterRegistry = configuredApplicationContext.getBean(MeterRegistry.class);
@@ -167,7 +186,14 @@ class DeadLetterRetentionCleanupIntegrationTests {
 
             this.now.set(Instant.parse("2026-01-31T00:00:00.000000500Z"));
             assertAllLookupsEmpty(deadLetterOccurrenceRepository, occurrenceId, eventId, 0);
-            Assertions.assertThat(this.physicalIds()).containsExactly(occurrenceId);
+            this.transactionTemplate.executeWithoutResult(_ -> {
+                Assertions.assertThat(this.lockOccurrence(occurrenceId)).containsExactly(occurrenceId);
+                Assertions.assertThat(executorService.submit(deadLetterOccurrenceCleanupService::runCleanup)).succeedsWithin(5, TimeUnit.SECONDS);
+                Assertions.assertThat(this.physicalIds()).containsExactly(occurrenceId);
+                Assertions.assertThat(meterRegistry.get("gregor.deadletter.occurrences.retained").gauge().value()).isZero();
+                Assertions.assertThat(meterRegistry.get("gregor.deadletter.cleanup.deleted").counter().count()).isZero();
+            });
+
             deadLetterOccurrenceCleanupService.runCleanup();
             Assertions.assertThat(this.physicalIds()).isEmpty();
             Assertions.assertThat(meterRegistry.get("gregor.deadletter.occurrences.retained").gauge().value()).isZero();
@@ -238,7 +264,16 @@ class DeadLetterRetentionCleanupIntegrationTests {
     }
 
     @Test
-    void createsTheExpiryIndexOnAnExistingOccurrenceTable() {
+    void createsTheExpiryIndexWithoutLosingTheExistingOccurrence() {
+        Assertions.assertThat(this.upgradedDeadLetterOccurrence).isNotNull().satisfies(deadLetterOccurrence -> {
+            Assertions.assertThat(deadLetterOccurrence.getOccurrenceId()).isEqualTo(PRE_INDEX_OCCURRENCE_ID);
+            Assertions.assertThat(deadLetterOccurrence.getEventId()).isEqualTo(PRE_INDEX_EVENT_ID);
+            Assertions.assertThat(deadLetterOccurrence.getReplayCount()).isEqualTo(4);
+            Assertions.assertThat(deadLetterOccurrence.getDeadLetteredAt()).isEqualTo(Instant.parse("2026-01-01T00:00:00.001Z"));
+            Assertions.assertThat(deadLetterOccurrence.isReplayAccepted()).isTrue();
+            Assertions.assertThat(deadLetterOccurrence.getStoredWebhookEnvelope().writerSchemaJson()).isEqualTo("\"null\"");
+            Assertions.assertThat(deadLetterOccurrence.getStoredWebhookEnvelope().datumBytes()).containsExactly(8, -3, 5);
+        });
         Assertions.assertThat(this.jdbcTemplate.queryForList(
                 """
                 SELECT attribute.attname::text FROM pg_index AS index_metadata
@@ -256,18 +291,14 @@ class DeadLetterRetentionCleanupIntegrationTests {
     void deletesOnlyTheOldestExpiredRowsInCommittedBatchesAndSamplesRetainedVolume() {
         UUID firstTieId = UUID.fromString("7fffffff-0000-0000-0000-000000000001");
         UUID secondTieId = UUID.fromString("80000000-0000-0000-0000-000000000001");
-        UUID oldestId = UUID.randomUUID();
-        UUID newerExpiredId = UUID.randomUUID();
-        UUID expiryBoundaryId = UUID.randomUUID();
+        UUID oldestId = UUID.fromString("ffffffff-0000-0000-0000-000000000001");
         UUID expiredEventId = UUID.randomUUID();
         UUID retainedId = UUID.randomUUID();
         UUID retainedEventId = UUID.randomUUID();
-        this.insert(secondTieId, UUID.randomUUID(), 0, KAFKA_TIMESTAMP.minusMillis(2), false);
-        this.insert(expiryBoundaryId, expiredEventId, 0, KAFKA_TIMESTAMP, true);
-        this.insert(firstTieId, UUID.randomUUID(), 0, KAFKA_TIMESTAMP.minusMillis(2), true);
+        this.insert(secondTieId, UUID.randomUUID(), 0, KAFKA_TIMESTAMP, false);
+        this.insert(firstTieId, expiredEventId, 0, KAFKA_TIMESTAMP, true);
         this.insert(retainedId, retainedEventId, 0, KAFKA_TIMESTAMP.plusMillis(1), true);
-        this.insert(newerExpiredId, UUID.randomUUID(), 0, KAFKA_TIMESTAMP.minusMillis(1), false);
-        this.insert(oldestId, UUID.randomUUID(), 0, KAFKA_TIMESTAMP.minusMillis(3), false);
+        this.insert(oldestId, UUID.randomUUID(), 0, KAFKA_TIMESTAMP.minusMillis(1), false);
         StoredWebhookEnvelope retainedEnvelope = this.deadLetterOccurrenceRepository.findById(retainedId).orElseThrow().getStoredWebhookEnvelope();
         RunCounts previousRunCounts = this.runCounts();
         UUID attemptId = UUID.randomUUID();
@@ -285,24 +316,23 @@ class DeadLetterRetentionCleanupIntegrationTests {
                 UUID.randomUUID(),
                 CUTOFF
         );
+        String selectDeliveryAttempt = "SELECT to_jsonb(attempt)::text FROM delivery_attempt AS attempt WHERE attempt_id = ? AND event_id = ?";
+        List<String> expectedDeliveryAttempts = this.jdbcTemplate.queryForList(selectDeliveryAttempt, String.class, attemptId, expiredEventId);
+        Assertions.assertThat(expectedDeliveryAttempts).hasSize(1);
 
         this.deadLetterOccurrenceCleanupService.runCleanup();
-        Assertions.assertThat(this.physicalIds()).containsExactlyInAnyOrder(secondTieId, newerExpiredId, expiryBoundaryId, retainedId);
+        Assertions.assertThat(this.physicalIds()).containsExactlyInAnyOrder(secondTieId, retainedId);
         this.assertRunDeltas(previousRunCounts, 2, 1, 0);
         this.assertRetainedVolume(1);
 
         this.deadLetterOccurrenceCleanupService.runCleanup();
-        Assertions.assertThat(this.physicalIds()).containsExactlyInAnyOrder(expiryBoundaryId, retainedId);
-        this.assertRunDeltas(previousRunCounts, 4, 2, 0);
+        Assertions.assertThat(this.physicalIds()).containsExactly(retainedId);
+        this.assertRunDeltas(previousRunCounts, 3, 2, 0);
         this.assertRetainedVolume(1);
 
         this.deadLetterOccurrenceCleanupService.runCleanup();
         Assertions.assertThat(this.physicalIds()).containsExactly(retainedId);
-        this.assertRunDeltas(previousRunCounts, 5, 3, 0);
-
-        this.deadLetterOccurrenceCleanupService.runCleanup();
-        Assertions.assertThat(this.physicalIds()).containsExactly(retainedId);
-        this.assertRunDeltas(previousRunCounts, 5, 4, 0);
+        this.assertRunDeltas(previousRunCounts, 3, 3, 0);
         this.assertRetainedVolume(1);
         DeadLetterOccurrence retainedDeadLetterOccurrence = this.deadLetterOccurrenceRepository.findById(retainedId).orElseThrow();
         Assertions.assertThat(retainedDeadLetterOccurrence.getEventId()).isEqualTo(retainedEventId);
@@ -310,13 +340,14 @@ class DeadLetterRetentionCleanupIntegrationTests {
         Assertions.assertThat(retainedDeadLetterOccurrence.getDeadLetteredAt()).isEqualTo(Instant.parse("2026-01-01T00:00:00.001Z"));
         Assertions.assertThat(retainedDeadLetterOccurrence.isReplayAccepted()).isTrue();
         Assertions.assertThat(retainedDeadLetterOccurrence.getStoredWebhookEnvelope()).isEqualTo(retainedEnvelope);
-        Assertions.assertThat(this.jdbcTemplate.queryForList("SELECT event_type FROM delivery_attempt WHERE attempt_id = ? AND event_id = ?", String.class, attemptId, expiredEventId))
-                .containsExactly("cleanup-audit-fixture");
+        Assertions.assertThat(this.jdbcTemplate.queryForList(selectDeliveryAttempt, String.class, attemptId, expiredEventId)).containsExactlyElementsOf(expectedDeliveryAttempts);
     }
 
     @Test
     void cleanupQueriesRequireAnExplicitTransactionAndCommittedBatchesSurviveAnOuterRollback() {
         DeadLetterOccurrenceCleanupRepository deadLetterOccurrenceCleanupRepository = this.configurableApplicationContext.getBean(DeadLetterOccurrenceCleanupRepository.class);
+        this.deadLetterOccurrenceCleanupService.runCleanup();
+        this.assertRetainedVolume(0);
         UUID occurrenceId = UUID.randomUUID();
         this.insert(occurrenceId, UUID.randomUUID(), 0, KAFKA_TIMESTAMP, false);
         String cutoff = "2026-01-01 00:00:00.000+00:00 AD";
@@ -325,14 +356,20 @@ class DeadLetterRetentionCleanupIntegrationTests {
         Assertions.assertThat(this.physicalIds()).containsExactly(occurrenceId);
         RunCounts previousRunCounts = this.runCounts();
 
+        UUID retainedId = UUID.randomUUID();
+        UUID uncommittedId = UUID.randomUUID();
+        this.insert(retainedId, UUID.randomUUID(), 0, KAFKA_TIMESTAMP.plusMillis(1), false);
         this.transactionTemplate.executeWithoutResult(transactionStatus -> {
+            this.insert(uncommittedId, UUID.randomUUID(), 0, KAFKA_TIMESTAMP.plusMillis(1), false);
+            Assertions.assertThat(this.physicalIds()).containsExactlyInAnyOrder(occurrenceId, retainedId, uncommittedId);
             this.deadLetterOccurrenceCleanupService.runCleanup();
+            this.assertRetainedVolume(1);
             transactionStatus.setRollbackOnly();
         });
 
-        Assertions.assertThat(this.physicalIds()).isEmpty();
+        Assertions.assertThat(this.physicalIds()).containsExactly(retainedId);
         this.assertRunDeltas(previousRunCounts, 1, 1, 0);
-        this.assertRetainedVolume(0);
+        this.assertRetainedVolume(1);
     }
 
     @Test
@@ -400,8 +437,12 @@ class DeadLetterRetentionCleanupIntegrationTests {
         this.assertRunDeltas(previousRunCounts, 4, 3, 0);
     }
 
-    @Test
-    void replayAdmissionChecksRetentionAfterLockAndCleanupSkipsAdmittedWorkUntilRelease() {
+    @ParameterizedTest
+    @ValueSource(booleans = {
+            false,
+            true
+    })
+    void replayAdmissionChecksRetentionAfterLockAndCleanupSkipsAdmittedWorkUntilRelease(boolean rollback) {
         UUID replayOccurrenceId = UUID.randomUUID();
         UUID replayEventId = UUID.randomUUID();
         UUID otherExpiredId = UUID.randomUUID();
@@ -411,31 +452,74 @@ class DeadLetterRetentionCleanupIntegrationTests {
         RunCounts previousRunCounts = this.runCounts();
 
         try (ExecutorService executorService = Executors.newVirtualThreadPerTaskExecutor()) {
-            this.transactionTemplate.executeWithoutResult(_ -> {
-                this.lockOccurrence(replayOccurrenceId);
+            this.transactionTemplate.executeWithoutResult(transactionStatus -> {
+                Assertions.assertThat(this.lockOccurrence(replayOccurrenceId)).containsExactly(replayOccurrenceId);
                 assertAllLookupsRetain(this.deadLetterOccurrenceRepository, replayOccurrenceId, replayEventId, 0);
                 Assertions.assertThat(executorService.submit(() -> assertAllLookupsRetain(this.deadLetterOccurrenceRepository, replayOccurrenceId, replayEventId, 0))).succeedsWithin(5, TimeUnit.SECONDS);
 
-                this.now.set(EXPIRY.plusMillis(1));
+                this.now.set(EXPIRY);
                 assertAllLookupsEmpty(this.deadLetterOccurrenceRepository, replayOccurrenceId, replayEventId, 0);
+                Assertions.assertThat(executorService.submit(() -> assertAllLookupsEmpty(this.deadLetterOccurrenceRepository, replayOccurrenceId, replayEventId, 0))).succeedsWithin(5, TimeUnit.SECONDS);
+                this.now.set(EXPIRY.plusMillis(1));
                 Assertions.assertThat(executorService.submit(this.deadLetterOccurrenceCleanupService::runCleanup)).succeedsWithin(5, TimeUnit.SECONDS);
                 Assertions.assertThat(this.physicalIds()).containsExactly(replayOccurrenceId);
                 this.assertRunDeltas(previousRunCounts, 1, 1, 0);
                 this.assertRetainedVolume(0);
+                if (rollback) {
+                    transactionStatus.setRollbackOnly();
+                }
             });
         }
 
         this.transactionTemplate.executeWithoutResult(_ -> {
-            this.lockOccurrence(replayOccurrenceId);
+            Assertions.assertThat(this.lockOccurrence(replayOccurrenceId)).containsExactly(replayOccurrenceId);
             assertAllLookupsEmpty(this.deadLetterOccurrenceRepository, replayOccurrenceId, replayEventId, 0);
         });
         this.deadLetterOccurrenceCleanupService.runCleanup();
         Assertions.assertThat(this.physicalIds()).isEmpty();
         this.assertRunDeltas(previousRunCounts, 2, 2, 0);
+        this.transactionTemplate.executeWithoutResult(_ -> Assertions.assertThat(this.lockOccurrence(replayOccurrenceId)).isEmpty());
     }
 
     @Test
-    void redeliveryRecreatesOnlyAnExpiredPhysicalRowAndANewerPublicationCanBeRetained() {
+    void rejectsReplayAdmissionWhenAnOccurrenceExpiresWhileWaitingForItsLock() throws Exception {
+        UUID occurrenceId = UUID.randomUUID();
+        UUID eventId = UUID.randomUUID();
+        this.insert(occurrenceId, eventId, 0, KAFKA_TIMESTAMP, false);
+        this.now.set(EXPIRY.minusMillis(1));
+        CountDownLatch releaseLock = new CountDownLatch(1);
+        CompletableFuture<Integer> blockingPidFuture = new CompletableFuture<>();
+        CompletableFuture<Integer> waitingPidFuture = new CompletableFuture<>();
+
+        try (ExecutorService executorService = Executors.newVirtualThreadPerTaskExecutor()) {
+            Future<?> heldLock = executorService.submit(() -> this.transactionTemplate.executeWithoutResult(_ -> {
+                Assertions.assertThat(this.lockOccurrence(occurrenceId)).containsExactly(occurrenceId);
+                blockingPidFuture.complete(this.jdbcTemplate.queryForObject("SELECT pg_backend_pid()", Integer.class));
+                awaitRelease(releaseLock);
+            }));
+            try {
+                int blockingPid = blockingPidFuture.get(5, TimeUnit.SECONDS);
+                Future<?> admission = executorService.submit(() -> this.transactionTemplate.executeWithoutResult(_ -> {
+                    Assertions.assertThat(this.deadLetterOccurrenceRepository.findById(occurrenceId)).get().extracting(DeadLetterOccurrence::getOccurrenceId).isEqualTo(occurrenceId);
+                    waitingPidFuture.complete(this.jdbcTemplate.queryForObject("SELECT pg_backend_pid()", Integer.class));
+                    Assertions.assertThat(this.lockOccurrence(occurrenceId)).containsExactly(occurrenceId);
+                    Assertions.assertThat(this.deadLetterOccurrenceRepository.findById(occurrenceId)).isEmpty();
+                }));
+                this.awaitReplayLockWait(blockingPid, waitingPidFuture.get(5, TimeUnit.SECONDS));
+                this.now.set(EXPIRY);
+                releaseLock.countDown();
+
+                Assertions.assertThat(heldLock).succeedsWithin(5, TimeUnit.SECONDS);
+                Assertions.assertThat(admission).succeedsWithin(5, TimeUnit.SECONDS);
+                Assertions.assertThat(this.physicalIds()).containsExactly(occurrenceId);
+            } finally {
+                releaseLock.countDown();
+            }
+        }
+    }
+
+    @Test
+    void preservesAnExpiredGenerationUntilDeletionAndUsesTheNewRecordTimestampAfterDeletion() {
         UUID eventId = UUID.randomUUID();
         WebhookEnvelopeCodec webhookEnvelopeCodec = this.configurableApplicationContext.getBean(WebhookEnvelopeCodec.class);
         DeadLetterOccurrenceService deadLetterOccurrenceService = this.configurableApplicationContext.getBean(DeadLetterOccurrenceService.class);
@@ -446,23 +530,33 @@ class DeadLetterRetentionCleanupIntegrationTests {
         assertAllLookupsRetain(this.deadLetterOccurrenceRepository, originalOccurrenceId, eventId, 0);
 
         this.now.set(EXPIRY);
+        Instant newerRecordTimestamp = Instant.parse("2026-01-01T00:00:00.001Z");
+        deadLetterOccurrenceService.persistIfAbsent(storedWebhookEnvelope, newerRecordTimestamp);
+        Assertions.assertThat(this.physicalIds()).containsExactly(originalOccurrenceId);
+        Assertions.assertThat(this.physicalTimestamp(originalOccurrenceId)).isEqualTo(CUTOFF);
+        assertAllLookupsEmpty(this.deadLetterOccurrenceRepository, originalOccurrenceId, eventId, 0);
+
         this.deadLetterOccurrenceCleanupService.runCleanup();
         Assertions.assertThat(this.physicalIds()).isEmpty();
         deadLetterOccurrenceService.persistIfAbsent(storedWebhookEnvelope, KAFKA_TIMESTAMP);
         Assertions.assertThat(this.physicalIds()).hasSize(1).doesNotContain(originalOccurrenceId);
         UUID redeliveredOccurrenceId = this.physicalIds().getFirst();
-        Assertions.assertThat(this.jdbcTemplate.queryForObject("SELECT dead_lettered_at FROM dead_letter_occurrence WHERE occurrence_id = ?", OffsetDateTime.class, redeliveredOccurrenceId)).isEqualTo(CUTOFF);
+        Assertions.assertThat(this.physicalTimestamp(redeliveredOccurrenceId)).isEqualTo(CUTOFF);
         assertAllLookupsEmpty(this.deadLetterOccurrenceRepository, redeliveredOccurrenceId, eventId, 0);
         this.deadLetterOccurrenceCleanupService.runCleanup();
         Assertions.assertThat(this.physicalIds()).isEmpty();
 
-        deadLetterOccurrenceService.persistIfAbsent(storedWebhookEnvelope, Instant.parse("2026-01-01T00:00:00.001Z"));
+        deadLetterOccurrenceService.persistIfAbsent(storedWebhookEnvelope, newerRecordTimestamp);
         Assertions.assertThat(this.physicalIds()).hasSize(1).doesNotContain(originalOccurrenceId, redeliveredOccurrenceId);
-        assertAllLookupsRetain(this.deadLetterOccurrenceRepository, this.physicalIds().getFirst(), eventId, 0);
+        UUID newOccurrenceId = this.physicalIds().getFirst();
+        Assertions.assertThat(this.physicalTimestamp(newOccurrenceId)).isEqualTo(OffsetDateTime.parse("2026-01-01T00:00:00.001Z"));
+        assertAllLookupsRetain(this.deadLetterOccurrenceRepository, newOccurrenceId, eventId, 0);
     }
 
     @Test
     void scheduledCleanupWaitsAfterRegistrationAndSamplingAndRecoversAfterARejectedCommit() throws InterruptedException {
+        this.deadLetterOccurrenceCleanupService.runCleanup();
+        this.assertRetainedVolume(0);
         UUID expiredId = UUID.randomUUID();
         UUID retainedId = UUID.randomUUID();
         this.insert(expiredId, UUID.randomUUID(), 0, KAFKA_TIMESTAMP, false);
@@ -486,28 +580,28 @@ class DeadLetterRetentionCleanupIntegrationTests {
             annotationConfigApplicationContext.register(DeadLetterCleanupConfiguration.class);
             annotationConfigApplicationContext.registerBean(DeadLetterOccurrenceCleanupService.class, () -> this.deadLetterOccurrenceCleanupService);
             annotationConfigApplicationContext.registerBean(DeadLetterCleanupProperties.class, () -> new DeadLetterCleanupProperties(CLEANUP_INTERVAL, "2"));
-            annotationConfigApplicationContext.registerBean("taskScheduler", ObservingTaskScheduler.class);
+            annotationConfigApplicationContext.registerBean("taskScheduler", ObservingTaskScheduler.class, () -> new ObservingTaskScheduler(this::retainedVolume));
             annotationConfigApplicationContext.refresh();
             ObservingTaskScheduler observingTaskScheduler = annotationConfigApplicationContext.getBean(ObservingTaskScheduler.class);
             try {
-                long firstStart = awaitTimestamp(observingTaskScheduler.starts);
+                long firstStart = awaitObservation(observingTaskScheduler.starts);
                 Assertions.assertThat(firstStart - observingTaskScheduler.registrationNanos.get()).isGreaterThanOrEqualTo(CLEANUP_INTERVAL.toNanos());
                 Assertions.assertThat(firstSampleStarted.await(5, TimeUnit.SECONDS)).isTrue();
                 this.assertRunDeltas(previousRunCounts, 0, 0, 1);
                 Assertions.assertThat(this.physicalIds()).containsExactlyInAnyOrder(expiredId, retainedId);
-            } finally {
+                Assertions.assertThat(observingTaskScheduler.completions.poll(CLEANUP_INTERVAL.toNanos(), TimeUnit.NANOSECONDS)).as("scheduled callback completion while the retained sample is blocked").isNull();
                 releaseFirstSample.countDown();
-            }
 
-            long firstCompletion = awaitTimestamp(observingTaskScheduler.completions);
-            long secondStart = awaitTimestamp(observingTaskScheduler.starts);
-            Assertions.assertThat(secondStart - firstCompletion).isGreaterThanOrEqualTo(CLEANUP_INTERVAL.toNanos());
-            awaitTimestamp(observingTaskScheduler.completions);
-            try {
+                CleanupCompletion firstCleanupCompletion = awaitObservation(observingTaskScheduler.completions);
+                Assertions.assertThat(firstCleanupCompletion.retainedVolume()).isEqualTo(1);
+                long secondStart = awaitObservation(observingTaskScheduler.starts);
+                Assertions.assertThat(secondStart - firstCleanupCompletion.completionNanos()).isGreaterThanOrEqualTo(CLEANUP_INTERVAL.toNanos());
+                awaitObservation(observingTaskScheduler.completions);
                 this.assertRunDeltas(previousRunCounts, 1, 1, 1);
                 this.assertRetainedVolume(1);
                 Assertions.assertThat(this.physicalIds()).containsExactly(retainedId);
             } finally {
+                releaseFirstSample.countDown();
                 observingTaskScheduler.releaseSecondCompletion.countDown();
             }
         } finally {
@@ -556,8 +650,24 @@ class DeadLetterRetentionCleanupIntegrationTests {
         return this.jdbcTemplate.queryForList("SELECT occurrence_id FROM dead_letter_occurrence", UUID.class);
     }
 
-    private void lockOccurrence(UUID occurrenceId) {
-        Assertions.assertThat(this.jdbcTemplate.queryForObject("SELECT occurrence_id FROM dead_letter_occurrence WHERE occurrence_id = ? FOR UPDATE", UUID.class, occurrenceId)).isEqualTo(occurrenceId);
+    private OffsetDateTime physicalTimestamp(UUID occurrenceId) {
+        return this.jdbcTemplate.queryForObject("SELECT dead_lettered_at FROM dead_letter_occurrence WHERE occurrence_id = ?", OffsetDateTime.class, occurrenceId);
+    }
+
+    private List<UUID> lockOccurrence(UUID occurrenceId) {
+        return this.jdbcTemplate.queryForList("SELECT occurrence_id FROM dead_letter_occurrence WHERE occurrence_id = ? FOR UPDATE", UUID.class, occurrenceId);
+    }
+
+    private void awaitReplayLockWait(int blockingPid, int waitingPid) throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+        while (deadline - System.nanoTime() > 0) {
+            Boolean blocked = this.jdbcTemplate.queryForObject("SELECT ? = ANY(pg_blocking_pids(?))", Boolean.class, blockingPid, waitingPid);
+            if (Objects.equals(Boolean.TRUE, blocked)) {
+                return;
+            }
+            Thread.sleep(Duration.ofMillis(20));
+        }
+        throw new AssertionError("Replay admission did not wait for the fixture row lock");
     }
 
     private static void assertAllLookupsRetain(DeadLetterOccurrenceRepository deadLetterOccurrenceRepository, UUID occurrenceId, UUID eventId, int replayCount) {
@@ -609,7 +719,11 @@ class DeadLetterRetentionCleanupIntegrationTests {
     }
 
     private void assertRetainedVolume(int retained) {
-        Assertions.assertThat(this.meterRegistry.get("gregor.deadletter.occurrences.retained").gauge().value()).isEqualTo(retained);
+        Assertions.assertThat(this.retainedVolume()).isEqualTo(retained);
+    }
+
+    private double retainedVolume() {
+        return this.meterRegistry.get("gregor.deadletter.occurrences.retained").gauge().value();
     }
 
     private static void awaitRelease(CountDownLatch countDownLatch) {
@@ -623,24 +737,29 @@ class DeadLetterRetentionCleanupIntegrationTests {
         }
     }
 
-    private static long awaitTimestamp(BlockingQueue<Long> timestamps) throws InterruptedException {
-        Long timestamp = timestamps.poll(5, TimeUnit.SECONDS);
-        Assertions.assertThat(timestamp).as("cleanup scheduler observation").isNotNull();
-        return Objects.requireNonNull(timestamp);
+    private static <T> T awaitObservation(BlockingQueue<T> observations) throws InterruptedException {
+        T observation = observations.poll(5, TimeUnit.SECONDS);
+        Assertions.assertThat(observation).as("cleanup scheduler observation").isNotNull();
+        return Objects.requireNonNull(observation);
     }
 
     private record RunCounts(double deleted, double successful, double failed) {
+    }
+
+    private record CleanupCompletion(double retainedVolume, long completionNanos) {
     }
 
     private static final class ObservingTaskScheduler extends SimpleAsyncTaskScheduler {
 
         private final AtomicLong registrationNanos = new AtomicLong();
         private final BlockingQueue<Long> starts = new LinkedBlockingQueue<>();
-        private final BlockingQueue<Long> completions = new LinkedBlockingQueue<>();
+        private final BlockingQueue<CleanupCompletion> completions = new LinkedBlockingQueue<>();
         private final CountDownLatch releaseSecondCompletion = new CountDownLatch(1);
         private final AtomicInteger completedRuns = new AtomicInteger();
+        private final DoubleSupplier retainedVolumeSupplier;
 
-        ObservingTaskScheduler() {
+        ObservingTaskScheduler(DoubleSupplier retainedVolumeSupplier) {
+            this.retainedVolumeSupplier = retainedVolumeSupplier;
             this.setVirtualThreads(true);
             long originNanos = System.nanoTime();
             InstantSource monotonicInstantSource = () -> Instant.EPOCH.plusNanos(System.nanoTime() - originNanos);
@@ -662,7 +781,7 @@ class DeadLetterRetentionCleanupIntegrationTests {
                 try {
                     runnable.run();
                 } finally {
-                    this.completions.add(System.nanoTime());
+                    this.completions.add(new CleanupCompletion(this.retainedVolumeSupplier.getAsDouble(), System.nanoTime()));
                     if (this.completedRuns.incrementAndGet() == 2) {
                         try {
                             this.releaseSecondCompletion.await(10, TimeUnit.SECONDS);

@@ -81,6 +81,7 @@ Map<String, List<String>> sourceDependencies = [
                 "org.springframework:spring-tx",
                 "org.springframework:spring-web",
                 "org.springframework:spring-webmvc",
+                "org.yaml:snakeyaml",
                 "tools.jackson.core:jackson-core",
                 "tools.jackson.core:jackson-databind"
         ],

@@ -91,6 +91,7 @@ class DeadLetterOccurrenceCleanupServiceTests {
 
         deadLetterOccurrenceCleanupService.runCleanup();
 
+        Mockito.verify(this.deadLetterOccurrenceCleanupRepository).deleteExpired(CUTOFF, 2);
         this.assertMetrics(7, 0, 1, 0);
     }
 
