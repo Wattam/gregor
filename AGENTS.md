@@ -4,6 +4,26 @@
 - Always treat formatting-only changes as intentional.
 - Never use deprecated APIs, dependencies, commands, or configuration options. Use supported replacements.
 
+## Package structure
+
+Application code lives under `gregor` (`src/main/java/gregor`).
+
+```text
+gregor
+├── avro                 Kafka record types, Avro codecs, and registry schema resolution
+├── component            Spring helpers for outbound HTTP and webhook signing
+├── config               Spring bean wiring, Kafka topic declarations, and scheduling
+│   └── properties       Typed configuration bindings
+├── controller           HTTP endpoints
+│   └── advice           HTTP exception-to-response mapping
+├── dto                  HTTP request and response types, internal route messages and results
+├── entity               JPA mappings
+├── exception            Application exceptions
+├── repository           JPA and JDBC database access
+├── route                Camel message flow and Kafka offset commits
+└── service              Delivery and retry policy, dead-letter handling, and persistence coordination
+```
+
 ## Java
 
 - Prefer newer finalized JDK features when they simplify the code. Never use preview or incubator features.
