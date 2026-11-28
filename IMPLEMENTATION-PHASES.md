@@ -33,7 +33,8 @@ not hold yet. Completing groundwork or an isolated test suite does not mark an i
 - Preserve at-least-once Kafka-to-HTTP behavior and document every new duplicate-delivery window.
 - Add unit tests for domain decisions and integration tests for Kafka, PostgreSQL, HTTP, restart, and failure boundaries affected by the
   increment.
-- Require Kafka acknowledgement before reporting publication success or committing a source offset.
+- Require Kafka acknowledgement before reporting publication success or committing a source offset. Distinguish durable outbox
+  acceptance from Kafka publication.
 - Add backward-compatible Avro defaults and regenerate Java from `.avsc` files; never edit generated Avro Java.
 - Add database migrations and rollback/compatibility notes before relying on new persisted state.
 - Validate new configuration at startup and document its environment overrides.
@@ -287,50 +288,69 @@ Every terminal event is an idempotently persisted dead-letter occurrence that is
 
 Retained occurrences are retention-bounded, expired state disappears from reads immediately, and physical cleanup is observable.
 
-### Phase 2I: Single-event replay API
+### Phase 2I: Single-occurrence replay API
 
-**Goal:** Replay one retained dead-letter occurrence at most once without changing event identity.
+**Goal:** Accept at most one durable replay command per retained dead-letter occurrence. Give the same delivery a fresh attempt budget.
 
-#### Tasks
+#### Delivery identity and attempt budget
 
-- [ ] Expose `POST /api/dead-letter-events/{eventId}/replay` with an empty request body.
-- [ ] Add an atomic replay operation that locks the latest retained occurrence and accepts it at most once.
-- [ ] Preserve the original event ID, type, tenant, endpoint, creation time, payload bytes, cumulative attempt count, and endpoint Kafka
-  key.
-- [ ] Start a fresh retry cycle by incrementing replay generation and resetting retry tier and next-eligible time.
-- [ ] Publish replay to the source topic synchronously and mark the occurrence accepted only after Kafka acknowledges it.
-- [ ] Return `202 Accepted` with `{"eventId":"<original-event-id>"}` after acknowledgement, `404` for unknown or expired state, `409`
-  for an already accepted occurrence, and `503` for publication failure while leaving the occurrence eligible for another request.
-- [ ] Document that the unauthenticated Phase 2 replay endpoint is for trusted local use only. Authentication is added in Phase 5A.
-- [ ] Test concurrent replay requests for one occurrence, failed publication, unknown and expired state, retention races, and acceptance
-  ordering relative to Kafka acknowledgement.
+- [ ] Define `(tenantId, eventId, endpointId)` as the stable delivery key, with one delivery per endpoint per source event. Keep
+  `eventId` for grouping and `endpointId` as the Kafka key. Preserve the delivery key through retries, replay, attempts, and dead letters.
+- [ ] Deduplicate attempts by delivery key, replay generation, and attempt number. Deduplicate dead letters by delivery key and replay
+  generation. Backfill tenant and endpoint for existing occurrences from the stored envelopes without changing `occurrenceId`.
+- [ ] Keep `deliveryAttemptCount` cumulative along the replay chain. Apply `gregor.webhook.maximum-attempts` per generation in both the
+  delivery guard and the retry planner. Use the cumulative count as the generation attempt count for legacy generation-zero envelopes.
+- [ ] Start replay at the next generation with its own attempt budget, reset retry tier and next-eligible time, and preserve the original
+  event metadata, payload bytes, cumulative attempt count, and `webhook-id`. Carry the generation and counters through retry envelopes,
+  attempt records, and dead letters.
+- [ ] Verify Avro compatibility with old writer data and test the PostgreSQL migration and deduplication with deliveries that share an
+  event ID but have different endpoints.
+
+#### Replay acceptance and publication
+
+- [ ] Expose `POST /api/dead-letter-occurrences/{occurrenceId}/replay` with an empty request body. Lock that occurrence and recheck
+  retention in the write transaction. Never resolve the request to a newer occurrence.
+- [ ] Mark the occurrence accepted and insert a PostgreSQL outbox command in the same transaction. Enforce uniqueness by source
+  occurrence ID. Assign the replay command ID and generation once. Keep the command publishable after source occurrence cleanup, never
+  store signing secrets, and remove the outbox payload after confirmed publication.
+- [ ] Return `202 Accepted` with `eventId` and `replayCommandId` after the database commits. This means durably queued, not published.
+  Return `404` for an unknown or expired occurrence, `409` for a retained occurrence already accepted, and `503` if durable acceptance
+  cannot be confirmed.
+- [ ] Relay committed commands to the source topic with the original endpoint Kafka key. Retry pending commands with backoff after
+  publication failure or restart. Mark a command published only after Kafka acknowledges it. Repeated publication carries the same
+  command ID, delivery key, and generation. HTTP delivery remains at least once.
+- [ ] Document trusted-local access until Phase 5A adds authentication, the acceptance and publication guarantees, and outbox payload
+  handling.
+- [ ] Test concurrent requests, unknown and expired occurrences, retention races, and transaction rollback. Verify that rollback publishes
+  nothing and that a command accepted before expiry still publishes after occurrence cleanup.
+- [ ] Test retry after a lost response when a newer occurrence exists. Verify that the retry never accepts the newer occurrence.
+- [ ] Test a Kafka outage and a relay crash after acknowledgement but before recording publication. Verify that accepted work survives
+  and that resends preserve the command ID and generation.
+- [ ] Test that a replay of an exhausted delivery gets the full attempt budget and continues numbering from the retained occurrence.
 
 #### Completion gate
 
-A retained occurrence is replayed at most once and re-enters the normal delivery path with its original identity and cumulative attempt
-count.
+One retained occurrence can create at most one durable replay command. The relay publishes accepted commands on recovery and may repeat
+publication under the same command ID. Replay re-enters delivery with the original delivery key, cumulative numbering, and a fresh attempt budget.
 
 ### Phase 2J: Replay-aware delivery auditing
 
-**Goal:** Make repeated delivery cycles for one event independently auditable.
+**Goal:** Make repeated generations of one delivery independently auditable.
 
 #### Tasks
 
-- [ ] Propagate replay generation through delivery, retry tiers, attempt records, and dead-letter records so each generation is
-  attributable.
-- [ ] Keep attempt numbering cumulative across generations and keep attempt deduplication correct when a later generation continues the
-  sequence.
-- [ ] Create a new dead-letter occurrence for each exhausted generation without mutating an earlier occurrence.
-- [ ] Verify that `webhook-id` stays stable while every physical request receives a fresh webhook timestamp and signature.
-- [ ] Record replayed attempts in the normal attempt stream; do not create a synthetic attempt merely for replay acceptance.
-- [ ] Document replay semantics, cumulative numbering, and the interaction between replay and dead-letter retention.
-- [ ] Test repeated generations, retry exhaustion after replay, duplicate-safe persistence across generations, and stable identity with
+- [ ] Retain a distinct dead-letter occurrence for each terminal generation instead of overwriting an earlier occurrence.
+- [ ] Record replayed attempts in the normal attempt stream; do not create a synthetic attempt for replay acceptance.
+- [ ] Verify that `webhook-id` stays stable and that each physical request computes its timestamp and signature anew.
+- [ ] Document cumulative numbering, generation-scoped deduplication, and how replay acceptance and publication interact with dead-letter
+  retention. Distinguish logical attempt history from physical request counts.
+- [ ] Test repeated exhaustion and replay, duplicate publications, independent histories across generations, and stable identity with
   fresh signatures.
 
 #### Completion gate
 
-A retained event can complete repeated, independently auditable delivery cycles while only one replay is accepted per dead-letter
-occurrence and all Phase 2 acceptance criteria pass.
+Repeated generations have independent attempt histories and dead-letter occurrences. Each source occurrence permits at most one durable
+replay acceptance, and all Phase 2 acceptance criteria pass.
 
 ## Phase 3: Endpoint Health and Delivery Protection (PLANNED)
 
@@ -491,19 +511,25 @@ Per-endpoint delivery rates are enforced across workers with documented deferral
 
 ### Phase 3J: Slow-endpoint isolation and capacity bounds
 
-**Goal:** Prevent one endpoint from monopolizing worker capacity.
+**Goal:** Bound worker resource use and maintain healthy-endpoint latency under slow-endpoint load.
 
 #### Tasks
 
+- [ ] Define a repeatable workload with traffic rates, slow-response latencies, and Kafka partition and listener settings. Set a healthy-endpoint
+  p99 time-to-first-attempt target measured from source publication to HTTP start. Record a healthy-only baseline.
+- [ ] Use a test fixture with healthy and slow destinations on the same Kafka partition. Exercise the real delivery path without depending on
+  Phase 5D endpoint management.
 - [ ] Bound connection time, response time, in-flight requests, and worker resources per endpoint.
 - [ ] Isolate slow endpoints so unrelated endpoints on the same Kafka partition remain eligible for delivery.
 - [ ] Define and implement behavior when per-endpoint capacity is exhausted, including saturation signals and deferral.
 - [ ] Document the worker capacity model and its interaction with the configured listener concurrency.
-- [ ] Test slow responses, saturated endpoints, partition sharing, restart under saturation, and interaction with breakers and rate limits.
+- [ ] Run the mixed workload with saturated slow endpoints, including retry eligibility waits, breaker and rate-limit deferrals, and restart
+  under load. Check offset safety and report healthy-endpoint latency and resource use against the targets.
 
 #### Completion gate
 
-Endpoint-specific limits and slow responses cannot exhaust shared delivery capacity, and all deferral and ordering tradeoffs are explicit.
+Under the documented shared-partition workload, healthy endpoints meet the p99 target and resource limits hold. Restart does not lose
+accepted work. Deferral and ordering tradeoffs are documented.
 
 ## Phase 4: Spring Boot Starter and Transactional Outbox (PLANNED)
 
@@ -695,16 +721,20 @@ Tenants manage real applications and endpoints, and workers deliver using resolv
 #### Tasks
 
 - [ ] Define tenant-scoped models and lifecycle rules for event types and subscriptions.
-- [ ] Resolve event type and application subscriptions to endpoint IDs during ingestion, including fan-out to several endpoints.
+- [ ] Resolve event type and application subscriptions during ingestion. Keep one source `eventId` and create at most one delivery per
+  matching endpoint, even when several subscriptions match it. Use the Phase 2I delivery key for each destination.
+- [ ] Keep `endpointId` as the Kafka key and preserve the selected delivery key across retries and replay. Give new fan-out deliveries
+  distinct `webhook-id` values without changing values already sent to receivers.
 - [ ] Keep endpoint destinations and signing secrets invisible to producers.
 - [ ] Define behavior for unmatched event types, disabled subscriptions, and subscription changes while events are in retry.
-- [ ] Test single-endpoint and multi-endpoint fan-out, unmatched events, subscription changes mid-retry, and per-endpoint keying and
-  ordering.
+- [ ] Test single-endpoint and multi-endpoint fan-out, duplicate subscription matches, unmatched events, subscription changes mid-retry,
+  and per-endpoint keying and ordering. Verify that deliveries sharing an event ID retain independent attempt and dead-letter records
+  and that replay affects only the selected occurrence.
 
 #### Completion gate
 
-Producers publish event types and the service resolves subscriptions into per-endpoint deliveries with unchanged ordering and no
-configuration leakage.
+Producers publish event types and the service resolves subscriptions into independently auditable per-endpoint deliveries under one
+source event ID, with unchanged per-endpoint ordering and no configuration leakage.
 
 ### Phase 5F: Signing-secret lifecycle
 
@@ -744,16 +774,25 @@ Untrusted destinations cannot be used to reach protected networks, and configura
 
 **Goal:** Let operators inspect event and attempt history through secured APIs.
 
+#### Capacity gate before fixing the API contract
+
+- [ ] Define target ingest and read rates, fan-out, retry and replay rates, tenant skew, and retention horizons. Size a representative
+  PostgreSQL dataset and set attempt write-throughput and p99 history-query latency targets.
+- [ ] Benchmark concurrent attempt inserts and candidate portal cursor queries against the retained dataset. Record throughput, latency,
+  and query plans with the workload and database configuration. Use the results to select supported filters, sorts, and cursors before
+  committing to the API contract.
+
 #### Tasks
 
 - [ ] Add tenant-scoped event metadata storage needed for event inspection without weakening payload-retention rules.
 - [ ] Add paginated and filterable APIs for events and delivery attempts with stable sorting and cursor semantics.
 - [ ] Bound query cost for large histories and document the required indexes and partitioning.
-- [ ] Test tenant isolation, large histories, pagination stability under concurrent writes, and filter correctness.
+- [ ] Test tenant isolation, pagination stability under concurrent writes, and filter correctness. Verify the implemented queries and
+  attempt writes meet the targets under the benchmark workload.
 
 #### Completion gate
 
-Event and attempt history is inspectable through secured, tenant-scoped APIs with bounded query cost and no direct database access.
+Secured, tenant-scoped event and attempt history APIs meet the measured capacity targets without direct database access.
 
 ### Phase 5I: Payload visibility, dead-letter access, and authorized replay
 
@@ -764,7 +803,8 @@ Event and attempt history is inspectable through secured, tenant-scoped APIs wit
 - [ ] Define payload visibility, redaction, encryption, and retention separately from payload-free attempt history.
 - [ ] Add paginated and filterable APIs for dead-letter occurrences and replay history.
 - [ ] Replace the local replay boundary with authorized replay and record actor, reason, time, source occurrence, and result.
-- [ ] Preserve the Phase 2I at-most-once acceptance rules under authorization and tenant scoping.
+- [ ] Preserve the Phase 2I at-most-once acceptance rules for the selected occurrence under authorization and tenant scoping. Distinguish
+  queued replay commands from Kafka publication and delivery outcomes in replay history.
 - [ ] Test redaction, expiry, concurrent authorized replay, cross-tenant replay attempts, and recorded replay context.
 
 #### Completion gate
@@ -842,11 +882,12 @@ Reliability targets are defined, measured, and alerted on, with bounded cardinal
 #### Tasks
 
 - [ ] Add configurable retention policies for event metadata, attempts, dead letters, audit history, and optional payload storage.
-- [ ] Implement PostgreSQL partitioning and cleanup where required, and document the measured threshold for moving analytics to a dedicated
-  store such as ClickHouse.
+- [ ] Use the Phase 5H benchmark results to implement PostgreSQL partitioning and cleanup where required. Document the measured threshold
+  for moving analytics to a dedicated store such as ClickHouse.
 - [ ] Add capacity limits and quotas for tenants, endpoints, payload size, replay, schemas, and retained history with explicit rejection
   behavior.
-- [ ] Test retention cleanup under load, partition maintenance, quota boundaries, and behavior at storage limits.
+- [ ] Repeat the Phase 5H workload with retention cleanup enabled. Test partition maintenance, quota boundaries, and behavior at storage
+  limits.
 
 #### Completion gate
 
@@ -994,8 +1035,9 @@ worker restart, consumer rebalance, and all Phase 3 protection mechanisms. Unrel
 ## Cross-phase rules
 
 - Preserve at-least-once delivery semantics. Never claim exactly-once delivery across Kafka and HTTP.
-- Keep `webhook-id` stable across retries and replay so receivers can deduplicate deliveries.
-- Preserve ordering within one event's retry sequence. Allow delayed retries to be overtaken unless strict FIFO is explicitly enabled.
+- Use the tenant-scoped delivery key for per-destination state. Keep the source event ID for grouping and the endpoint ID for Kafka keying.
+- Keep `webhook-id` stable for a delivery across retries and replay so receivers can deduplicate repeated requests.
+- Preserve ordering within one delivery's retry sequence. Allow delayed retries to be overtaken unless strict FIFO is explicitly enabled.
 - Keep customer payloads opaque to delivery workers except when optional validation is enabled at ingestion.
 - Never include signing secrets in Kafka records, attempt records, dead-letter metadata, API responses, or logs.
 - Keep attempt publication and persistence separate from the hot HTTP path through Kafka.
